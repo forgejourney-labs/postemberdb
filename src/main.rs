@@ -8,7 +8,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("server") => {
             let address = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:7432");
-            if let Err(error) = run_server(address) {
+            let data_path = args.get(3).map(String::as_str).unwrap_or("postemberdb.pdb");
+            if let Err(error) = run_server(address, data_path) {
                 eprintln!("PostemberDB server error: {error}");
                 std::process::exit(1);
             }
@@ -19,16 +20,18 @@ fn main() {
         _ => {
             eprintln!("PostemberDB {}", env!("CARGO_PKG_VERSION"));
             eprintln!("Usage:");
-            eprintln!("  postemberdb server [host:port]");
+            eprintln!("  postemberdb server [host:port] [data-file]");
             eprintln!("  postemberdb version");
         }
     }
 }
 
-fn run_server(address: &str) -> io::Result<()> {
+fn run_server(address: &str, data_path: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("PostemberDB server listening on {address}");
-    let database = std::sync::Arc::new(std::sync::Mutex::new(Database::new()));
+    let database = Database::open(data_path)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let database = std::sync::Arc::new(std::sync::Mutex::new(database));
 
     for incoming in listener.incoming() {
         match incoming {
