@@ -15,6 +15,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Owned client sessions with optimistic revision conflict detection.
 - [x] Development server `BEGIN`, `COMMIT`, and `ROLLBACK` commands.
 - [x] Streaming WAL recovery with a bounded 64 MiB maximum transaction frame; the complete WAL is not loaded into memory.
+- [x] Stage the recovery pass once and publish only after all complete frames validate, avoiding a full database clone per frame.
 - [ ] Savepoints, explicit SQL BEGIN/COMMIT/ROLLBACK, and transaction isolation levels.
 - [x] OS-level exclusive sidecar lock for the same database path.
 - [ ] Hard-link alias detection and broader multi-writer coordination.
