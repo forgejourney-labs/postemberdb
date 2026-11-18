@@ -125,3 +125,8 @@ Parameters are encoded from typed `Value` variants and quoted by the engine; cal
 ## Exact KSL adapter status
 
 KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its published dialect set is SQLite, MySQL, MariaDB, and PostgreSQL; PostemberDB is not yet a selectable KSL dialect. A production adapter therefore still needs a stable server protocol, a JDBC driver, and KSL dialect/migration support. The current Rust TCP line server is only a development interface and must not be presented as the KSL adapter.
+
+
+## Client sessions and server transactions
+
+The engine now exposes an owned `DatabaseSession`. A session works against a private staged view, can execute typed parameterized statements, and commits only if the database revision has not changed since the session began. This optimistic conflict check prevents silently overwriting another client's committed writes. The development TCP server exposes `BEGIN`, `COMMIT`, and `ROLLBACK` using this API. Sessions currently clone the in-memory table state; they are not yet suitable for a large number of concurrent clients or large databases. A production protocol and JDBC driver remain separate milestones.
