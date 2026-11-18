@@ -49,6 +49,7 @@ impl Database {
             _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
+            ember_indexes_valid: false,
         };
         loop {
             let mut header = [0u8; 24];
