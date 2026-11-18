@@ -584,15 +584,29 @@ impl Database {
         let projection = sql["SELECT".len()..from].trim();
         let tail = sql[from + 6..].trim();
         let upper_tail = tail.to_ascii_uppercase();
-        let where_pos = upper_tail.find(" WHERE ");
+
+        let (query_tail, limit) = if let Some(position) = upper_tail.rfind(" LIMIT ") {
+            let limit_text = tail[position + 7..].trim();
+            if limit_text.split_whitespace().count() != 1 {
+                return Err(DbError::Parse("LIMIT expects one non-negative integer".into()));
+            }
+            let limit = limit_text.parse::<usize>()
+                .map_err(|_| DbError::Parse("LIMIT expects one non-negative integer".into()))?;
+            (&tail[..position], Some(limit))
+        } else {
+            (tail, None)
+        };
+
+        let query_upper = query_tail.to_ascii_uppercase();
+        let where_pos = query_upper.find(" WHERE ");
         let (table_part, predicate) = match where_pos {
-            Some(position) => (&tail[..position], Some(tail[position + 7..].trim())),
-            None => (tail, None),
+            Some(position) => (&query_tail[..position], Some(query_tail[position + 7..].trim())),
+            None => (query_tail, None),
         };
         let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
 
-        let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
+        let mut selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
             table.matching_rows_for_predicates(&predicates)
         } else {
@@ -611,6 +625,9 @@ impl Database {
             });
         }
 
+        if let Some(limit) = limit {
+            selected_rows.truncate(limit);
+        }
         let projection_indices = if projection == "*" {
             (0..table.columns.len()).collect::<Vec<_>>()
         } else {
@@ -1134,6 +1151,23 @@ mod tests {
         drop(reopened);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
+
+    #[test]
+    fn select_limit_bounds_result_rows_with_and_without_index_predicates() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE player_events (uuid TEXT, event TEXT)").unwrap();
+        db.execute("INSERT INTO player_events VALUES ('a', 'join')").unwrap();
+        db.execute("INSERT INTO player_events VALUES ('a', 'move')").unwrap();
+        db.execute("INSERT INTO player_events VALUES ('b', 'join')").unwrap();
+        db.execute("CREATE INDEX idx_player_events_uuid ON player_events (uuid)").unwrap();
+
+        assert_eq!(db.execute("SELECT * FROM player_events LIMIT 2").unwrap().rows.len(), 2);
+        assert_eq!(db.execute("SELECT * FROM player_events WHERE uuid = 'a' LIMIT 1").unwrap().rows.len(), 1);
+        assert_eq!(db.execute("SELECT * FROM player_events LIMIT 0").unwrap().rows.len(), 0);
+        assert!(db.execute("SELECT * FROM player_events LIMIT nope").is_err());
+        assert_eq!(db.execute("SELECT COUNT(*) FROM player_events LIMIT 1").unwrap().rows[0].values[0], Value::Integer(3));
     }
 
     #[test]
