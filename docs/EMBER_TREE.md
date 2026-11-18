@@ -165,3 +165,10 @@ SQL rows now carry monotonically allocated table-local `u64` identifiers. Deleti
 The snapshot payload version is now PDB5 and stores each row identifier plus the next-ID counter, including when a table is empty after deletions. PDB4 and earlier snapshots remain readable: legacy rows receive deterministic identifiers in their existing row order, and the next checkpoint writes PDB5. Zero is reserved for synthetic aggregate result rows and is rejected in persisted table rows and persistent index entries. IDs are monotonically allocated and are not reused after deletion or checkpoint. The SQL WAL remains authoritative, and the derived EmberTree mirror is rebuilt from canonical snapshot/WAL state during open.
 
 Delta discovery still compares complete in-memory index-entry sets (O(total indexed entries)); direct mutation journaling remains future work. Stable IDs solve positional churn, not the full-scan cost.
+
+
+## Direct SQL index mutation journal
+
+SQL transactions now collect persistent index-key changes at the point where rows are inserted, updated, deleted, or upserted. Creating an index over an existing table records its initial entries once. Each journal item contains the fully namespaced EmberTree key (including the stable row ID) and whether it is inserted or removed.
+
+After the canonical SQL WAL commit is synced, the derived EmberTree receives the journal through one mixed removal/upsert CoW batch, one redo record, and one root publication. The transaction path no longer scans every in-memory index entry to calculate a before/after set difference. A full scan remains on database open/rebuild, and unsupported key encodings deliberately disable the persistent mirror so SQL queries safely use in-memory indexes.
