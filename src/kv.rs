@@ -17,7 +17,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// A persistent byte-oriented key/value store backed by PostemberDB's native
 /// copy-on-write B+ Tree. Each batch is one redo-WAL transaction and one root
-/// publication. Keys are 1..=1024 bytes; values must fit in one data page.
+/// publication. Keys are 1..=1024 bytes; values must fit alongside their keys in one leaf entry.
 pub struct KeyValueStore {
     store: ExtentFile,
     wal_path: PathBuf,
@@ -257,6 +257,9 @@ impl Registry {
 
     pub fn get_value(&mut self, path: &str, name: &str) -> Result<Option<RegistryValue>, DbError> {
         let normalized = normalize_path(path)?;
+        if name.contains('\\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
         let mut key = value_record_prefix(&normalized);
         key.extend_from_slice(name.to_lowercase().as_bytes());
         self.store.get(&key)?.map(|value| RegistryValue::decode(&value)).transpose()
@@ -264,6 +267,9 @@ impl Registry {
 
     pub fn delete_value(&mut self, path: &str, name: &str) -> Result<bool, DbError> {
         let normalized = normalize_path(path)?;
+        if name.contains('\\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
         let mut key = value_record_prefix(&normalized);
         key.extend_from_slice(name.to_lowercase().as_bytes());
         self.store.delete(&key)
