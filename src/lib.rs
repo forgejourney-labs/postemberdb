@@ -1224,7 +1224,10 @@ mod tests {
         let second = Database::open(&path).unwrap();
         drop(second);
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+        let wal_path = format!("{}.wal", path.display());
+        if std::path::Path::new(&wal_path).exists() {
+            std::fs::remove_file(wal_path).unwrap();
+        }
         std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
     }
 
