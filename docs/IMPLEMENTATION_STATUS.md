@@ -45,7 +45,8 @@ The current page format is a physical layout milestone only. Startup still recon
 
 - [x] Typed positional SQL parameters in the Rust API.
 - [x] Typed positional parameters inside transaction sessions.
-- [x] SQL LIMIT clause for bounded result sets.
+- [x] SQL LIMIT clause applied during index lookup and table scans.
+- [ ] TTL expiry index and explicitly budgeted expiration sweeps.
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
 - [ ] Stable framed client/server protocol.
