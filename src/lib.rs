@@ -1358,6 +1358,40 @@ mod tests {
         assert_eq!(result.rows[0].values[0], Value::Integer(2));
     }
 
+
+    #[test]
+    fn persistent_ksl_composite_key_and_upsert_survive_checkpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-ksl-pk-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE IF NOT EXISTS ksl_persist (script_name VARCHAR(190) NOT NULL, \"key\" VARCHAR(190) NOT NULL, value TEXT, PRIMARY KEY (script_name, \"key\"))").unwrap();
+            db.execute_params(
+                "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?) ON CONFLICT (script_name, \"key\") DO UPDATE SET value = EXCLUDED.value",
+                &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("125".into())],
+            ).unwrap();
+            db.execute_params(
+                "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?) ON CONFLICT (script_name, \"key\") DO UPDATE SET value = EXCLUDED.value",
+                &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("400".into())],
+            ).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute_params(
+            "SELECT value FROM ksl_persist WHERE script_name = ? AND \"key\" = ?",
+            &[Value::Text("economy".into()), Value::Text("balance".into())],
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Text("400".into()));
+        assert!(reopened.execute("INSERT INTO ksl_persist VALUES ('economy', 'balance', 'duplicate')").is_err());
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
