@@ -722,6 +722,28 @@ mod tests {
         assert!(db.execute_params("SELECT * FROM missing", &[Value::Integer(1)]).is_err());
     }
 
+
+    #[test]
+    fn wal_replay_restores_index_definitions() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-index-wal-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE indexed_players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("INSERT INTO indexed_players VALUES ('player-1', 12)").unwrap();
+            db.execute("CREATE INDEX idx_indexed_players_uuid ON indexed_players (uuid)").unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM indexed_players WHERE uuid = 'player-1'").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
