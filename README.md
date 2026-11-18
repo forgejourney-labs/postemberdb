@@ -30,7 +30,7 @@ The project is at an early development stage. The first prototype provides:
 - secondary indexes backed by the native in-memory B+ tree and stable table-local row IDs;
 - incremental index-key maintenance for INSERT, UPDATE, DELETE, and UPSERT; DELETE compacts table rows without rebuilding index trees;
 - direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;
-- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, and atomic prefix deletion;
+- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, and bounded per-call prefix cleanup;
 - a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
