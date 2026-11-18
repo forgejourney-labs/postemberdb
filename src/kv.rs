@@ -169,7 +169,7 @@ impl RegistryValue {
 
 fn normalize_path(path: &str) -> Result<String, DbError> {
     let mut components = Vec::new();
-    for component in path.split(|character| character == '/' || character == '\\\\') {
+    for component in path.split(|character| character == '/' || character == '\\') {
         let component = component.trim();
         if component.is_empty() { continue; }
         if component == "." || component == ".." || component.contains('\0') {
