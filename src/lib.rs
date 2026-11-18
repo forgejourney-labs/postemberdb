@@ -1,7 +1,7 @@
 //! PostemberDB: an independent, Rust-native SQL-like database engine.
 //!
-//! The first implementation is intentionally in-memory. Persistence, transactions,
-//! indexing, and the network protocol will be developed as separate engine layers.
+//! The engine supports both in-memory databases and an initial persistent file format.
+//! Transactions, indexing, and crash recovery remain future engine layers.
 
 use std::collections::BTreeMap;
 use std::fmt;
