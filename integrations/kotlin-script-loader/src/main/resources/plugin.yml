@@ -1,0 +1,5 @@
+name: PostemberDBKSL
+version: ${version}
+main: io.postemberdb.ksl.PostemberDbAddon
+api-version: '1.21'
+depend: [KotlinScriptLoader]
