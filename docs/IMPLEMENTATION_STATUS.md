@@ -58,17 +58,19 @@ The native B+ tree now backs SQL index equality lookups and is also available as
 - [ ] TTL expiry index and explicitly budgeted expiration sweeps.
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
-- [ ] Stable framed client/server protocol.
+- [x] Versioned JSONL/1 request/response protocol with typed JSON values and legacy line-protocol compatibility.
 - [ ] JDBC driver and service-provider registration.
-- [ ] KSL dialect, configuration, migration, and connection-pool integration.
+- [x] Separate KSL addon service with loopback-only client, configuration, and async query/write methods.
+- [ ] JDBC driver, native prepared statements, transaction scope in the addon, and KSL JDBC dialect/connection-pool integration.
 - [ ] PreparedStatement, ResultSet, timeout, row-limit, and cancellation compatibility tests.
 - [ ] End-to-end tests using the actual KSL plugin.
 
-KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL backend.
+A separate PostemberDBKSL addon now registers a KSL service and exposes async query/write methods over JSONL/1. It is not a JDBC driver and does not replace KSL's existing JDBC backend. End-to-end testing against a running Paper/KSL server is still pending.
 
 ## 5. Security and operations
 
 - [x] Development server rejects non-loopback bind addresses until TLS/authentication exist.
+- [x] KSL bridge independently validates loopback destinations and refuses remote database hosts.
 - [x] Bounded client count, SQL line size, UTF-8 input, and socket timeouts.
 - [x] CLI recovery check and WAL checkpoint commands.
 - [ ] TLS, authentication, role-based authorization, and audit log.
