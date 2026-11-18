@@ -107,3 +107,21 @@ The benchmark inserts a generated player-statistics dataset in bounded batches, 
 Snapshots are now stored as a PPG1 page file. The file uses fixed 4 KiB pages, page sequence identifiers, per-page checksums, and a whole-payload checksum. The decoder remains backward-compatible with the earlier raw PDB1, PDB2, and PDB3 snapshot payloads.
 
 This is the first physical page-format milestone, not yet the large-database memory solution: startup still reads the complete page file, reconstructs the serialized snapshot, and loads every table row into memory. The next storage task is a bounded page cache with lazy page reads and streaming scans; only after that can PostemberDB claim bounded-memory table access.
+
+
+## Parameterized SQL API
+
+The Rust API exposes typed positional parameters for the supported SQL subset:
+
+```rust
+let result = db.execute_params(
+    "SELECT * FROM player_stats WHERE uuid = ?",
+    &[Value::Text(player_uuid.to_owned())],
+)?;
+```
+
+Parameters are encoded from typed `Value` variants and quoted by the engine; callers should not concatenate untrusted player input into SQL strings. The transaction facade also exposes `execute_params`. This is a Rust API capability, not yet a JDBC `PreparedStatement` implementation.
+
+## Exact KSL adapter status
+
+KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its published dialect set is SQLite, MySQL, MariaDB, and PostgreSQL; PostemberDB is not yet a selectable KSL dialect. A production adapter therefore still needs a stable server protocol, a JDBC driver, and KSL dialect/migration support. The current Rust TCP line server is only a development interface and must not be presented as the KSL adapter.
