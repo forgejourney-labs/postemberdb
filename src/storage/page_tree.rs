@@ -160,7 +160,7 @@ fn insert_recursive(
             for split in 1..entries.len() {
                 if let (Ok(left), Ok(right)) = (encode_leaf(&entries[..split]), encode_leaf(&entries[split..])) {
                     let imbalance = left.len().abs_diff(right.len());
-                    if best_split.is_none_or(|(_, best)| imbalance < best) {
+                    if best_split.map_or(true, |(_, best)| imbalance < best) {
                         best_split = Some((split, imbalance));
                     }
                 }
