@@ -55,7 +55,17 @@ The current page format is a physical layout milestone only. Startup still recon
 
 KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL backend.
 
-## 5. Minecraft workloads and performance
+## 5. Security and operations
+
+- [x] Development server rejects non-loopback bind addresses until TLS/authentication exist.
+- [x] Bounded client count, SQL line size, UTF-8 input, and socket timeouts.
+- [x] CLI recovery check and WAL checkpoint commands.
+- [ ] TLS, authentication, role-based authorization, and audit log.
+- [ ] Encryption at rest and managed key rotation.
+- [ ] Verified full/incremental backup and restore.
+- [ ] Fuzzing, corruption tests, and fault-injection release suite.
+
+## 6. Minecraft workloads and performance
 
 - [x] Reproducible 100,000-row player-statistics benchmark harness.
 - [x] Bulk insert and UUID equality lookup workload.
@@ -65,6 +75,22 @@ KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL ba
 - [ ] Restart/recovery stress tests with large WALs.
 - [ ] Concurrent player-update and read-heavy workload tests.
 - [ ] Memory ceiling, tail latency, and queue-backpressure measurements.
+
+## 7. Source layout
+
+- [x] SQL parsing helpers moved to src/sql.rs.
+- [x] Development server and its tests moved to src/server.rs.
+- [ ] Split storage into codec, WAL, page-file, and allocator modules.
+- [ ] Split the engine into catalog, index, execution, transaction, and buffer-pool modules.
+
+## 8. Storage roadmap
+
+- [ ] EmberTree page-oriented B+ tree and extent allocator.
+- [ ] Explicit CoW and in-place update modes with crash-safe recovery.
+- [ ] FragmentationStats and manually budgeted defrag APIs.
+- [ ] Per-page LZ4/Snappy compression with decompression limits.
+- [ ] Snapshot and incremental backup/restore system.
+- [ ] Explicit page/index/query/WAL memory budgets.
 
 ## Release gate
 
