@@ -475,9 +475,11 @@ fn validate_node<K: Ord + Clone, V, const ORDER: usize>(
             for index in 0..keys.len() {
                 let left_max = bounds[index].as_ref().map(|(_, max)| max);
                 let right_min = bounds[index + 1].as_ref().map(|(min, _)| min);
-                if left_max.is_some_and(|max| max >= &keys[index])
-                    || right_min.is_some_and(|min| min != &keys[index]) {
-                    return Err("internal separator does not match child key ranges".into());
+                if left_max.is_some_and(|max| max >= &keys[index]) {
+                    return Err(format!("internal separator violates left child upper bound at index {index}"));
+                }
+                if right_min.is_some_and(|min| min != &keys[index]) {
+                    return Err(format!("internal separator differs from right child minimum at index {index}"));
                 }
             }
             let min = bounds.first().and_then(|bound| bound.as_ref()).map(|(min, _)| min.clone());
