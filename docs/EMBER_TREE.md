@@ -146,3 +146,8 @@ TTL must not silently delete data based on an untrusted or backwards-moving wall
 ## Incremental deletion
 
 `remove_many` performs copy-on-write deletion for an ordered batch. Missing keys are ignored. Changed search paths are staged as immutable pages, adjacent same-level siblings are coalesced when their combined contents fit in one page, and unary roots are collapsed before a single redo record and root publication. When siblings cannot be coalesced, a non-root unary internal node may remain. Redistribution of underfull siblings, a minimum-occupancy invariant, SQL transaction-delta integration, and page reclamation are still pending. The current delete API is a storage primitive and is not yet wired into SQL DELETE or SQL index synchronization.
+
+
+## SQL transaction delta integration
+
+After the canonical SQL WAL commit is durable, the database now compares the previous and next in-memory index entry sets and applies only removed row-reference keys with `remove_many` and new keys with `insert_many`. Unchanged persistent subtrees are retained by copy-on-write path updates. If the mirror update fails, the SQL transaction remains committed and the engine falls back to in-memory indexes; startup can rebuild the derived mirror from the SQL snapshot/WAL. This first delta implementation still scans all in-memory index entries to calculate the set difference, so delta discovery is O(total indexed entries). Because SQL row references are positional, deleting a row can shift references for later rows and produce a larger delta. Stable row identifiers and direct mutation journaling are future optimizations. SQL rows/catalog are still not page-backed.
