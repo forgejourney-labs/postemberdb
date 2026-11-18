@@ -25,7 +25,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Index maintenance during INSERT and bounded bulk insert.
 - [x] Persist index definitions and rebuild index entries after snapshot load.
 - [x] Restore index definitions through WAL replay.
-- [ ] Unique and composite indexes.
+- [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
+- [ ] General composite indexes, range scans, ordering, and index selection for multi-predicate queries.
 - [ ] Range scans, ordering, and index selection for multi-predicate queries.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
