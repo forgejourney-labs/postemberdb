@@ -346,6 +346,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pdb4_rows_receive_stable_identifiers_on_load() {
+        let path = test_path("legacy-pdb4-row-ids");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PDB4");
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        put_u32(&mut bytes, 1);
+        put_string(&mut bytes, "legacy_rows").unwrap();
+        put_u32(&mut bytes, 1);
+        put_string(&mut bytes, "value").unwrap();
+        bytes.push(2); // TEXT
+        bytes.push(0); // NOT NULL
+        put_u32(&mut bytes, 0); // indexes
+        put_u32(&mut bytes, 2); // rows
+        bytes.push(2);
+        put_string(&mut bytes, "first").unwrap();
+        bytes.push(2);
+        put_string(&mut bytes, "second").unwrap();
+        fs::write(&path, bytes).unwrap();
+
+        let db = Database::decode_file(&path).unwrap();
+        let table = db.tables.get("legacy_rows").unwrap();
+        assert_eq!(table.rows[0].row_id, 1);
+        assert_eq!(table.rows[1].row_id, 2);
+        assert_eq!(table.next_row_id, 3);
+        assert_eq!(table.row_positions.get(&1), Some(&0));
+        assert_eq!(table.row_positions.get(&2), Some(&1));
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn committed_sql_indexes_are_mirrored_into_persistent_ember_tree() {
         let path = test_path("ember-index-mirror");
         let page_path = page_tree_file_path(&path);
@@ -389,8 +420,8 @@ mod tests {
             .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
             .collect::<Vec<_>>();
         assert_eq!(refs.len(), 700);
-        assert_eq!(refs.first(), Some(&0));
-        assert_eq!(refs.last(), Some(&699));
+        assert_eq!(refs.first(), Some(&1));
+        assert_eq!(refs.last(), Some(&700));
         drop(store);
 
         for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
