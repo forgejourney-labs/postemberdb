@@ -104,7 +104,7 @@ The benchmark inserts a generated player-statistics dataset in bounded batches, 
 
 ## Fixed-size page snapshots
 
-Snapshots are now stored as a PPG1 page file. The file uses fixed 4 KiB pages, page sequence identifiers, per-page checksums, and a whole-payload checksum. The decoder remains backward-compatible with the earlier raw PDB1, PDB2, and PDB3 snapshot payloads.
+Snapshots are now stored as a PPG1 page file. The file uses fixed 4 KiB pages, page sequence identifiers, per-page checksums, and a whole-payload checksum. The decoder remains backward-compatible with the earlier raw PDB1, PDB2, PDB3, and PDB4 snapshot payloads.
 
 This is the first physical page-format milestone, not yet the large-database memory solution: startup still reads the complete page file, reconstructs the serialized snapshot, and loads every table row into memory. The next storage task is a bounded page cache with lazy page reads and streaming scans; only after that can PostemberDB claim bounded-memory table access.
 
@@ -137,3 +137,6 @@ The engine now exposes an owned `DatabaseSession`. A session works against a pri
 The Rust SQL subset now accepts the core DDL patterns used by KSL's schema migrations: `CREATE TABLE IF NOT EXISTS`, `VARCHAR(n)`, `TEXT`/`LONGTEXT`, integer types, quoted identifiers, and composite primary keys. Composite primary-key uniqueness is enforced and its B-tree index can serve matching equality predicates. The insert path supports both `ON CONFLICT (...) DO UPDATE SET ... EXCLUDED.column` and `ON DUPLICATE KEY UPDATE ... VALUES(column)` upserts. Column-list inserts, projections, `UPDATE`, `DELETE`, and `AND`-joined equality predicates are also implemented.
 
 This brings the engine closer to KSL's SQL usage, but does not complete the integration. The current engine still lacks a JDBC driver, full JDBC semantics, some SQL features used by arbitrary scripts, row/result limits, and the production wire protocol. KSL itself has not yet been modified to add a PostemberDB dialect.
+
+
+The Rust SQL layer also supports `COUNT(*) AS alias` for common aggregate lookups. It still does not implement the full SQL grammar or every feature used by arbitrary KSL scripts.
