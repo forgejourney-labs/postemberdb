@@ -1262,6 +1262,42 @@ mod tests {
 
 
     #[test]
+    fn durable_sql_commit_survives_embertree_mirror_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-mirror-failure-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let page_path = format!("{}.pages", path.display());
+        let wal_path = format!("{}.wal", path.display());
+        let lock_path = format!("{}.lock", path.display());
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE mirror_failure (id INTEGER, tag TEXT)").unwrap();
+            db.execute("CREATE INDEX idx_mirror_failure_tag ON mirror_failure (tag)").unwrap();
+
+            std::fs::remove_file(&page_path).unwrap();
+            std::fs::create_dir(&page_path).unwrap();
+            db.execute("INSERT INTO mirror_failure VALUES (41, 'committed')").unwrap();
+            assert!(!db.ember_indexes_valid);
+            let result = db.execute("SELECT * FROM mirror_failure WHERE tag = 'committed'").unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].values[0], Value::Integer(41));
+        }
+        std::fs::remove_dir(&page_path).unwrap();
+
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM mirror_failure WHERE tag = 'committed'").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Integer(41));
+        drop(reopened);
+
+        for candidate in [path.to_string_lossy().to_string(), wal_path, lock_path, page_path, format!("{}.pages.btree.wal", path.display())] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn select_limit_bounds_result_rows_with_and_without_index_predicates() {
         let mut db = Database::new();
         db.execute("CREATE TABLE player_events (uuid TEXT, event TEXT)").unwrap();
