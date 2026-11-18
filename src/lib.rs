@@ -668,12 +668,12 @@ impl Database {
             let persistent_index = if self.ember_indexes_valid {
                 self.storage_path.as_deref().and_then(|path| {
                     table.indexes.iter().find(|(_, index)| index.column_indices == columns)
-                        .map(|(name, index)| (path, name.as_str(), index))
+                        .map(|(name, _)| (path, name.as_str()))
                 })
             } else {
                 None
             };
-            if let Some((path, index_name, index)) = persistent_index {
+            if let Some((path, index_name)) = persistent_index {
                 let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
                 let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
                 if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key)? {
