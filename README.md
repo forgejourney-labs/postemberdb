@@ -27,7 +27,7 @@ The project is at an early development stage. The first prototype provides:
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** WAL transactions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range/composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range/composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
 
 ## Build and test
 
