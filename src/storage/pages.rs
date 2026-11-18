@@ -57,19 +57,26 @@ pub(super) fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
     }
 
     let mut payload = Vec::with_capacity(payload_len);
+    let mut remaining = payload_len;
     for page_number in 0..page_count {
         let start = 32 + page_number * PAGE_SIZE;
         let page_id = u32::from_le_bytes(file[start..start + 4].try_into().unwrap()) as usize;
         let used = u32::from_le_bytes(file[start + 4..start + 8].try_into().unwrap()) as usize;
         let page_checksum = u64::from_le_bytes(file[start + 8..start + 16].try_into().unwrap());
-        if page_id != page_number || used > PAGE_PAYLOAD_SIZE {
+        let expected_used = remaining.min(PAGE_PAYLOAD_SIZE);
+        if page_id != page_number || used != expected_used {
             return Err(DbError::Storage(format!("invalid page metadata for page {page_number}")));
         }
-        let data = &file[start + PAGE_META_SIZE..start + PAGE_META_SIZE + used];
+        let page_payload = &file[start + PAGE_META_SIZE..start + PAGE_SIZE];
+        let data = &page_payload[..used];
+        if page_payload[used..].iter().any(|byte| *byte != 0) {
+            return Err(DbError::Storage(format!("non-zero page padding for page {page_number}")));
+        }
         if checksum(data) != page_checksum {
             return Err(DbError::Storage(format!("page checksum mismatch for page {page_number}")));
         }
         payload.extend_from_slice(data);
+        remaining -= used;
     }
     if payload.len() != payload_len || checksum(&payload) != expected_checksum {
         return Err(DbError::Storage("page-file payload checksum mismatch".into()));
