@@ -1026,6 +1026,8 @@ mod tests {
 
             db.execute("INSERT INTO delta_players VALUES ('player-d', 40)").unwrap();
             assert!(db.ember_indexes_valid);
+            let player_c_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
+                .unwrap().rows[0].row_id;
             db.execute("UPDATE delta_players SET uuid = 'player-a2' WHERE uuid = 'player-a'").unwrap();
             assert!(db.ember_indexes_valid);
             db.execute("DELETE FROM delta_players WHERE uuid = 'player-b'").unwrap();
@@ -1034,7 +1036,9 @@ mod tests {
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a'").unwrap().rows.len(), 0);
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
-            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+            let player_c_after_delete = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
+                .unwrap().rows[0].row_id;
+            assert_eq!(player_c_after_delete, player_c_id, "deleting an earlier row must not renumber later rows");
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-d'").unwrap().rows.len(), 1);
             db.checkpoint().unwrap();
         }
@@ -1042,7 +1046,9 @@ mod tests {
         assert!(reopened.ember_indexes_valid);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
-        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+        let player_c_reopened = reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
+            .unwrap().rows[0].row_id;
+        assert_eq!(player_c_reopened, player_c_id, "PDB5 checkpoint must preserve stable row identifiers");
         drop(reopened);
         for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
             let candidate = format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix));
