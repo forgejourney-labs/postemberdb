@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 mod allocator;
-mod btree;
+pub(crate) mod btree;
 mod pages;
 mod wal;
 
