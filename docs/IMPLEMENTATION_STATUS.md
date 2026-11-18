@@ -21,21 +21,19 @@ This file tracks implemented behavior separately from planned work. A checked bo
 ## 2. Indexes
 
 - [x] Single-column typed B-tree equality indexes.
-- [x] Unique composite indexes generated from SQL PRIMARY KEY constraints.
 - [x] CREATE INDEX and SELECT equality predicates.
 - [x] Index maintenance during INSERT and bounded bulk insert.
 - [x] Persist index definitions and rebuild index entries after snapshot load.
 - [x] Restore index definitions through WAL replay.
 - [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
 - [ ] User-defined general composite indexes, range scans, ordering, and a cost-aware index planner.
-- [ ] Range scans, ordering, and index selection for multi-predicate queries.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
 ## 3. Page-oriented storage
 
 - [x] Fixed 4 KiB page-file snapshots.
 - [x] Page identifiers, per-page checksums, and whole-payload checksum.
-- [x] Backward-compatible reads for the earlier raw PDB1/PDB2/PDB3 snapshot payloads.
+- [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
