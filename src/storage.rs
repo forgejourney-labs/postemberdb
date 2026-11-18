@@ -341,6 +341,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_db_extension_reads_old_snapshot_and_checkpoints_to_current_format() {
+        let path = test_path("legacy-db").with_extension("db");
+        let mut legacy = b"PDB1".to_vec();
+        legacy.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, legacy).unwrap();
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE legacy_rows (id INTEGER, label TEXT)").unwrap();
+            db.execute("INSERT INTO legacy_rows VALUES (1, 'kept')").unwrap();
+            db.checkpoint().unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM legacy_rows").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[1], Value::Text("kept".into()));
+        drop(reopened);
+
+        assert!(fs::read(&path).unwrap().starts_with(PAGE_MAGIC));
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(wal_file_path(&path)).ok();
+        fs::remove_file(lock_file_path(&path)).ok();
+    }
+
+    #[test]
     fn rejects_invalid_database_header() {
         let path = test_path("invalid");
         fs::write(&path, b"NOPE").unwrap();
