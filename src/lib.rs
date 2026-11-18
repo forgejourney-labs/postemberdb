@@ -369,6 +369,7 @@ impl Database {
         }
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
+        self.sync_ember_indexes()?;
         Ok(())
     }
 
@@ -767,6 +768,7 @@ impl Transaction<'_> {
             self.database.revision = self.database.revision.wrapping_add(1);
         }
         self.database.tables = self.staged.tables;
+        self.database.sync_ember_indexes()?;
         Ok(())
     }
 }
