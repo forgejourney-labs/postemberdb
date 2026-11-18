@@ -350,6 +350,38 @@ mod tests {
     }
 
     #[test]
+    fn sql_wal_rebuilds_missing_ember_index_sidecar_on_open() {
+        let path = test_path("ember-index-rebuild");
+        let page_path = page_tree_file_path(&path);
+        let tree_wal_path = page_tree_wal_file_path(&path);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE rebuild_rows (id INTEGER, label TEXT)").unwrap();
+            db.execute("CREATE INDEX idx_rebuild_label ON rebuild_rows (label)").unwrap();
+            db.execute("INSERT INTO rebuild_rows VALUES (7, 'durable')").unwrap();
+        }
+        fs::remove_file(&page_path).unwrap();
+
+        let reopened = Database::open(&path).unwrap();
+        let mut store = extent::ExtentFile::open(&page_path).unwrap();
+        let mut disk_key = Vec::new();
+        put_namespace_part(&mut disk_key, b"rebuild_rows").unwrap();
+        put_namespace_part(&mut disk_key, b"idx_rebuild_label").unwrap();
+        disk_key.extend_from_slice(&index_codec::encode_index_key(
+            &super::super::IndexKey::from(&Value::Text("durable".into()))
+        ).unwrap());
+        let encoded_rows = page_tree::get(&mut store, &disk_key).unwrap().unwrap();
+        assert_eq!(index_codec::decode_row_refs(&encoded_rows).unwrap(), vec![0]);
+        assert_eq!(reopened.tables["rebuild_rows"].rows.len(), 1);
+        drop(store);
+        drop(reopened);
+
+        for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn database_reopens_with_persisted_rows() {
         let path = test_path("roundtrip");
         {
@@ -571,6 +603,9 @@ impl Database {
             }
         }
 
+        if entries.is_empty() && !page_path.exists() && !tree_wal_path.exists() {
+            return Ok(());
+        }
         let mut store = extent::ExtentFile::open(&page_path)?;
         if entries.is_empty() {
             store.publish_root(None)?;
