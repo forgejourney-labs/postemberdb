@@ -595,10 +595,17 @@ impl Database {
                     put_namespace_part(&mut disk_key, table_name.as_bytes())?;
                     put_namespace_part(&mut disk_key, index_name.as_bytes())?;
                     disk_key.extend_from_slice(&encoded);
-                    if disk_key.len() > 1024 {
-                        return Err(DbError::Storage("namespaced SQL index key exceeds EmberTree's 1024-byte limit".into()));
+                    if disk_key.len() > 1015 {
+                        return Err(DbError::Storage("namespaced SQL index key leaves no room for its row-reference suffix".into()));
                     }
-                    entries.insert(disk_key, rows);
+                    for row in rows {
+                        let row = u64::try_from(row)
+                            .map_err(|_| DbError::Storage("SQL row reference does not fit in u64".into()))?;
+                        let mut entry_key = disk_key.clone();
+                        entry_key.push(0);
+                        entry_key.extend_from_slice(&row.to_be_bytes());
+                        entries.insert(entry_key, Vec::new());
+                    }
                 }
             }
         }
