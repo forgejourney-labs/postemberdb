@@ -769,15 +769,20 @@ fn collect_ember_index_entries(
                 if disk_key.len() > 1015 {
                     return Ok(None);
                 }
-                for row_position in rows {
+                for row_id in rows {
+                    if row_id == 0 {
+                        return Err(DbError::Storage("in-memory SQL index contains a zero stable row identifier".into()));
+                    }
+                    let row_position = table.row_positions.get(&row_id).copied()
+                        .ok_or_else(|| DbError::Storage("in-memory SQL index references an unknown stable row identifier".into()))?;
                     let row = table.rows.get(row_position)
-                        .ok_or_else(|| DbError::Storage("in-memory SQL index contains an invalid row position".into()))?;
-                    if row.row_id == 0 {
-                        return Err(DbError::Storage("in-memory SQL row has a zero stable identifier".into()));
+                        .ok_or_else(|| DbError::Storage("stable row identifier maps to an invalid row position".into()))?;
+                    if row.row_id != row_id {
+                        return Err(DbError::Storage("stable row identifier map does not match the table row".into()));
                     }
                     let mut entry_key = disk_key.clone();
                     entry_key.push(0);
-                    entry_key.extend_from_slice(&row.row_id.to_be_bytes());
+                    entry_key.extend_from_slice(&row_id.to_be_bytes());
                     entries.insert(entry_key);
                 }
             }
