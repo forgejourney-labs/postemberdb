@@ -100,3 +100,10 @@ cargo bench --bench minecraft_workload
 ```
 
 The benchmark inserts a generated player-statistics dataset in bounded batches, builds a UUID index, and times a set of equality lookups. Results depend on hardware and must be recorded alongside the machine, Rust version, dataset size, and commit SHA. Do not compare numbers from different machines as if they were controlled results.
+
+
+## Fixed-size page snapshots
+
+Snapshots are now stored as a PPG1 page file. The file uses fixed 4 KiB pages, page sequence identifiers, per-page checksums, and a whole-payload checksum. The decoder remains backward-compatible with the earlier raw PDB1, PDB2, and PDB3 snapshot payloads.
+
+This is the first physical page-format milestone, not yet the large-database memory solution: startup still reads the complete page file, reconstructs the serialized snapshot, and loads every table row into memory. The next storage task is a bounded page cache with lazy page reads and streaming scans; only after that can PostemberDB claim bounded-memory table access.
