@@ -15,13 +15,15 @@ KSL is an optional integration target, not a requirement for using PostemberDB. 
 
 The project is at an early development stage. The first prototype provides:
 
-- an in-memory database shared by the Embedded API and server process;
+- an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`;
 - basic `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT * FROM` statements;
 - integer, text, boolean, and nullable values;
 - basic column type and `NOT NULL` validation;
+- a versioned binary on-disk format with automatic persistence after successful table creation and inserts;
+- temporary-file writes followed by rename when saving the database;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** data is memory-only and is lost when the process exits. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** the storage layer rewrites the full database file after each successful write; it has no WAL, transactions, crash-recovery protocol, checksums, or concurrent multi-process file locking. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
 
 ## Build and test
 
@@ -38,7 +40,7 @@ cargo build --release
 cargo run -- server 127.0.0.1:7432
 ```
 
-The development protocol accepts one SQL statement per line. Send `QUIT` to close a client session.
+The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line. Send `QUIT` to close a client session.
 
 ## Use as an embedded library
 
@@ -46,7 +48,7 @@ The development protocol accepts one SQL statement per line. Send `QUIT` to clos
 use postemberdb::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = Database::new();
+    let mut db = Database::open("./data/app.pdb")?;
     db.execute("CREATE TABLE users (id INTEGER NOT NULL, name TEXT)")?;
     db.execute("INSERT INTO users VALUES (1, 'Ada')")?;
 
@@ -59,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Roadmap
 
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
-2. Introduce a page-oriented storage layer and durable on-disk format.
+2. Evolve the initial file snapshot format into page-oriented storage.
 3. Add write-ahead logging, crash recovery, and transactions.
 4. Add indexes and a cost-aware query planner.
 5. Harden the server protocol with authentication, framing, and resource limits.
