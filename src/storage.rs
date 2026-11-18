@@ -202,3 +202,61 @@ impl<'a> Decoder<'a> {
         Ok(len)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("postemberdb-{label}-{}-{nonce}.pdb", std::process::id()))
+    }
+
+    #[test]
+    fn database_reopens_with_persisted_rows() {
+        let path = test_path("roundtrip");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER NOT NULL, name TEXT, active BOOLEAN)").unwrap();
+            db.execute("INSERT INTO users VALUES (7, 'Ada', TRUE)").unwrap();
+            db.execute("INSERT INTO users VALUES (8, 'Lin', FALSE)").unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM users").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values, vec![
+            Value::Integer(7), Value::Text("Ada".into()), Value::Boolean(true)
+        ]);
+        assert_eq!(result.rows[1].values, vec![
+            Value::Integer(8), Value::Text("Lin".into()), Value::Boolean(false)
+        ]);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_database_header() {
+        let path = test_path("invalid");
+        fs::write(&path, b"NOPE").unwrap();
+        let error = Database::open(&path).unwrap_err();
+        assert!(error.to_string().contains("invalid database file header"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_statement_does_not_replace_persisted_state() {
+        let path = test_path("failed-write");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE counters (value INTEGER)").unwrap();
+            assert!(db.execute("INSERT INTO counters VALUES ('not-an-integer')").is_err());
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.execute("SELECT * FROM counters").unwrap().rows.len(), 0);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+}
