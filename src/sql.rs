@@ -197,7 +197,7 @@ pub(super) fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String,
     Ok(output)
 }
 
-fn value_to_sql(value: &Value) -> String {
+pub(super) fn value_to_sql(value: &Value) -> String {
     match value {
         Value::Null => "NULL".into(),
         Value::Integer(value) => value.to_string(),
