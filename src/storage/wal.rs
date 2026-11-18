@@ -46,9 +46,12 @@ impl Database {
                 0 => break,
                 _ => {}
             }
-            if file.read_exact(&mut header[1..]).is_err() {
-                truncated_tail = true;
-                break;
+            if let Err(error) = file.read_exact(&mut header[1..]) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    truncated_tail = true;
+                    break;
+                }
+                return Err(storage_error(error));
             }
             if &header[..4] != b"PWT2" {
                 return Err(DbError::Storage(format!("invalid WAL frame header at byte {offset}")));
@@ -60,9 +63,12 @@ impl Database {
                 return Err(DbError::Storage("WAL frame exceeds 64 MiB".into()));
             }
             let mut payload = vec![0u8; len];
-            if file.read_exact(&mut payload).is_err() {
-                truncated_tail = true;
-                break;
+            if let Err(error) = file.read_exact(&mut payload) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    truncated_tail = true;
+                    break;
+                }
+                return Err(storage_error(error));
             }
             if checksum(&payload) != expected {
                 return Err(DbError::Storage(format!("WAL checksum mismatch at byte {offset}")));
