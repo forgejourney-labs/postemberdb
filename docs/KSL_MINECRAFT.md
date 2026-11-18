@@ -140,3 +140,6 @@ This brings the engine closer to KSL's SQL usage, but does not complete the inte
 
 
 The Rust SQL layer also supports `COUNT(*) AS alias` for common aggregate lookups. It still does not implement the full SQL grammar or every feature used by arbitrary KSL scripts.
+
+
+The SQL subset now accepts LIMIT and applies it while collecting matching row IDs, rather than materializing every result row first. This is useful for KSL's query row ceiling, although the engine still lacks streaming ResultSet pages and a server-side query timeout/cancellation contract.
