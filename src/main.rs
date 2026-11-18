@@ -9,15 +9,15 @@ fn main() {
     let result = match command.as_deref() {
         Some("server") => {
             let address = args.next().unwrap_or_else(|| "127.0.0.1:7432".into());
-            let data_path = args.next().unwrap_or_else(|| "postemberdb.pdb".into());
+            let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             server::run_server(&address, &data_path)
         }
         Some("check") => {
-            let path = args.next().unwrap_or_else(|| "postemberdb.pdb".into());
+            let path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             run_check(&path)
         }
         Some("checkpoint") => {
-            let path = args.next().unwrap_or_else(|| "postemberdb.pdb".into());
+            let path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             run_checkpoint(&path)
         }
         Some("version") | Some("--version") | Some("-V") => {
