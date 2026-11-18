@@ -36,21 +36,23 @@ This file tracks implemented behavior separately from planned work. A checked bo
 
 ## 3. Page-oriented storage
 
-- [x] Fixed 4 KiB page-file snapshots.
-- [x] Page identifiers, per-page checksums, and whole-payload checksum.
-- [x] Strict page validation for canonical payload lengths, zero padding, and platform-safe length conversion.
+- [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums.
+- [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
+- [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
+- [x] Dual-slot EAM1 metadata persistence with generation checksums and fallback to the previous valid slot.
+- [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
 - [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
-- [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
+- [ ] Connect the experimental extent allocator to B+ tree root publication and WAL recovery; persistent tree-page serialization, pinning, compaction, and crash-safe reclamation remain pending.
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
 - [x] In-memory B+ tree deletion with leaf/internal borrowing, merging, root collapse, and strict occupancy validation; focused and deterministic reference tests added.
 - [x] Stack-based successor-leaf traversal for in-memory range scans.
 - [ ] Persistent leaf sibling links (optional follow-up), page serialization, persistent index nodes, and catalog/page-file integration.
 
-The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The PPG1 snapshot format remains a physical snapshot layout, not a lazy page store. A separate experimental ExtentFile primitive now persists EPG1 data pages and a dual-slot EAM1 free-extent map; it has focused tests for reopen, reuse, coalescing, metadata fallback, and checksums. ExtentFile is not yet connected to Database commits, B+ tree roots, or WAL recovery, so it is not the active database storage backend. Startup still reconstructs the complete PPG1 snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
@@ -101,7 +103,7 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 
 ## 8. Storage roadmap
 
-- [ ] EmberTree page-oriented B+ tree and extent allocator (the in-memory B+ tree core exists; page-backed integration and extent management remain pending).
+- [ ] EmberTree page-oriented B+ tree (the in-memory B+ tree and an experimental persistent extent-file primitive exist; catalog/root integration and WAL-coordinated page commits remain pending).
 - [ ] Explicit CoW and in-place update modes with crash-safe recovery.
 - [ ] FragmentationStats and manually budgeted defrag APIs.
 - [ ] Per-page LZ4/Snappy compression with decompression limits.
