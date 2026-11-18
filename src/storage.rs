@@ -706,10 +706,17 @@ impl Database {
         if journal.is_empty() {
             return Ok(true);
         }
-        let removals = journal.iter().filter(|delta| !delta.insert)
-            .map(|delta| delta.key.clone()).collect::<Vec<_>>();
-        let upserts = journal.iter().filter(|delta| delta.insert)
-            .map(|delta| (delta.key.clone(), Vec::new())).collect::<Vec<_>>();
+        // Collapse repeated mutations by key in transaction order. The final
+        // operation wins, so INSERT followed by DELETE cannot resurrect a stale
+        // persistent index entry when removals and upserts are batched separately.
+        let mut final_states = BTreeMap::<Vec<u8>, bool>::new();
+        for delta in journal {
+            final_states.insert(delta.key.clone(), delta.insert);
+        }
+        let removals = final_states.iter().filter(|(_, insert)| !**insert)
+            .map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let upserts = final_states.iter().filter(|(_, insert)| **insert)
+            .map(|(key, _)| (key.clone(), Vec::new())).collect::<Vec<_>>();
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
         let mut store = extent::ExtentFile::open(&page_path)?;
