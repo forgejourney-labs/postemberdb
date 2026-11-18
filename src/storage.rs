@@ -335,6 +335,11 @@ mod tests {
             ])).unwrap();
         }
 
+        let mut reopened = Database::open(&path).unwrap();
+        let query = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap();
+        assert_eq!(query.rows.len(), 700);
+        drop(reopened);
+
         let mut store = extent::ExtentFile::open(&page_path).unwrap();
         let mut disk_key = Vec::new();
         put_namespace_part(&mut disk_key, b"players").unwrap();
