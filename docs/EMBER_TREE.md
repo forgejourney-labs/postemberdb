@@ -145,7 +145,7 @@ TTL must not silently delete data based on an untrusted or backwards-moving wall
 
 ## Incremental deletion
 
-`remove_many` performs copy-on-write deletion for an ordered batch. Missing keys are ignored. Changed search paths are staged as immutable pages, adjacent same-level siblings are coalesced when their combined contents fit in one page, and unary roots are collapsed before a single redo record and root publication. When siblings cannot be coalesced, a non-root unary internal node may remain. Redistribution of underfull siblings, a minimum-occupancy invariant, SQL transaction-delta integration, and page reclamation are still pending. The current delete API is a storage primitive and is not yet wired into SQL DELETE or SQL index synchronization.
+`remove_many` performs copy-on-write deletion for an ordered batch. Missing keys are ignored. Changed search paths are staged as immutable pages, adjacent same-level siblings are coalesced when their combined contents fit in one page, and unary roots are collapsed before a single redo record and root publication. When siblings cannot be coalesced, a non-root unary internal node may remain. Redistribution of underfull siblings, a minimum-occupancy invariant, and page reclamation are still pending. SQL DELETE transactions now update the derived persistent index mirror through this API after the canonical SQL WAL commit.
 
 
 ## SQL transaction delta integration
