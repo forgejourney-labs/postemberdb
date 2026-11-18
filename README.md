@@ -18,8 +18,8 @@ The project is at an early development stage. The first prototype provides:
 - an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`;
 - a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` equality predicates joined by `AND`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
 - integer, text, boolean, and nullable values;
-- basic column type and `NOT NULL` validation;
-- a versioned, fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
+- basic column type, `NOT NULL`, and composite primary-key validation;
+- a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
 - secondary B-tree indexes with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
