@@ -5,21 +5,21 @@
 //! The first milestone supports insertion, point lookup, bounded scans and
 //! structural validation; deletion and disk-page persistence are separate work.
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Node<K, V> {
     Leaf { keys: Vec<K>, values: Vec<V> },
     Internal { keys: Vec<K>, children: Vec<Box<Node<K, V>>> },
 }
 
 /// An in-memory B+ tree. ORDER is the maximum number of keys per node.
-#[derive(Debug)]
-pub(super) struct BPlusTree<K, V, const ORDER: usize = 32> {
+#[derive(Debug, Clone)]
+pub(crate) struct BPlusTree<K, V, const ORDER: usize = 32> {
     root: Box<Node<K, V>>,
     len: usize,
 }
 
 impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         assert!(ORDER >= 3, "B+ tree order must be at least 3");
         Self {
             root: Box::new(Node::Leaf { keys: Vec::new(), values: Vec::new() }),
