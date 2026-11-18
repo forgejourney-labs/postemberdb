@@ -314,7 +314,7 @@ mod tests {
 
     fn test_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("postemberdb-{label}-{}-{nonce}.pdb", std::process::id()))
+        std::env::temp_dir().join(format!("postemberdb-{label}-{}-{nonce}.pbd", std::process::id()))
     }
 
     #[test]
