@@ -239,10 +239,15 @@ fn remove_recursive<K: Ord + Clone, V, const ORDER: usize>(
             let child_index = keys.partition_point(|separator| key >= separator);
             let removed = remove_recursive::<K, V, ORDER>(children[child_index].as_mut(), key);
             if removed.is_some() {
+                // The child's minimum may have changed even when it did not
+                // underflow. Refresh parent separators before borrowing or
+                // merging: internal rebalancing moves the parent separator
+                // into a child, so using the stale value corrupts that subtree.
+                refresh_separators(keys, children);
                 if is_underfull(children[child_index].as_ref(), ORDER) {
                     rebalance_child(keys, children, child_index, ORDER);
+                    refresh_separators(keys, children);
                 }
-                refresh_separators(keys, children);
             }
             removed
         }
