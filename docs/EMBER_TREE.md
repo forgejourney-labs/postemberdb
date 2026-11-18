@@ -111,3 +111,17 @@ The current PPG1/PDB4 snapshot format is a prototype, not EmberTree. The new for
 ## Non-goals
 
 No claims of Btrfs-level maturity, no background compaction by default, no unbounded result materialization, no unbounded connection threads, and no unbounded decompression.
+
+## TTL (Time-To-Live)
+
+TTL is planned as indexed expiry metadata, not a timer thread per row. A table may define an expiry column or a TTL policy. The engine maintains an expiry-ordered tree so expired rows can be found without scanning every record.
+
+The intended semantics are:
+- expiration timestamps use a documented UTC epoch unit and checked integer conversion;
+- reads can optionally treat expired rows as invisible at a caller-supplied or transaction-stable timestamp;
+- physical deletion is a logged transaction, not an unjournaled memory cleanup;
+- expiry work is explicitly budgeted with a maximum number of rows/pages per call;
+- automatic expiry workers are disabled by default, preserving operator control and predictable latency;
+- snapshots and backups preserve the expiry metadata and commit sequence.
+
+TTL must not silently delete data based on an untrusted or backwards-moving wall clock. Clock source, transaction timestamp, retention grace period, and restore behavior are part of the public contract.
