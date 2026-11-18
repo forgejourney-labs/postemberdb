@@ -1302,6 +1302,37 @@ mod tests {
         assert!(db.execute("INSERT INTO ksl_persist VALUES ('economy', 'balance', 'duplicate')").is_err());
     }
 
+
+    #[test]
+    fn supports_postgres_and_mariadb_upsert_syntax_for_ksl_keys() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE ksl_persist (script_name VARCHAR(190) NOT NULL, \"key\" VARCHAR(190) NOT NULL, value TEXT, PRIMARY KEY (script_name, \"key\"))").unwrap();
+        db.execute_params(
+            "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?)",
+            &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("100".into())],
+        ).unwrap();
+        db.execute_params(
+            "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?) ON CONFLICT (script_name, \"key\") DO UPDATE SET value = EXCLUDED.value",
+            &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("250".into())],
+        ).unwrap();
+        let result = db.execute_params(
+            "SELECT value FROM ksl_persist WHERE script_name = ? AND \"key\" = ?",
+            &[Value::Text("economy".into()), Value::Text("balance".into())],
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Text("250".into()));
+
+        db.execute_params(
+            "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("300".into())],
+        ).unwrap();
+        let result = db.execute_params(
+            "SELECT value FROM ksl_persist WHERE script_name = ? AND \"key\" = ?",
+            &[Value::Text("economy".into()), Value::Text("balance".into())],
+        ).unwrap();
+        assert_eq!(result.rows[0].values[0], Value::Text("300".into()));
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
