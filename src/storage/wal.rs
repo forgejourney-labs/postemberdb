@@ -40,6 +40,16 @@ impl Database {
         let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(storage_error)?;
         let mut offset = 0u64;
         let mut truncated_tail = false;
+        // Stage the entire recovery pass once. This keeps recovery atomic while
+        // avoiding a full database clone for every WAL frame.
+        let mut staged = Database {
+            tables: self.tables.clone(),
+            storage_path: None,
+            wal_path: None,
+            _lock_file: None,
+            wal_sequence: self.wal_sequence,
+            revision: self.revision,
+        };
         loop {
             let mut header = [0u8; 24];
             match file.read(&mut header[..1]).map_err(storage_error)? {
@@ -80,29 +90,19 @@ impl Database {
             if decoder.offset != payload.len() {
                 return Err(DbError::Storage("trailing bytes in WAL transaction".into()));
             }
-            if sequence > self.wal_sequence {
-                if sequence != self.wal_sequence + 1 {
+            if sequence > staged.wal_sequence {
+                if sequence != staged.wal_sequence + 1 {
                     return Err(DbError::Storage(format!(
-                        "WAL sequence gap: expected {}, found {sequence}", self.wal_sequence + 1
+                        "WAL sequence gap: expected {}, found {sequence}", staged.wal_sequence + 1
                     )));
                 }
-                // A WAL frame is one committed transaction. Replay it against a
-                // private copy so a malformed later statement cannot publish a
-                // partially-applied transaction during recovery.
-                let mut staged = Database {
-                    tables: self.tables.clone(),
-                    storage_path: None,
-                    wal_path: None,
-                    _lock_file: None,
-                    wal_sequence: self.wal_sequence,
-                    revision: self.revision,
-                };
+                // Each frame is a transaction. If any statement fails, the
+                // staged recovery state is discarded and self remains unchanged.
                 for statement in statements {
                     staged.execute_inner(&statement)?;
                 }
-                self.tables = staged.tables;
-                self.wal_sequence = sequence;
-                self.revision = sequence;
+                staged.wal_sequence = sequence;
+                staged.revision = sequence;
             }
             offset = offset.checked_add(24 + len as u64)
                 .ok_or_else(|| DbError::Storage("WAL offset overflow".into()))?;
@@ -111,6 +111,8 @@ impl Database {
             file.set_len(offset).map_err(storage_error)?;
             file.sync_all().map_err(storage_error)?;
         }
+        self.tables = staged.tables;
+        self.wal_sequence = staged.wal_sequence;
         self.revision = self.wal_sequence;
         Ok(())
     }
