@@ -372,7 +372,9 @@ impl Database {
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
-        self.ember_indexes_valid = self.sync_ember_indexes()?;
+        // The SQL WAL is the commit authority. A derived EmberTree mirror
+        // failure must not report a committed SQL transaction as rolled back.
+        self.ember_indexes_valid = self.sync_ember_indexes().unwrap_or(false);
         Ok(())
     }
 
@@ -675,7 +677,7 @@ impl Database {
             if let Some((path, index_name)) = persistent_index {
                 let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
                 let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
-                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key)? {
+                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
                     if rows.windows(2).any(|pair| pair[0] >= pair[1])
                         || rows.iter().any(|row| *row >= table.rows.len())
                     {
@@ -797,7 +799,9 @@ impl Transaction<'_> {
         }
         self.database.tables = self.staged.tables;
         self.database.ember_indexes_valid = false;
-        self.database.ember_indexes_valid = self.database.sync_ember_indexes()?;
+        // The SQL WAL is already durable at this point; keep the transaction
+        // committed and fall back to in-memory indexes if the mirror fails.
+        self.database.ember_indexes_valid = self.database.sync_ember_indexes().unwrap_or(false);
         Ok(())
     }
 }
@@ -1256,6 +1260,43 @@ mod tests {
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
     }
 
+
+    #[test]
+    fn durable_sql_commit_survives_embertree_mirror_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-mirror-failure-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let page_path = format!("{}.pages", path.display());
+        let wal_path = format!("{}.wal", path.display());
+        let lock_path = format!("{}.lock", path.display());
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE mirror_failure (id INTEGER, tag TEXT)").unwrap();
+            db.execute("CREATE INDEX idx_mirror_failure_tag ON mirror_failure (tag)").unwrap();
+            db.execute("INSERT INTO mirror_failure VALUES (5, 'seed')").unwrap();
+
+            std::fs::remove_file(&page_path).unwrap();
+            std::fs::create_dir(&page_path).unwrap();
+            db.execute("INSERT INTO mirror_failure VALUES (41, 'committed')").unwrap();
+            assert!(!db.ember_indexes_valid);
+            let result = db.execute("SELECT * FROM mirror_failure WHERE tag = 'committed'").unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].values[0], Value::Integer(41));
+        }
+        std::fs::remove_dir(&page_path).unwrap();
+
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM mirror_failure WHERE tag = 'committed'").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Integer(41));
+        drop(reopened);
+
+        for candidate in [path.to_string_lossy().to_string(), wal_path, lock_path, page_path, format!("{}.pages.btree.wal", path.display())] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
 
     #[test]
     fn select_limit_bounds_result_rows_with_and_without_index_predicates() {
