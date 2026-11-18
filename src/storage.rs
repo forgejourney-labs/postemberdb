@@ -719,6 +719,11 @@ impl Database {
             .map(|(key, _)| (key.clone(), Vec::new())).collect::<Vec<_>>();
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
+        if !page_path.exists() {
+            // A removed derived sidecar cannot be repaired by applying only the
+            // latest transaction journal; rebuild it from canonical SQL state.
+            return self.sync_ember_indexes();
+        }
         let mut store = extent::ExtentFile::open(&page_path)?;
         page_tree::apply_mutations(&mut store, &tree_wal_path, &removals, &upserts)?;
         Ok(true)
