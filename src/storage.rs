@@ -16,7 +16,7 @@ mod wal;
 use pages::{decode_pages, encode_pages};
 use wal::wal_file_path;
 
-const MAGIC: &[u8; 4] = b"PDB4";
+const MAGIC: &[u8; 4] = b"PDB5";
 const PAGE_MAGIC: &[u8; 4] = b"PPG1";
 const PAGE_SIZE: usize = 4096;
 const PAGE_META_SIZE: usize = 16;
@@ -131,6 +131,10 @@ impl Database {
             }
             put_u32(&mut out, checked_count(table.rows.len())?);
             for row in &table.rows {
+                if row.row_id == 0 {
+                    return Err(DbError::Storage(format!("zero stable row identifier in table {name}")));
+                }
+                out.extend_from_slice(&row.row_id.to_le_bytes());
                 if row.values.len() != table.columns.len() {
                     return Err(DbError::Storage(format!("row width mismatch in table {name}")));
                 }
@@ -164,7 +168,9 @@ impl Database {
         let bytes = payload;
         let mut input = Decoder { bytes: &bytes, offset: 0 };
         let header = input.take(4)?;
-        let (format_version, wal_sequence) = if header == b"PDB4" {
+        let (format_version, wal_sequence) = if header == b"PDB5" {
+            (5, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
+        } else if header == b"PDB4" {
             (4, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
         } else if header == b"PDB3" {
             (3, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
@@ -219,7 +225,20 @@ impl Database {
             }
             let row_count = input.count()?;
             let mut rows = Vec::with_capacity(row_count);
-            for _ in 0..row_count {
+            let mut row_positions = BTreeMap::new();
+            let mut next_row_id = 1u64;
+            for row_position in 0..row_count {
+                let row_id = if format_version >= 5 {
+                    u64::from_le_bytes(input.take(8)?.try_into().unwrap())
+                } else {
+                    u64::try_from(row_position).ok().and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| DbError::Storage("legacy row count exceeds stable identifier space".into()))?
+                };
+                if row_id == 0 || row_positions.insert(row_id, row_position).is_some() {
+                    return Err(DbError::Storage("zero or duplicate stable row identifier in database file".into()));
+                }
+                next_row_id = next_row_id.max(row_id.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("stable row identifier space exhausted".into()))?);
                 let mut values = Vec::with_capacity(column_count);
                 for column in &columns {
                     let value = match input.byte()? {
@@ -241,9 +260,15 @@ impl Database {
                     if !valid { return Err(DbError::Storage(format!("invalid value for column {}", column.name))); }
                     values.push(value);
                 }
-                rows.push(Row { values });
+                rows.push(Row { row_id, values });
             }
-            let mut table = Table { columns, rows, indexes: BTreeMap::new() };
+            let mut table = Table {
+                columns,
+                rows,
+                next_row_id,
+                row_positions,
+                indexes: BTreeMap::new(),
+            };
             for (index_name, column_names, unique) in index_definitions {
                 table.add_index_columns(index_name, &column_names, unique)?;
             }
@@ -321,6 +346,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pdb4_rows_receive_stable_identifiers_on_load() {
+        let path = test_path("legacy-pdb4-row-ids");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PDB4");
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        put_u32(&mut bytes, 1);
+        put_string(&mut bytes, "legacy_rows").unwrap();
+        put_u32(&mut bytes, 1);
+        put_string(&mut bytes, "value").unwrap();
+        bytes.push(2); // TEXT
+        bytes.push(0); // NOT NULL
+        put_u32(&mut bytes, 0); // indexes
+        put_u32(&mut bytes, 2); // rows
+        bytes.push(2);
+        put_string(&mut bytes, "first").unwrap();
+        bytes.push(2);
+        put_string(&mut bytes, "second").unwrap();
+        fs::write(&path, bytes).unwrap();
+
+        let db = Database::decode_file(&path).unwrap();
+        let table = db.tables.get("legacy_rows").unwrap();
+        assert_eq!(table.rows[0].row_id, 1);
+        assert_eq!(table.rows[1].row_id, 2);
+        assert_eq!(table.next_row_id, 3);
+        assert_eq!(table.row_positions.get(&1), Some(&0));
+        assert_eq!(table.row_positions.get(&2), Some(&1));
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn committed_sql_indexes_are_mirrored_into_persistent_ember_tree() {
         let path = test_path("ember-index-mirror");
         let page_path = page_tree_file_path(&path);
@@ -364,8 +420,8 @@ mod tests {
             .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
             .collect::<Vec<_>>();
         assert_eq!(refs.len(), 700);
-        assert_eq!(refs.first(), Some(&0));
-        assert_eq!(refs.last(), Some(&699));
+        assert_eq!(refs.first(), Some(&1));
+        assert_eq!(refs.last(), Some(&700));
         drop(store);
 
         for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
@@ -407,7 +463,7 @@ mod tests {
             .into_iter()
             .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
             .collect::<Vec<_>>();
-        assert_eq!(refs, vec![0]);
+        assert_eq!(refs, vec![1]);
         assert_eq!(reopened.tables["rebuild_rows"].rows.len(), 1);
         drop(store);
         drop(reopened);
@@ -686,12 +742,15 @@ fn collect_ember_index_entries(
                 if disk_key.len() > 1015 {
                     return Ok(None);
                 }
-                for row in rows {
-                    let row = u64::try_from(row)
-                        .map_err(|_| DbError::Storage("SQL row reference does not fit in u64".into()))?;
+                for row_position in rows {
+                    let row = table.rows.get(row_position)
+                        .ok_or_else(|| DbError::Storage("in-memory SQL index contains an invalid row position".into()))?;
+                    if row.row_id == 0 {
+                        return Err(DbError::Storage("in-memory SQL row has a zero stable identifier".into()));
+                    }
                     let mut entry_key = disk_key.clone();
                     entry_key.push(0);
-                    entry_key.extend_from_slice(&row.to_be_bytes());
+                    entry_key.extend_from_slice(&row.row_id.to_be_bytes());
                     entries.insert(entry_key);
                 }
             }
@@ -715,7 +774,7 @@ pub(crate) fn lookup_ember_index(
     index_name: &str,
     key: &super::IndexKey,
     limit: Option<usize>,
-) -> Result<Option<Vec<usize>>, DbError> {
+) -> Result<Option<Vec<u64>>, DbError> {
     let page_path = page_tree_file_path(database_path);
     if !page_path.exists() {
         return Ok(None);
@@ -744,9 +803,11 @@ pub(crate) fn lookup_ember_index(
         if entry_key.len() != lower.len() {
             return Err(DbError::Storage("malformed persistent SQL index row-reference key".into()));
         }
-        let value = u64::from_be_bytes(entry_key[entry_key.len() - 8..].try_into().unwrap());
-        rows.push(usize::try_from(value)
-            .map_err(|_| DbError::Storage("persistent SQL row reference does not fit this platform".into()))?);
+        let row_id = u64::from_be_bytes(entry_key[entry_key.len() - 8..].try_into().unwrap());
+        if row_id == 0 {
+            return Err(DbError::Storage("persistent SQL index contains a zero stable row identifier".into()));
+        }
+        rows.push(row_id);
     }
     Ok(Some(rows))
 }
