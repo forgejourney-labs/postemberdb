@@ -146,6 +146,7 @@ impl Database {
             file.set_len(offset as u64).map_err(storage_error)?;
             file.sync_all().map_err(storage_error)?;
         }
+        self.revision = self.wal_sequence;
         Ok(())
     }
 
@@ -283,7 +284,7 @@ impl Database {
         if input.offset != bytes.len() {
             return Err(DbError::Storage("trailing bytes in database file".into()));
         }
-        Ok(Database { tables, storage_path: None, wal_path: None, wal_sequence })
+        Ok(Database { tables, storage_path: None, wal_path: None, wal_sequence, revision: wal_sequence })
     }
 }
 
