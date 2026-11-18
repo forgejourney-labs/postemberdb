@@ -64,9 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Roadmap
 
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
-2. Evolve the initial file snapshot format into page-oriented storage.
+2. Add a bounded page cache and lazy page reads over the fixed-size page file.
 3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
-4. Add a bounded page cache and streaming table scans over the fixed-size page store.
+4. Add streaming table scans and bounded query result materialization.
 5. Extend indexes to range/composite keys and add a cost-aware query planner.
 6. Replace the development line protocol with a framed, parameter-aware server protocol.
 7. Add a stable KSL/JVM JDBC adapter and benchmark it against the general API.
