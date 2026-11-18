@@ -363,7 +363,8 @@ impl Transaction<'_> {
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
         if !self.statements.is_empty() && self.database.wal_path.is_some() {
-            self.database.wal_sequence = self.database.append_wal_transaction(&self.statements)?;
+            let sequence = self.database.append_wal_transaction(&self.statements)?;
+            self.database.wal_sequence = sequence;
         }
         self.database.tables = self.staged.tables;
         Ok(())
