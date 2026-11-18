@@ -1,0 +1,14 @@
+[package]
+name = "postemberdb"
+version = "0.1.0"
+edition = "2021"
+description = "An independent Rust-native SQL-like database engine with Embedded and Server modes"
+license = "MIT"
+
+[lib]
+name = "postemberdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "postemberdb"
+path = "src/main.rs"
