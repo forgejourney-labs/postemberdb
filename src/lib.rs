@@ -703,22 +703,37 @@ impl Database {
         let target_column = normalize_ident(assignment[..equals].trim());
         let new_value = parse_value(assignment[equals + 1..].trim())?;
 
-        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        let target_index = table.columns.iter().position(|column| column.name == target_column)
-            .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
-        validate_value(&table.columns[target_index], &new_value)?;
+        let (affected, deltas) = {
+            let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let target_index = table.columns.iter().position(|column| column.name == target_column)
+                .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
+            validate_value(&table.columns[target_index], &new_value)?;
 
-        let matching = if let Some(predicate) = predicate {
-            let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            table.matching_rows_for_predicates(&predicates)
-        } else {
-            (0..table.rows.len()).collect()
+            let matching = if let Some(predicate) = predicate {
+                let predicates = parse_equality_predicates(&table.columns, predicate)?;
+                table.matching_rows_for_predicates(&predicates)
+            } else {
+                (0..table.rows.len()).collect()
+            };
+            let old_rows = matching.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
+            for row_index in &matching {
+                table.rows[*row_index].values[target_index] = new_value.clone();
+            }
+            table.rebuild_indexes();
+            let new_rows = matching.iter().filter_map(|position| {
+                let row_id = old_rows.iter().find(|old| old.row_id == table.rows.get(*position).map(|row| row.row_id).unwrap_or(0))
+                    .map(|row| row.row_id)?;
+                table.row_positions.get(&row_id).and_then(|position| table.rows.get(*position)).cloned()
+            }).collect::<Vec<_>>();
+            let old_deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
+            let new_deltas = build_rows_index_deltas(&table_name, table, &new_rows, None, true)?;
+            match (old_deltas, new_deltas) {
+                (Some(mut old), Some(mut new)) => { old.append(&mut new); (matching.len(), Some(old)) }
+                _ => (matching.len(), None),
+            }
         };
-        for row_index in &matching {
-            table.rows[*row_index].values[target_index] = new_value.clone();
-        }
-        table.rebuild_indexes();
-        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: matching.len(), message: format!("{} row(s) updated", matching.len()) })
+        self.append_ember_journal(deltas);
+        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: affected, message: format!("{affected} row(s) updated") })
     }
 
     fn delete(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -729,24 +744,27 @@ impl Database {
             None => (rest, None),
         };
         let table_name = normalize_ident(table_part);
-        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        let removed = if let Some(predicate) = predicate {
-            let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let matches = table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>();
+        let (removed, deltas) = {
+            let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let matches = if let Some(predicate) = predicate {
+                let predicates = parse_equality_predicates(&table.columns, predicate)?;
+                table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>()
+            } else {
+                (0..table.rows.len()).collect::<std::collections::BTreeSet<_>>()
+            };
+            let old_rows = matches.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
             let before = table.rows.len();
             let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
                 .collect::<Vec<_>>();
             table.rows = retained;
             table.rebuild_row_positions();
-            before - table.rows.len()
-        } else {
-            let count = table.rows.len();
-            table.rows.clear();
-            table.row_positions.clear();
-            count
+            table.rebuild_indexes();
+            let removed = before - table.rows.len();
+            let deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
+            (removed, deltas)
         };
-        table.rebuild_indexes();
+        self.append_ember_journal(deltas);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: removed, message: format!("{removed} row(s) deleted") })
     }
 
