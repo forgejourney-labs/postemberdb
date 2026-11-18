@@ -213,8 +213,21 @@ impl Table {
         }
     }
 
+    fn matching_rows_for_predicates(&self, predicates: &[(usize, Value)]) -> Vec<usize> {
+        let columns = predicates.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        if let Some(index) = self.indexes.values().find(|index| index.column_indices == columns) {
+            let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+            let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
+            return index.entries.get(&key).cloned().unwrap_or_default();
+        }
+        let (first_column, first_value) = &predicates[0];
+        self.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
+            predicates.iter().all(|(column_index, value)| self.rows[*row_index].values[*column_index] == *value)
+        }).collect()
+    }
+
     fn matching_rows(&self, column_index: usize, value: &Value) -> Vec<usize> {
-        if let Some(index) = self.indexes.values().find(|index| index.column_indices.as_slice() == [column_index]) {
+        if let Some(index) = self.indexes.values().find(|index| index.column_indices.len() == 1 && index.column_indices[0] == column_index) {
             index.entries.get(&IndexKey::from(value)).cloned().unwrap_or_default()
         } else {
             self.rows.iter().enumerate()
@@ -517,10 +530,7 @@ impl Database {
 
         let matching = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let (first_column, first_value) = &predicates[0];
-            table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
-                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
-            }).collect()
+            table.matching_rows_for_predicates(&predicates)
         } else {
             (0..table.rows.len()).collect()
         };
@@ -542,10 +552,7 @@ impl Database {
         let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
         let removed = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let (first_column, first_value) = &predicates[0];
-            let matches = table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
-                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
-            }).collect::<std::collections::BTreeSet<_>>();
+            let matches = table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>();
             let before = table.rows.len();
             let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
@@ -577,10 +584,7 @@ impl Database {
 
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let (first_column, first_value) = &predicates[0];
-            table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
-                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
-            }).collect()
+            table.matching_rows_for_predicates(&predicates)
         } else {
             (0..table.rows.len()).collect()
         };
@@ -781,7 +785,9 @@ impl DatabaseSession {
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE")
             || starts_with_kw(statement, "CREATE INDEX")
-            || starts_with_kw(statement, "INSERT INTO");
+            || starts_with_kw(statement, "INSERT INTO")
+            || starts_with_kw(statement, "UPDATE")
+            || starts_with_kw(statement, "DELETE FROM");
         let result = self.staged.execute_inner(statement)?;
         if is_write { self.statements.push(statement.to_owned()); }
         Ok(result)
@@ -1185,7 +1191,7 @@ mod tests {
         ).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values[0], Value::Text("150".into()));
-        assert!(db.execute("INSERT INTO ksl_persist VALUES ('economy', 'balance', 'duplicate')").is_ok());
+        assert!(db.execute("INSERT INTO ksl_persist VALUES ('economy', 'balance', 'duplicate')").is_err());
     }
 
     #[test]
