@@ -371,9 +371,7 @@ impl Database {
         }
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
-        self.ember_indexes_valid = false;
-        self.sync_ember_indexes()?;
-        self.ember_indexes_valid = self.storage_path.is_some();
+        self.ember_indexes_valid = self.sync_ember_indexes()?;
         Ok(())
     }
 
@@ -797,9 +795,7 @@ impl Transaction<'_> {
             self.database.revision = self.database.revision.wrapping_add(1);
         }
         self.database.tables = self.staged.tables;
-        self.database.ember_indexes_valid = false;
-        self.database.sync_ember_indexes()?;
-        self.database.ember_indexes_valid = self.database.storage_path.is_some();
+        self.database.ember_indexes_valid = self.database.sync_ember_indexes()?;
         Ok(())
     }
 }
