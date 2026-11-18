@@ -53,6 +53,8 @@ pub struct Column {
 
 #[derive(Debug, Clone)]
 pub struct Row {
+    /// Stable table-local identifier, independent of the current vector position.
+    pub row_id: u64,
     pub values: Vec<Value>,
 }
 
@@ -160,6 +162,8 @@ struct Index {
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Row>,
+    next_row_id: u64,
+    row_positions: BTreeMap<u64, usize>,
     indexes: BTreeMap<String, Index>,
 }
 
@@ -212,6 +216,13 @@ impl Table {
             let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
             positions.push(row_index);
             index.entries.insert(key, positions);
+        }
+    }
+
+    fn rebuild_row_positions(&mut self) {
+        self.row_positions.clear();
+        for (position, row) in self.rows.iter().enumerate() {
+            self.row_positions.insert(row.row_id, position);
         }
     }
 
@@ -498,7 +509,13 @@ impl Database {
         for column in &mut columns {
             if primary_key_columns.contains(&column.name) { column.nullable = false; }
         }
-        let mut table = Table { columns, rows: Vec::new(), indexes: BTreeMap::new() };
+        let mut table = Table {
+            columns,
+            rows: Vec::new(),
+            next_row_id: 1,
+            row_positions: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+        };
         if !primary_key_columns.is_empty() {
             table.add_index_columns(format!("__pk_{name}"), &primary_key_columns, true)?;
         }
@@ -570,8 +587,12 @@ impl Database {
             return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
         }
         table.validate_unique(&values)?;
-        table.rows.push(Row { values });
+        let row_id = table.next_row_id;
+        table.next_row_id = table.next_row_id.checked_add(1)
+            .ok_or_else(|| DbError::Storage("table row identifier space exhausted".into()))?;
+        table.rows.push(Row { row_id, values });
         let row_index = table.rows.len() - 1;
+        table.row_positions.insert(row_id, row_index);
         table.index_row(row_index);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row inserted".into() })
     }
@@ -625,10 +646,12 @@ impl Database {
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
                 .collect::<Vec<_>>();
             table.rows = retained;
+            table.rebuild_row_positions();
             before - table.rows.len()
         } else {
             let count = table.rows.len();
             table.rows.clear();
+            table.row_positions.clear();
             count
         };
         table.rebuild_indexes();
@@ -680,13 +703,17 @@ impl Database {
             if let Some((path, index_name)) = persistent_index {
                 let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
                 let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
-                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
-                    if rows.windows(2).any(|pair| pair[0] >= pair[1])
-                        || rows.iter().any(|row| *row >= table.rows.len())
-                    {
-                        return Err(DbError::Storage("persistent SQL index contains invalid row references".into()));
+                if let Some(row_ids) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
+                    if row_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(DbError::Storage("persistent SQL index contains non-increasing stable row identifiers".into()));
                     }
-                    rows.into_iter().take(selection_limit.unwrap_or(usize::MAX)).collect()
+                    let mut positions = Vec::with_capacity(row_ids.len());
+                    for row_id in row_ids.into_iter().take(selection_limit.unwrap_or(usize::MAX)) {
+                        let position = table.row_positions.get(&row_id).copied()
+                            .ok_or_else(|| DbError::Storage("persistent SQL index references an unknown stable row identifier".into()))?;
+                        positions.push(position);
+                    }
+                    positions
                 } else {
                     table.matching_rows_for_predicates_limited(&predicates, selection_limit)
                 }
@@ -702,7 +729,7 @@ impl Database {
                 .unwrap_or_else(|| "count".into());
             return Ok(QueryResult {
                 columns: vec![alias],
-                rows: vec![Row { values: vec![Value::Integer(selected_rows.len() as i64)] }],
+                rows: vec![Row { row_id: 0, values: vec![Value::Integer(selected_rows.len() as i64)] }],
                 message: "1 row(s)".into(),
                 affected_rows: 0,
             });
