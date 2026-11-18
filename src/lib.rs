@@ -959,6 +959,53 @@ mod tests {
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
     }
 
+
+    #[test]
+    fn sql_supports_column_inserts_projections_updates_and_deletes() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER, active BOOLEAN)").unwrap();
+        db.execute("INSERT INTO players (coins, uuid, active) VALUES (50, 'player-a', TRUE)").unwrap();
+        db.execute("INSERT INTO players (uuid, coins, active) VALUES ('player-b', 75, FALSE)").unwrap();
+        db.execute("CREATE INDEX idx_players_uuid ON players (uuid)").unwrap();
+
+        let projected = db.execute("SELECT coins, uuid FROM players WHERE uuid = 'player-a'").unwrap();
+        assert_eq!(projected.columns, vec!["coins", "uuid"]);
+        assert_eq!(projected.rows[0].values, vec![Value::Integer(50), Value::Text("player-a".into())]);
+
+        let updated = db.execute("UPDATE players SET coins = 99 WHERE uuid = 'player-a'").unwrap();
+        assert_eq!(updated.affected_rows, 1);
+        assert_eq!(db.execute("SELECT coins FROM players WHERE uuid = 'player-a'").unwrap().rows[0].values[0], Value::Integer(99));
+
+        let deleted = db.execute("DELETE FROM players WHERE uuid = 'player-b'").unwrap();
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(db.execute("SELECT * FROM players").unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn persistent_update_and_delete_replay_from_wal() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-dml-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE dml_rows (id INTEGER, label TEXT)").unwrap();
+            db.execute("INSERT INTO dml_rows VALUES (1, 'first')").unwrap();
+            db.execute("INSERT INTO dml_rows VALUES (2, 'second')").unwrap();
+            db.execute("UPDATE dml_rows SET label = 'changed' WHERE id = 1").unwrap();
+            db.execute("DELETE FROM dml_rows WHERE id = 2").unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let rows = reopened.execute("SELECT label FROM dml_rows WHERE id = 1").unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Text("changed".into()));
+        assert_eq!(reopened.execute("SELECT * FROM dml_rows").unwrap().rows.len(), 1);
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
