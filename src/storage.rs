@@ -65,7 +65,7 @@ impl Database {
         Ok(())
     }
 
-    fn append_wal_transaction(&self, statements: &[String]) -> Result<u64, DbError> {
+    pub(super) fn append_wal_transaction(&self, statements: &[String]) -> Result<u64, DbError> {
         let path = self.wal_path.as_ref()
             .ok_or_else(|| DbError::Storage("database has no WAL path".into()))?;
         let mut payload = Vec::new();
