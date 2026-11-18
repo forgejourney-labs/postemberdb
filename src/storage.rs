@@ -746,33 +746,7 @@ impl Database {
     /// Apply only the persistent index entries that changed between two
     /// committed SQL states. SQL WAL remains authoritative; callers disable
     /// the mirror and fall back to in-memory indexes if this derived update fails.
-    pub(crate) fn sync_ember_indexes_delta(
-        &self,
-        previous_tables: &BTreeMap<String, Table>,
-        previous_mirror_valid: bool,
-    ) -> Result<bool, DbError> {
-        if !previous_mirror_valid {
-            return self.sync_ember_indexes();
-        }
-        let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
-        let Some(previous) = collect_ember_index_entries(previous_tables)? else { return Ok(false); };
-        let Some(current) = collect_ember_index_entries(&self.tables)? else { return Ok(false); };
 
-        let removed = previous.difference(&current).cloned().collect::<Vec<_>>();
-        let inserted = current.difference(&previous)
-            .cloned()
-            .map(|key| (key, Vec::new()))
-            .collect::<Vec<_>>();
-        if removed.is_empty() && inserted.is_empty() {
-            return Ok(true);
-        }
-
-        let page_path = page_tree_file_path(database_path);
-        let tree_wal_path = page_tree_wal_file_path(database_path);
-        let mut store = extent::ExtentFile::open(&page_path)?;
-        page_tree::apply_mutations(&mut store, &tree_wal_path, &removed, &inserted)?;
-        Ok(true)
-    }
 }
 
 fn collect_ember_index_entries(
