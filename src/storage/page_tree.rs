@@ -1058,7 +1058,7 @@ mod tests {
         let mut reopened = ExtentFile::open(&path).unwrap();
         recover(&mut reopened, &wal).unwrap();
         validate_tree(&mut reopened).unwrap();
-        assert_eq!(scan_range(&mut reopened, b"alpha", b"delta").unwrap().len(), 4);
+        assert_eq!(scan_range(&mut reopened, b"alpha", b"gamma").unwrap().len(), 4);
         drop(reopened);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
