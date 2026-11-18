@@ -50,6 +50,8 @@ impl Database {
             wal_sequence: self.wal_sequence,
             revision: self.revision,
             ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
         };
         loop {
             let mut header = [0u8; 24];
