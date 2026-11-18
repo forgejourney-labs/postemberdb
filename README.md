@@ -28,6 +28,7 @@ The project is at an early development stage. The first prototype provides:
 - staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
 - secondary B-tree indexes with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
 - temporary-file writes followed by rename when checkpointing the database;
+- an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
