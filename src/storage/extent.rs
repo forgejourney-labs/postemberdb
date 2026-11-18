@@ -16,17 +16,18 @@ const METADATA_SLOTS: u64 = 2;
 const METADATA_BYTES: u64 = METADATA_SLOTS * PAGE_SIZE as u64;
 const PAGE_HEADER_SIZE: usize = 32;
 const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
-const METADATA_HEADER_SIZE: usize = 36;
+const METADATA_HEADER_SIZE: usize = 44;
 const EXTENT_ENTRY_SIZE: usize = 16;
 const MAX_FREE_EXTENTS: usize = (PAGE_SIZE - METADATA_HEADER_SIZE) / EXTENT_ENTRY_SIZE;
-const METADATA_MAGIC: &[u8; 4] = b"EAM2";
+const METADATA_MAGIC: &[u8; 4] = b"EAM3";
 const DATA_PAGE_MAGIC: &[u8; 4] = b"EPG1";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AllocatorMetadata {
     generation: u64,
     next_page_id: u64,
+    root_page_id: Option<u64>,
     free_extents: BTreeMap<u64, u64>,
 }
 
@@ -95,6 +96,7 @@ impl ExtentFile {
                 metadata: AllocatorMetadata {
                     generation: 0,
                     next_page_id: 0,
+                    root_page_id: None,
                     free_extents: BTreeMap::new(),
                 },
                 poisoned: false,
@@ -276,6 +278,25 @@ impl ExtentFile {
         self.commit_metadata(next)
     }
 
+    pub(crate) fn root_page_id(&self) -> Option<u64> {
+        self.metadata.root_page_id
+    }
+
+    /// Publish a fully-written copy-on-write root. The metadata commit is the
+    /// atomic visibility point; callers must sync all referenced pages first.
+    pub(crate) fn publish_root(&mut self, root_page_id: Option<u64>) -> Result<(), DbError> {
+        self.ensure_healthy()?;
+        if let Some(page_id) = root_page_id {
+            if !is_allocated(&self.metadata, page_id) {
+                return Err(DbError::Storage(format!("root page {page_id} is not allocated")));
+            }
+            self.read_page(page_id)?;
+        }
+        let mut next = self.metadata.clone();
+        next.root_page_id = root_page_id;
+        self.commit_metadata(next)
+    }
+
     pub(crate) fn stats(&self) -> ExtentStats {
         let free_pages = self.metadata.free_extents.values().copied().sum::<u64>();
         ExtentStats {
@@ -398,6 +419,9 @@ fn is_allocated(metadata: &AllocatorMetadata, page_id: u64) -> bool {
 }
 
 fn validate_metadata(metadata: &AllocatorMetadata) -> Result<(), DbError> {
+    if metadata.root_page_id.is_some_and(|root| root >= metadata.next_page_id || !is_allocated(metadata, root)) {
+        return Err(DbError::Storage("metadata root points to an unallocated page".into()));
+    }
     let mut previous_end = None;
     for (start, count) in &metadata.free_extents {
         if *count == 0 {
@@ -428,6 +452,7 @@ fn encode_metadata(metadata: &AllocatorMetadata) -> Result<[u8; PAGE_SIZE], DbEr
     page[8..16].copy_from_slice(&metadata.generation.to_le_bytes());
     page[16..24].copy_from_slice(&metadata.next_page_id.to_le_bytes());
     page[24..28].copy_from_slice(&(metadata.free_extents.len() as u32).to_le_bytes());
+    page[28..36].copy_from_slice(&metadata.root_page_id.unwrap_or(u64::MAX).to_le_bytes());
 
     let mut offset = METADATA_HEADER_SIZE;
     for (start, count) in &metadata.free_extents {
@@ -436,7 +461,7 @@ fn encode_metadata(metadata: &AllocatorMetadata) -> Result<[u8; PAGE_SIZE], DbEr
         offset += EXTENT_ENTRY_SIZE;
     }
     let checksum = super::checksum(&page[..offset]);
-    page[28..36].copy_from_slice(&checksum.to_le_bytes());
+    page[36..44].copy_from_slice(&checksum.to_le_bytes());
     Ok(page)
 }
 
@@ -445,20 +470,27 @@ fn decode_metadata(page: &[u8; PAGE_SIZE]) -> Result<AllocatorMetadata, DbError>
         return Err(DbError::Storage("invalid extent metadata magic".into()));
     }
     let version = u32::from_le_bytes(page[4..8].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != 2 && version != FORMAT_VERSION {
         return Err(DbError::Storage("unsupported extent metadata version".into()));
     }
 
     let generation = u64::from_le_bytes(page[8..16].try_into().unwrap());
     let next_page_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
     let extent_count = u32::from_le_bytes(page[24..28].try_into().unwrap()) as usize;
-    if extent_count > MAX_FREE_EXTENTS {
+    let (header_size, checksum_offset, root_page_id) = if version == 2 {
+        (36usize, 28usize, None)
+    } else {
+        let root = u64::from_le_bytes(page[28..36].try_into().unwrap());
+        (44usize, 36usize, (root != u64::MAX).then_some(root))
+    };
+    let max_extents = (PAGE_SIZE - header_size) / EXTENT_ENTRY_SIZE;
+    if extent_count > max_extents {
         return Err(DbError::Storage("extent metadata entry count exceeds page capacity".into()));
     }
-    let used = METADATA_HEADER_SIZE + extent_count * EXTENT_ENTRY_SIZE;
-    let expected_checksum = u64::from_le_bytes(page[28..36].try_into().unwrap());
+    let used = header_size + extent_count * EXTENT_ENTRY_SIZE;
+    let expected_checksum = u64::from_le_bytes(page[checksum_offset..checksum_offset + 8].try_into().unwrap());
     let mut checksum_bytes = page[..used].to_vec();
-    checksum_bytes[28..36].fill(0);
+    checksum_bytes[checksum_offset..checksum_offset + 8].fill(0);
     if super::checksum(&checksum_bytes) != expected_checksum {
         return Err(DbError::Storage("extent metadata checksum mismatch".into()));
     }
@@ -467,7 +499,7 @@ fn decode_metadata(page: &[u8; PAGE_SIZE]) -> Result<AllocatorMetadata, DbError>
     }
 
     let mut free_extents = BTreeMap::new();
-    let mut offset = METADATA_HEADER_SIZE;
+    let mut offset = header_size;
     for _ in 0..extent_count {
         let start = u64::from_le_bytes(page[offset..offset + 8].try_into().unwrap());
         let count = u64::from_le_bytes(page[offset + 8..offset + 16].try_into().unwrap());
@@ -477,7 +509,7 @@ fn decode_metadata(page: &[u8; PAGE_SIZE]) -> Result<AllocatorMetadata, DbError>
         offset += EXTENT_ENTRY_SIZE;
     }
 
-    let metadata = AllocatorMetadata { generation, next_page_id, free_extents };
+    let metadata = AllocatorMetadata { generation, next_page_id, root_page_id, free_extents };
     validate_metadata(&metadata)?;
     Ok(metadata)
 }
