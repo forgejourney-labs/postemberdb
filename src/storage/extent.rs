@@ -57,6 +57,20 @@ impl ExtentFile {
         Ok(())
     }
 
+    fn repair_metadata_slots(&mut self, keep_slot: u64) -> Result<(), DbError> {
+        let encoded = encode_metadata(&self.metadata)?;
+        let repair_slot = (keep_slot + 1) % METADATA_SLOTS;
+
+        // Keep the selected valid copy untouched until the other slot has been
+        // repaired and synced. If this repair is interrupted, one valid copy
+        // still contains the selected state.
+        write_at(&mut self.file, repair_slot * PAGE_SIZE as u64, &encoded)?;
+        self.file.sync_all().map_err(storage_error)?;
+        write_at(&mut self.file, keep_slot * PAGE_SIZE as u64, &encoded)?;
+        self.file.sync_all().map_err(storage_error)?;
+        Ok(())
+    }
+
     /// Opens or initializes a page file. A single process must own the file.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref();
@@ -96,24 +110,26 @@ impl ExtentFile {
 
         let slot0 = read_metadata_slot(&mut file, 0);
         let slot1 = read_metadata_slot(&mut file, 1);
-        let metadata = match (slot0, slot1) {
+        let (metadata, keep_slot, repair_needed) = match (&slot0, &slot1) {
             (Ok(Some(left)), Ok(Some(right))) => {
                 if left.generation > right.generation {
-                    left
+                    (left.clone(), 0, true)
                 } else if right.generation > left.generation {
-                    right
+                    (right.clone(), 1, true)
                 } else if left == right {
-                    left
+                    (left.clone(), 0, false)
                 } else {
                     return Err(DbError::Storage(
                         "extent metadata slots disagree at the same generation".into(),
                     ));
                 }
             }
-            (Ok(Some(valid)), Ok(None))
-            | (Ok(None), Ok(Some(valid)))
-            | (Ok(Some(valid)), Err(_))
-            | (Err(_), Ok(Some(valid))) => valid,
+            (Ok(Some(valid)), Ok(None)) | (Ok(Some(valid)), Err(_)) => {
+                (valid.clone(), 0, true)
+            }
+            (Ok(None), Ok(Some(valid))) | (Err(_), Ok(Some(valid))) => {
+                (valid.clone(), 1, true)
+            }
             (Ok(None), Ok(None)) => {
                 return Err(DbError::Storage("both extent metadata slots are empty".into()));
             }
@@ -137,7 +153,11 @@ impl ExtentFile {
             ));
         }
 
-        Ok(Self { file, metadata, poisoned: false })
+        let mut store = Self { file, metadata, poisoned: false };
+        if repair_needed {
+            store.repair_metadata_slots(keep_slot)?;
+        }
+        Ok(store)
     }
 
     /// Reserves a contiguous range of page IDs using first-fit extent allocation.
