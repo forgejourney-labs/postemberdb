@@ -369,12 +369,15 @@ impl Database {
             let sequence = self.append_wal_transaction(&session.statements)?;
             self.wal_sequence = sequence;
         }
-        self.tables = session.staged.tables;
+        let previous_mirror_valid = self.ember_indexes_valid;
+        let previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
-        // The SQL WAL is the commit authority. A derived EmberTree mirror
-        // failure must not report a committed SQL transaction as rolled back.
-        self.ember_indexes_valid = self.sync_ember_indexes().unwrap_or(false);
+        // The SQL WAL is the commit authority. Apply a derived index delta only
+        // after the SQL commit is durable; on failure queries use memory indexes.
+        self.ember_indexes_valid = self
+            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .unwrap_or(false);
         Ok(())
     }
 
@@ -790,18 +793,22 @@ impl Transaction<'_> {
 
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
-        if !self.statements.is_empty() {
-            if self.database.wal_path.is_some() {
-                let sequence = self.database.append_wal_transaction(&self.statements)?;
-                self.database.wal_sequence = sequence;
-            }
-            self.database.revision = self.database.revision.wrapping_add(1);
+        if self.statements.is_empty() {
+            return Ok(());
         }
-        self.database.tables = self.staged.tables;
+        if self.database.wal_path.is_some() {
+            let sequence = self.database.append_wal_transaction(&self.statements)?;
+            self.database.wal_sequence = sequence;
+        }
+        let previous_mirror_valid = self.database.ember_indexes_valid;
+        let previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
+        self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
-        // The SQL WAL is already durable at this point; keep the transaction
-        // committed and fall back to in-memory indexes if the mirror fails.
-        self.database.ember_indexes_valid = self.database.sync_ember_indexes().unwrap_or(false);
+        // The SQL WAL is already durable at this point. Update only changed
+        // EmberTree entries; failure leaves SQL committed and enables fallback.
+        self.database.ember_indexes_valid = self.database
+            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .unwrap_or(false);
         Ok(())
     }
 }
