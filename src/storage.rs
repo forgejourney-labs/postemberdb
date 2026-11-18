@@ -1,5 +1,5 @@
 use super::{Column, DataType, Database, DbError, Row, Table, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -620,34 +620,7 @@ impl Database {
         let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
-        let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-
-        for (table_name, table) in &self.tables {
-            for (index_name, index) in &table.indexes {
-                let upper = super::IndexKey::Composite(vec![super::IndexAtom::Boolean(true); 256]);
-                for (key, rows) in index.entries.scan_range(&super::IndexKey::Null, &upper) {
-                    let encoded = match index_codec::encode_index_key(&key) {
-                        Ok(encoded) => encoded,
-                        Err(_) => return Ok(false),
-                    };
-                    let mut disk_key = Vec::with_capacity(4 + table_name.len() + index_name.len() + encoded.len());
-                    put_namespace_part(&mut disk_key, table_name.as_bytes())?;
-                    put_namespace_part(&mut disk_key, index_name.as_bytes())?;
-                    disk_key.extend_from_slice(&encoded);
-                    if disk_key.len() > 1015 {
-                        return Ok(false);
-                    }
-                    for row in rows {
-                        let row = u64::try_from(row)
-                            .map_err(|_| DbError::Storage("SQL row reference does not fit in u64".into()))?;
-                        let mut entry_key = disk_key.clone();
-                        entry_key.push(0);
-                        entry_key.extend_from_slice(&row.to_be_bytes());
-                        entries.insert(entry_key, Vec::new());
-                    }
-                }
-            }
-        }
+        let Some(entries) = collect_ember_index_entries(&self.tables)? else { return Ok(false); };
 
         if entries.is_empty() && !page_path.exists() && !tree_wal_path.exists() {
             return Ok(true);
@@ -657,10 +630,79 @@ impl Database {
             store.publish_root(None)?;
             return Ok(true);
         }
-        let encoded = entries.into_iter().collect::<Vec<_>>();
+        let encoded = entries.into_iter().map(|key| (key, Vec::new())).collect::<Vec<_>>();
         page_tree::replace_all(&mut store, &tree_wal_path, &encoded)?;
         Ok(true)
     }
+
+    /// Apply only the persistent index entries that changed between two
+    /// committed SQL states. SQL WAL remains authoritative; callers disable
+    /// the mirror and fall back to in-memory indexes if this derived update fails.
+    pub(crate) fn sync_ember_indexes_delta(
+        &self,
+        previous_tables: &BTreeMap<String, Table>,
+        previous_mirror_valid: bool,
+    ) -> Result<bool, DbError> {
+        if !previous_mirror_valid {
+            return self.sync_ember_indexes();
+        }
+        let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
+        let Some(previous) = collect_ember_index_entries(previous_tables)? else { return Ok(false); };
+        let Some(current) = collect_ember_index_entries(&self.tables)? else { return Ok(false); };
+
+        let removed = previous.difference(&current).cloned().collect::<Vec<_>>();
+        let inserted = current.difference(&previous)
+            .cloned()
+            .map(|key| (key, Vec::new()))
+            .collect::<Vec<_>>();
+        if removed.is_empty() && inserted.is_empty() {
+            return Ok(true);
+        }
+
+        let page_path = page_tree_file_path(database_path);
+        let tree_wal_path = page_tree_wal_file_path(database_path);
+        let mut store = extent::ExtentFile::open(&page_path)?;
+        if !removed.is_empty() {
+            page_tree::remove_many(&mut store, &tree_wal_path, &removed)?;
+        }
+        if !inserted.is_empty() {
+            page_tree::insert_many(&mut store, &tree_wal_path, &inserted)?;
+        }
+        Ok(true)
+    }
+}
+
+fn collect_ember_index_entries(
+    tables: &BTreeMap<String, Table>,
+) -> Result<Option<BTreeSet<Vec<u8>>>, DbError> {
+    let mut entries = BTreeSet::<Vec<u8>>::new();
+    for (table_name, table) in tables {
+        for (index_name, index) in &table.indexes {
+            let upper = super::IndexKey::Composite(vec![super::IndexAtom::Boolean(true); 256]);
+            for (key, rows) in index.entries.scan_range(&super::IndexKey::Null, &upper) {
+                let encoded = match index_codec::encode_index_key(&key) {
+                    Ok(encoded) => encoded,
+                    Err(_) => return Ok(None),
+                };
+                let mut disk_key = Vec::with_capacity(4 + table_name.len() + index_name.len() + encoded.len());
+                put_namespace_part(&mut disk_key, table_name.as_bytes())?;
+                put_namespace_part(&mut disk_key, index_name.as_bytes())?;
+                disk_key.extend_from_slice(&encoded);
+                if disk_key.len() > 1015 {
+                    return Ok(None);
+                }
+                for row in rows {
+                    let row = u64::try_from(row)
+                        .map_err(|_| DbError::Storage("SQL row reference does not fit in u64".into()))?;
+                    let mut entry_key = disk_key.clone();
+                    entry_key.push(0);
+                    entry_key.extend_from_slice(&row.to_be_bytes());
+                    entries.insert(entry_key);
+                }
+            }
+        }
+    }
+    Ok(Some(entries))
 }
 
 fn put_namespace_part(out: &mut Vec<u8>, value: &[u8]) -> Result<(), DbError> {
