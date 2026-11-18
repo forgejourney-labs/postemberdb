@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
+mod allocator;
 mod pages;
 mod wal;
 
