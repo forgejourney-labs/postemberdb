@@ -468,12 +468,11 @@ fn encode_metadata(metadata: &AllocatorMetadata) -> Result<[u8; PAGE_SIZE], DbEr
 }
 
 fn decode_metadata(page: &[u8; PAGE_SIZE]) -> Result<AllocatorMetadata, DbError> {
-    if &page[0..4] != METADATA_MAGIC {
-        return Err(DbError::Storage("invalid extent metadata magic".into()));
-    }
     let version = u32::from_le_bytes(page[4..8].try_into().unwrap());
-    if version != 2 && version != FORMAT_VERSION {
-        return Err(DbError::Storage("unsupported extent metadata version".into()));
+    let valid_magic = (&page[0..4] == b"EAM2" && version == 2)
+        || (&page[0..4] == METADATA_MAGIC && version == FORMAT_VERSION);
+    if !valid_magic {
+        return Err(DbError::Storage("invalid extent metadata magic or version".into()));
     }
 
     let generation = u64::from_le_bytes(page[8..16].try_into().unwrap());
