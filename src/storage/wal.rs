@@ -124,6 +124,57 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn recovery_rejects_corrupt_complete_frame_without_publishing() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-corrupt-{}-{nonce}.wal",
+            std::process::id()
+        ));
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE checksum_guard (value INTEGER)".into(),
+        ]).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        fs::write(&path, bytes).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        let error = recovered.replay_wal().unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert!(!recovered.tables.contains_key("checksum_guard"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_wal_sequence_gap() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-gap-{}-{nonce}.wal",
+            std::process::id()
+        ));
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.wal_sequence = 1;
+        writer.append_wal_transaction(&[
+            "CREATE TABLE gap_guard (value INTEGER)".into(),
+        ]).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        let error = recovered.replay_wal().unwrap_err();
+        assert!(error.to_string().contains("sequence gap"));
+        assert!(!recovered.tables.contains_key("gap_guard"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn failed_recovery_does_not_publish_earlier_frames() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!(
