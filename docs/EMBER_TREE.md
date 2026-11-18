@@ -164,7 +164,7 @@ SQL rows now carry monotonically allocated table-local `u64` identifiers. Deleti
 
 The snapshot payload version is now PDB5 and stores each row identifier plus the next-ID counter, including when a table is empty after deletions. PDB4 and earlier snapshots remain readable: legacy rows receive deterministic identifiers in their existing row order, and the next checkpoint writes PDB5. Zero is reserved for synthetic aggregate result rows and is rejected in persisted table rows and persistent index entries. IDs are monotonically allocated and are not reused after deletion or checkpoint. The SQL WAL remains authoritative, and the derived EmberTree mirror is rebuilt from canonical snapshot/WAL state during open.
 
-Delta discovery still compares complete in-memory index-entry sets (O(total indexed entries)); direct mutation journaling remains future work. Stable IDs solve positional churn, not the full-scan cost.
+Stable IDs are now used by both in-memory SQL indexes and the persistent EmberTree mirror. In-memory mutations are incremental for INSERT, UPDATE, DELETE, and UPSERT; the persistent mirror receives the separate transaction-scoped mutation journal after the canonical SQL WAL commit.
 
 
 ## Direct SQL index mutation journal
@@ -172,3 +172,12 @@ Delta discovery still compares complete in-memory index-entry sets (O(total inde
 SQL transactions now collect persistent index-key changes at the point where rows are inserted, updated, deleted, or upserted. Creating an index over an existing table records its initial entries once. Each journal item contains the fully namespaced EmberTree key (including the stable row ID) and whether it is inserted or removed.
 
 After the canonical SQL WAL commit is synced, the derived EmberTree receives the journal through one mixed removal/upsert CoW batch, one redo record, and one root publication. The transaction path no longer scans every in-memory index entry to calculate a before/after set difference. A full scan remains on database open/rebuild, and unsupported key encodings deliberately disable the persistent mirror so SQL queries safely use in-memory indexes.
+
+
+## Incremental in-memory SQL index maintenance
+
+In-memory SQL index values are ordered lists of stable table-local `u64` row IDs, never vector offsets. Lookups resolve IDs through the table's row-position map. Because row IDs are monotonic, lists remain ordered without depending on physical row positions.
+
+INSERT adds the new ID to each relevant index. UPDATE and UPSERT compare old and new index keys and remove/reinsert the row ID only for indexes whose key changed; modifying a non-indexed column leaves every index tree untouched. DELETE removes the deleted IDs from their exact index keys before compacting the row vector. Compaction rebuilds only the ID-to-position map, not the B+ tree indexes. Empty index buckets are removed so unique-key checks cannot mistake deleted keys for live entries.
+
+A multi-row UPDATE checks all affected unique indexes as a set before applying its staged mutations, preventing two matching rows from being assigned the same unique key. The SQL transaction layer still provides rollback if validation fails. Persistent EmberTree mirror updates continue to use their own direct mutation journal after the canonical SQL WAL commit.
