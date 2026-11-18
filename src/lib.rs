@@ -605,7 +605,33 @@ mod tests {
         db.execute("CREATE INDEX idx_uuid ON players (uuid)").unwrap();
         assert!(db.execute("SELECT * FROM players WHERE uuid = 'missing'").unwrap().rows.is_empty());
     }
-\n    #[test]
+
+
+    #[test]
+    fn persistent_index_is_rebuilt_after_checkpoint_and_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-index-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE player_stats (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("INSERT INTO player_stats VALUES ('player-x', 50)").unwrap();
+            db.execute("CREATE INDEX idx_player_uuid ON player_stats (uuid)").unwrap();
+            db.execute("INSERT INTO player_stats VALUES ('player-y', 75)").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM player_stats WHERE uuid = 'player-y'").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[1], Value::Integer(75));
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
+    #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
         db.execute("CREATE TABLE metrics (value INTEGER)").unwrap();
