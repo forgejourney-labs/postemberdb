@@ -84,8 +84,9 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
     let mut file = OpenOptions::new().read(true).write(true).open(wal_path)
         .map_err(storage_error)?;
     let mut bytes = Vec::new();
-    let mut limited = Read::take(&mut file, (MAX_WAL_BYTES + 1) as u64);
+    let mut limited = (&mut file).take((MAX_WAL_BYTES + 1) as u64);
     limited.read_to_end(&mut bytes).map_err(storage_error)?;
+    drop(limited);
     if bytes.is_empty() {
         return Ok(());
     }
