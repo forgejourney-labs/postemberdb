@@ -17,6 +17,7 @@ const WAL_MAGIC: &[u8; 4] = b"PBTW";
 const WAL_HEADER_SIZE: usize = 28;
 const MAX_WAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 1024;
+const EMPTY_ROOT: u64 = u64::MAX;
 
 #[derive(Debug, Clone)]
 struct NodeRef {
@@ -94,6 +95,151 @@ pub(crate) fn insert_many(
     store.publish_root(Some(root))?;
     validate_tree(store)?;
     truncate_wal(wal_path)?;
+    Ok(())
+}
+
+/// Removes keys with copy-on-write path updates and publishes the batch once.
+/// Missing keys are ignored. Adjacent siblings are merged whenever their
+/// combined encoded page fits; the root is collapsed after each removal.
+pub(crate) fn remove_many(
+    store: &mut ExtentFile,
+    wal_path: &Path,
+    keys: &[Vec<u8>],
+) -> Result<usize, DbError> {
+    recover(store, wal_path)?;
+    for key in keys {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(DbError::Storage("B+ tree keys must contain 1..=1024 bytes".into()));
+        }
+    }
+    if keys.is_empty() { return Ok(0); }
+
+    let mut staged = Vec::new();
+    let mut root = store.root_page_id();
+    let mut removed = 0usize;
+    for key in keys {
+        let Some(root_id) = root else { break; };
+        if !contains_staged(store, &staged, root_id, key)? { continue; }
+        root = delete_recursive(store, &mut staged, root_id, key)?;
+        removed += 1;
+        if let Some(mut root_id) = root {
+            loop {
+                match read_staged_node(store, &staged, root_id)? {
+                    DecodedNode::Internal(children) if children.len() == 1 => root_id = children[0].1,
+                    _ => break,
+                }
+            }
+            root = Some(root_id);
+        }
+    }
+    if removed == 0 { return Ok(0); }
+
+    let frame = encode_wal(root.unwrap_or(EMPTY_ROOT), &staged)?;
+    write_wal(wal_path, &frame)?;
+    for (page_id, payload) in &staged {
+        store.write_page(*page_id, payload)?;
+    }
+    store.publish_root(root)?;
+    validate_tree(store)?;
+    truncate_wal(wal_path)?;
+    Ok(removed)
+}
+
+fn contains_staged(
+    store: &mut ExtentFile,
+    staged: &[(u64, Vec<u8>)],
+    mut page_id: u64,
+    key: &[u8],
+) -> Result<bool, DbError> {
+    loop {
+        match read_staged_node(store, staged, page_id)? {
+            DecodedNode::Leaf(entries) => {
+                return Ok(entries.binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key)).is_ok());
+            }
+            DecodedNode::Internal(children) => {
+                let index = children[1..].partition_point(|(separator, _)| key >= separator.as_slice());
+                page_id = children[index].1;
+            }
+        }
+    }
+}
+
+fn delete_recursive(
+    store: &mut ExtentFile,
+    staged: &mut Vec<(u64, Vec<u8>)>,
+    page_id: u64,
+    key: &[u8],
+) -> Result<Option<StagedNode>, DbError> {
+    match read_staged_node(store, staged, page_id)? {
+        DecodedNode::Leaf(mut entries) => {
+            let index = entries.binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
+                .map_err(|_| DbError::Storage("B+ tree delete path lost its target key".into()))?;
+            entries.remove(index);
+            if entries.is_empty() { return Ok(None); }
+            Ok(Some(stage_leaf(store, staged, &entries)?))
+        }
+        DecodedNode::Internal(children) => {
+            let index = children[1..].partition_point(|(separator, _)| key >= separator.as_slice());
+            let child_id = children[index].1;
+            let replacement = delete_recursive(store, staged, child_id, key)?;
+            let mut updated = Vec::with_capacity(children.len());
+            for (child_index, (_, id)) in children.into_iter().enumerate() {
+                if child_index == index {
+                    if let Some(node) = &replacement {
+                        updated.push(NodeRef { page_id: node.page_id, first_key: node.first_key.clone() });
+                    }
+                } else {
+                    updated.push(NodeRef { page_id: id, first_key: subtree_first_key(store, staged, id)? });
+                }
+            }
+            if updated.is_empty() { return Ok(None); }
+            merge_adjacent_children(store, staged, &mut updated)?;
+            let first_key = updated[0].first_key.clone();
+            let page_id = store.allocate_extent(1)?;
+            staged.push((page_id, encode_internal(&updated)?));
+            Ok(Some(StagedNode { page_id, first_key }))
+        }
+    }
+}
+
+/// Coalesces adjacent same-level siblings when their combined contents fit in
+/// one page. This is safe for immutable COW pages and refreshes parent fences.
+fn merge_adjacent_children(
+    store: &mut ExtentFile,
+    staged: &mut Vec<(u64, Vec<u8>)>,
+    children: &mut Vec<NodeRef>,
+) -> Result<(), DbError> {
+    let mut index = 0usize;
+    while index + 1 < children.len() {
+        let left_id = children[index].page_id;
+        let right_id = children[index + 1].page_id;
+        let left = read_staged_node(store, staged, left_id)?;
+        let right = read_staged_node(store, staged, right_id)?;
+        let merged = match (left, right) {
+            (DecodedNode::Leaf(mut left), DecodedNode::Leaf(right)) => {
+                left.extend(right);
+                encode_leaf(&left).ok().map(|payload| (payload, left[0].0.clone()))
+            }
+            (DecodedNode::Internal(left), DecodedNode::Internal(right)) => {
+                let mut combined = Vec::with_capacity(left.len() + right.len());
+                for (_, id) in left.into_iter().chain(right) {
+                    combined.push(NodeRef {
+                        page_id: id,
+                        first_key: subtree_first_key(store, staged, id)?,
+                    });
+                }
+                encode_internal(&combined).ok().map(|payload| (payload, combined[0].first_key.clone()))
+            }
+            _ => None,
+        };
+        if let Some((payload, first_key)) = merged {
+            let page_id = store.allocate_extent(1)?;
+            staged.push((page_id, payload));
+            children.splice(index..index + 2, [NodeRef { page_id, first_key }]);
+        } else {
+            index += 1;
+        }
+    }
     Ok(())
 }
 
@@ -266,7 +412,7 @@ pub(crate) fn replace_all(
     for (page_id, payload) in &pages {
         store.write_page(*page_id, payload)?;
     }
-    store.publish_root(Some(root_page_id))?;
+    store.publish_root((root_page_id != EMPTY_ROOT).then_some(root_page_id))?;
     validate_tree(store)?;
     truncate_wal(wal_path)?;
     Ok(())
@@ -414,8 +560,8 @@ fn validate_subtree(
             Ok(entries.first().zip(entries.last()).map(|(first, last)| (first.0.clone(), last.0.clone())))
         }
         DecodedNode::Internal(children) => {
-            if children.len() < 2 {
-                return Err(DbError::Storage("B+ tree internal node has fewer than two children".into()));
+            if children.is_empty() {
+                return Err(DbError::Storage("B+ tree internal node has no children".into()));
             }
             let mut previous_max: Option<Vec<u8>> = None;
             let mut overall_min: Option<Vec<u8>> = None;
@@ -521,8 +667,8 @@ fn encode_leaf(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, DbError> {
 }
 
 fn encode_internal(children: &[NodeRef]) -> Result<Vec<u8>, DbError> {
-    if children.len() < 2 {
-        return Err(DbError::Storage("B+ tree internal node requires at least two children".into()));
+    if children.is_empty() {
+        return Err(DbError::Storage("B+ tree internal node requires at least one child".into()));
     }
     let mut out = Vec::new();
     out.extend_from_slice(INTERNAL_MAGIC);
@@ -563,7 +709,6 @@ fn decode_node(bytes: &[u8]) -> Result<DecodedNode, DbError> {
         Ok(DecodedNode::Leaf(entries))
     } else if &bytes[..4] == INTERNAL_MAGIC {
         let count = get_u16(bytes, 4)? as usize;
-        if count == 0 { return Err(DbError::Storage("empty B+ tree internal node".into())); }
         if bytes.len() < 14 { return Err(DbError::Storage("truncated B+ tree internal node".into())); }
         let first_child = u64::from_le_bytes(bytes[6..14].try_into().unwrap());
         let mut children = vec![(Vec::new(), first_child)];
@@ -645,8 +790,8 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
         offset = end;
     }
     if offset != payload.len() { return Err(DbError::Storage("trailing bytes in B+ tree WAL".into())); }
-    if pages.is_empty() || page_ids.iter().filter(|page_id| **page_id == root).count() != 1 {
-        return Err(DbError::Storage("B+ tree WAL root must appear exactly once in its page set".into()));
+    if pages.is_empty() && root != EMPTY_ROOT {
+        return Err(DbError::Storage("B+ tree WAL with no page images must publish an empty root".into()));
     }
     Ok((root, pages))
 }
@@ -757,6 +902,34 @@ mod tests {
         let mut reopened = ExtentFile::open(&path).unwrap();
         recover(&mut reopened, &wal).unwrap();
         assert_eq!(get(&mut reopened, b"gamma").unwrap(), Some(b"3".to_vec()));
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn incremental_delete_merges_siblings_collapses_root_and_reopens() {
+        let (path, wal) = paths("incremental-delete");
+        let entries = (0u64..900)
+            .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut store = ExtentFile::open(&path).unwrap();
+        replace_all(&mut store, &wal, &entries).unwrap();
+
+        let keys = (0u64..899).map(|n| format!("key-{n:04}").into_bytes()).collect::<Vec<_>>();
+        assert_eq!(remove_many(&mut store, &wal, &keys).unwrap(), 899);
+        assert_eq!(get(&mut store, b"key-0899").unwrap(), Some(899u64.to_le_bytes().to_vec()));
+        let root = store.root_page_id().unwrap();
+        assert!(matches!(decode_node(&store.read_page(root).unwrap()).unwrap(), DecodedNode::Leaf(_)));
+        assert_eq!(remove_many(&mut store, &wal, &[b"missing".to_vec()]).unwrap(), 0);
+        assert_eq!(remove_many(&mut store, &wal, &[b"key-0899".to_vec()]).unwrap(), 1);
+        assert_eq!(store.root_page_id(), None);
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        recover(&mut reopened, &wal).unwrap();
+        assert_eq!(get(&mut reopened, b"key-0899").unwrap(), None);
+        assert_eq!(reopened.root_page_id(), None);
         drop(reopened);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
