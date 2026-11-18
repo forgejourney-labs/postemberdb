@@ -127,7 +127,7 @@ pub(crate) fn get(
                     .ok().map(|index| entries[index].1.clone()));
             }
             DecodedNode::Internal(children) => {
-                let child_index = children.partition_point(|(separator, _)| key >= separator.as_slice());
+                let child_index = children[1..].partition_point(|(separator, _)| key >= separator.as_slice());
                 page_id = children[child_index].1;
             }
         }
@@ -162,7 +162,7 @@ fn scan_node(
             }
         }
         DecodedNode::Internal(children) => {
-            let first = children.partition_point(|(separator, _)| separator.as_slice() < lower).saturating_sub(1);
+            let first = children[1..].partition_point(|(separator, _)| separator.as_slice() <= lower);
             for (_, child) in children.into_iter().skip(first) {
                 scan_node(store, child, lower, upper, out)?;
             }
@@ -179,7 +179,7 @@ fn validate_entries(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
         if value.len() > super::extent::page_payload_size() {
             return Err(DbError::Storage("B+ tree value exceeds one page".into()));
         }
-        if index > 0 && entries[index - 1].0 >= *key {
+        if index > 0 && entries[index - 1].0.as_slice() >= key.as_slice() {
             return Err(DbError::Storage("B+ tree keys must be strictly increasing".into()));
         }
     }
@@ -228,17 +228,8 @@ fn group_internal_children(children: &[NodeRef]) -> Result<Vec<Vec<NodeRef>>, Db
         if previous.len() <= 2 {
             return Err(DbError::Storage("cannot balance B+ tree internal page groups".into()));
         }
-        previous.pop();
-        groups.push(vec![previous.pop().unwrap(), last]);
-        // The previous page remains valid with at least two children.
-        let moved = groups.pop().unwrap();
-        let target = groups.last_mut().unwrap();
-        if target.len() == 1 {
-            target.push(moved[0].clone());
-            groups.push(vec![moved[1].clone()]);
-        } else {
-            groups.push(moved);
-        }
+        let moved = previous.pop().unwrap();
+        groups.push(vec![moved, last]);
     }
     Ok(groups)
 }
