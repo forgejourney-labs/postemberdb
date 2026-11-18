@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use fs2::FileExt;
 
 mod pages;
 mod wal;
@@ -23,6 +24,20 @@ impl Database {
     /// Open a persistent database. A missing file creates a new empty database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(storage_error)?;
+            }
+        }
+        let lock_path = lock_file_path(&path);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(storage_error)?;
+        FileExt::try_lock_exclusive(&lock_file)
+            .map_err(|error| DbError::Storage(format!("database is already open by another process or handle: {error}")))?;
         let mut db = if path.exists() {
             Self::decode_file(&path)?
         } else {
@@ -30,6 +45,7 @@ impl Database {
         };
         db.storage_path = Some(path.clone());
         db.wal_path = Some(wal_file_path(&path));
+        db.lock_file = Some(std::sync::Arc::new(lock_file));
         if !path.exists() {
             db.write_snapshot()?;
         }
@@ -433,3 +449,9 @@ fn checksum(bytes: &[u8]) -> u64 {
     hash
 }
 
+
+fn lock_file_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
