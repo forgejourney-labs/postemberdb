@@ -1242,6 +1242,13 @@ mod tests {
             let player_e_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'")
                 .unwrap().rows[0].row_id;
             assert_eq!(player_e_id, 5, "deleted row IDs must not be reused");
+            db.transaction(|tx| {
+                tx.execute("INSERT INTO delta_players VALUES ('ephemeral', 60)")?;
+                tx.execute("DELETE FROM delta_players WHERE uuid = 'ephemeral'")?;
+                Ok(())
+            }).unwrap();
+            assert!(db.ember_indexes_valid);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'ephemeral'").unwrap().rows.len(), 0);
             db.checkpoint().unwrap();
         }
         let mut reopened = Database::open(&path).unwrap();
