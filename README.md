@@ -11,6 +11,10 @@ PostemberDB is not a wrapper around SQLite or PostgreSQL. Its storage, execution
 
 KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert API (up to 5,000 rows per call) so persistent storage is written once per batch. This fits common KSL and Minecraft workloads such as player statistics and economy updates. A JVM/JDBC-compatible adapter is not implemented yet; see [KSL and Minecraft integration](docs/KSL_MINECRAFT.md) for the current contract and roadmap.
 
+## Storage architecture
+
+The planned tree-oriented storage model is named **EmberTree**. Its design, CoW/in-place modes, manual defragmentation contract, page budgets, compression, snapshots, and recovery invariants are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md). EmberTree is a design target; the current PPG1 snapshot implementation is not yet that engine. Security posture and release gates are in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+
 ## Current status
 
 The project is at an early development stage. The first prototype provides:
@@ -27,7 +31,11 @@ The project is at an early development stage. The first prototype provides:
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
+
+## CLI
+
+See [docs/CLI.md](docs/CLI.md) for available commands and the planned operator command groups.
 
 ## Build and test
 
