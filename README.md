@@ -21,6 +21,7 @@ The project is at an early development stage. The first prototype provides:
 - basic column type and `NOT NULL` validation;
 - a versioned, fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
+- staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
 - secondary B-tree indexes with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
 - temporary-file writes followed by rename when checkpointing the database;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
@@ -44,7 +45,7 @@ cargo bench --no-run
 cargo run -- server 127.0.0.1:7432
 ```
 
-The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line. Send `QUIT` to close a client session.
+The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. It is not yet a stable JDBC wire protocol.
 
 ## Use as an embedded library
 
