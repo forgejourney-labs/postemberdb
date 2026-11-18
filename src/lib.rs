@@ -431,8 +431,11 @@ impl Database {
         validate_value(&table.columns[target_index], &new_value)?;
 
         let matching = if let Some(predicate) = predicate {
-            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
-            table.matching_rows(column_index, &value)
+            let predicates = parse_equality_predicates(&table.columns, predicate)?;
+            let (first_column, first_value) = &predicates[0];
+            table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
+                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
+            }).collect()
         } else {
             (0..table.rows.len()).collect()
         };
@@ -453,8 +456,11 @@ impl Database {
         let table_name = normalize_ident(table_part);
         let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
         let removed = if let Some(predicate) = predicate {
-            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
-            let matches = table.matching_rows(column_index, &value).into_iter().collect::<std::collections::BTreeSet<_>>();
+            let predicates = parse_equality_predicates(&table.columns, predicate)?;
+            let (first_column, first_value) = &predicates[0];
+            let matches = table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
+                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
+            }).collect::<std::collections::BTreeSet<_>>();
             let before = table.rows.len();
             let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
@@ -485,8 +491,11 @@ impl Database {
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
 
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
-            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
-            table.matching_rows(column_index, &value)
+            let predicates = parse_equality_predicates(&table.columns, predicate)?;
+            let (first_column, first_value) = &predicates[0];
+            table.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
+                predicates.iter().all(|(column_index, value)| table.rows[*row_index].values[*column_index] == *value)
+            }).collect()
         } else {
             (0..table.rows.len()).collect()
         };
@@ -516,13 +525,55 @@ impl Database {
 }
 
 
-fn parse_equality_predicate(columns: &[Column], predicate: &str) -> Result<(usize, Value), DbError> {
-    let equals = predicate.find('=').ok_or_else(|| DbError::Parse("expected '=' in equality predicate".into()))?;
-    let column_name = normalize_ident(predicate[..equals].trim());
-    let value = parse_value(predicate[equals + 1..].trim())?;
-    let column_index = columns.iter().position(|column| column.name == column_name)
-        .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
-    Ok((column_index, value))
+fn parse_equality_predicates(columns: &[Column], predicate: &str) -> Result<Vec<(usize, Value)>, DbError> {
+    let conditions = split_and_conditions(predicate);
+    if conditions.is_empty() {
+        return Err(DbError::Parse("empty WHERE predicate".into()));
+    }
+    conditions.into_iter().map(|condition| {
+        let equals = condition.find('=').ok_or_else(|| DbError::Parse("expected '=' in equality predicate".into()))?;
+        let column_name = normalize_ident(condition[..equals].trim());
+        let value = parse_value(condition[equals + 1..].trim())?;
+        let column_index = columns.iter().position(|column| column.name == column_name)
+            .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
+        Ok((column_index, value))
+    }).collect()
+}
+
+fn split_and_conditions(input: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let chars = input.char_indices().collect::<Vec<_>>();
+    let mut cursor = 0usize;
+    while cursor < chars.len() {
+        let (position, ch) = chars[cursor];
+        if let Some(active) = quote {
+            if ch == active {
+                if cursor + 1 < chars.len() && chars[cursor + 1].1 == active {
+                    cursor += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            cursor += 1;
+            continue;
+        }
+        if input[position..].len() >= 5 && input[position..position + 5].eq_ignore_ascii_case(" AND ") {
+            result.push(input[start..position].trim());
+            start = position + 5;
+            while cursor < chars.len() && chars[cursor].0 < start { cursor += 1; }
+            continue;
+        }
+        cursor += 1;
+    }
+    result.push(input[start..].trim());
+    result
 }
 
 fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
