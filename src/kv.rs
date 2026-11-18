@@ -109,14 +109,12 @@ impl KeyValueStore {
     /// Returns all key/value pairs whose keys begin with the supplied prefix.
     /// Results are in bytewise key order.
     pub fn scan_prefix(&mut self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
+        if prefix.len() > MAX_KEY_BYTES {
+            return Err(DbError::Constraint("prefix cannot exceed 1024 bytes".into()));
+        }
         let lower = if prefix.is_empty() { vec![0] } else { prefix.to_vec() };
-        let upper = if prefix.len() == MAX_KEY_BYTES {
-            prefix.to_vec()
-        } else {
-            let mut upper = prefix.to_vec();
-            upper.push(u8::MAX);
-            if upper.is_empty() { vec![u8::MAX; MAX_KEY_BYTES] } else { upper }
-        };
+        let mut upper = prefix.to_vec();
+        upper.resize(MAX_KEY_BYTES, u8::MAX);
         page_tree::scan_range_limited(&mut self.store, &lower, &upper, limit)
     }
 
@@ -171,7 +169,7 @@ impl RegistryValue {
 
 fn normalize_path(path: &str) -> Result<String, DbError> {
     let mut components = Vec::new();
-    for component in path.split(['/', '\\\\']) {
+    for component in path.split(|character| character == '/' || character == '\\\\') {
         let component = component.trim();
         if component.is_empty() { continue; }
         if component == "." || component == ".." || component.contains('\0') {
