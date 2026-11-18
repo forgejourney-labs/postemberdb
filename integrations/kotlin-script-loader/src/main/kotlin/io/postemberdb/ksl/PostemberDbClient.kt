@@ -20,11 +20,11 @@ data class PostemberQueryResult(
     val message: String,
     val affectedRows: Long,
     val columns: List<String>,
-    val rows: List<List<JsonElement>>
+    val rows: List<List<Any?>>
 ) {
-    fun string(row: Int, column: Int): String? = rows[row][column].jsonPrimitive.contentOrNull
-    fun long(row: Int, column: Int): Long? = rows[row][column].jsonPrimitive.longOrNull
-    fun boolean(row: Int, column: Int): Boolean? = rows[row][column].jsonPrimitive.booleanOrNull
+    fun string(row: Int, column: Int): String? = rows[row][column] as? String
+    fun long(row: Int, column: Int): Long? = (rows[row][column] as? Number)?.toLong()
+    fun boolean(row: Int, column: Int): Boolean? = rows[row][column] as? Boolean
 }
 
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
@@ -106,6 +106,18 @@ class PostemberDbClient internal constructor(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) executor.shutdownNow()
+    }
+}
+
+private fun JsonElement.toNativeValue(): Any? = when (this) {
+    JsonNull -> null
+    is JsonObject, is JsonArray -> toString()
+    is JsonPrimitive -> when {
+        isString -> content
+        booleanOrNull != null -> boolean
+        longOrNull != null -> long
+        doubleOrNull != null -> double
+        else -> content
     }
 }
 
