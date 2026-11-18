@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn cow_tree_round_trips_and_publishes_new_root() {
         let (path, wal) = paths("roundtrip");
-        let entries = (0..800).map(|n| (format!("key-{n:04}").into_bytes(), format!("value-{n}").into_bytes())).collect::<Vec<_>>();
+        let entries = (0..800).map(|n: u64| (format!("key-{n:04}").into_bytes(), format!("value-{n}").into_bytes())).collect::<Vec<_>>();
         let mut store = ExtentFile::open(&path).unwrap();
         replace_all(&mut store, &wal, &entries).unwrap();
         let first_root = store.root_page_id().unwrap();
@@ -578,7 +578,7 @@ mod tests {
     fn validates_tree_structure_after_reopen() {
         let (path, wal) = paths("validate");
         let entries = (0u64..900)
-            .map(|n| (format!("entry-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .map(|n: u64| (format!("entry-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
             .collect::<Vec<_>>();
         {
             let mut store = ExtentFile::open(&path).unwrap();
