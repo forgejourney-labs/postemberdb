@@ -72,16 +72,7 @@ fn main() {
 }
 
 fn run_server(address: &str, data_path: &str) -> io::Result<()> {
-    let socket_address: SocketAddr = address.parse().map_err(|_| io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "server address must be an explicit loopback socket address until TLS and authentication are implemented",
-    ))?;
-    if !socket_address.ip().is_loopback() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing non-loopback bind: this development protocol has no TLS or authentication",
-        ));
-    }
+    let socket_address = validate_bind_address(address)?;
     let listener = TcpListener::bind(socket_address)?;
     println!("PostemberDB development server listening on loopback {socket_address}");
     let database = Database::open(data_path)
@@ -207,4 +198,47 @@ fn format_result(result: QueryResult) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_bounded_line, validate_bind_address};
+    use std::io::{self, BufReader, Cursor};
+
+    #[test]
+    fn server_accepts_only_loopback_bind_addresses() {
+        assert!(validate_bind_address("127.0.0.1:7432").is_ok());
+        assert!(validate_bind_address("[::1]:7432").is_ok());
+        assert_eq!(
+            validate_bind_address("0.0.0.0:7432").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_bind_address("db.example.com:7432").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn bounded_line_reader_rejects_oversize_and_recovers_at_next_line() {
+        let input = Cursor::new(b"12345\\nOK\\n".to_vec());
+        let mut reader = BufReader::new(input);
+        let mut line = Vec::new();
+        let error = read_bounded_line(&mut reader, &mut line, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), Some(2));
+        assert_eq!(line, b"OK");
+    }
+
+    #[test]
+    fn bounded_line_reader_accepts_exact_limit_and_final_line_without_newline() {
+        let input = Cursor::new(b"ABCD\\nxyz".to_vec());
+        let mut reader = BufReader::new(input);
+        let mut line = Vec::new();
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), Some(4));
+        assert_eq!(line, b"ABCD");
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), Some(3));
+        assert_eq!(line, b"xyz");
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), None);
+    }
 }
