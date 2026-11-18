@@ -503,6 +503,12 @@ impl Transaction<'_> {
         Ok(result)
     }
 
+    /// Execute a parameterized statement inside this transaction.
+    pub fn execute_params(&mut self, sql: &str, parameters: &[Value]) -> Result<QueryResult, DbError> {
+        let bound = bind_parameters(sql, parameters)?;
+        self.execute(&bound)
+    }
+
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
         if !self.statements.is_empty() && self.database.wal_path.is_some() {
