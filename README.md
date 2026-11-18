@@ -7,9 +7,9 @@
 
 PostemberDB is not a wrapper around SQLite or PostgreSQL. Its storage, execution, and protocol layers are intended to be implemented in this project.
 
-## KSL integration
+## KSL and Minecraft integration
 
-KSL is an optional integration target, not a requirement for using PostemberDB. The engine will expose a stable core API for ordinary Rust applications, with a dedicated integration layer planned to reduce conversion and execution overhead for KSL workloads.
+KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert API (up to 5,000 rows per call) so persistent storage is written once per batch. This fits common KSL and Minecraft workloads such as player statistics and economy updates. A JVM/JDBC-compatible adapter is not implemented yet; see [KSL and Minecraft integration](docs/KSL_MINECRAFT.md) for the current contract and roadmap.
 
 ## Current status
 
@@ -21,6 +21,7 @@ The project is at an early development stage. The first prototype provides:
 - basic column type and `NOT NULL` validation;
 - a versioned binary on-disk format with automatic persistence after successful table creation and inserts;
 - temporary-file writes followed by rename when saving the database;
+- atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
 **Current limitations:** the storage layer rewrites the full database file after each successful write; it has no WAL, transactions, crash-recovery protocol, checksums, or concurrent multi-process file locking. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
@@ -65,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 3. Add write-ahead logging, crash recovery, and transactions.
 4. Add indexes and a cost-aware query planner.
 5. Harden the server protocol with authentication, framing, and resource limits.
-6. Add KSL-specific integration and benchmark it against the general API.
+6. Add a stable KSL/JVM adapter and benchmark it against the general API.
 
 ## Development branches
 
