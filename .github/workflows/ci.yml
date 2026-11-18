@@ -19,3 +19,5 @@ jobs:
         run: cargo test --all-targets
       - name: Build release
         run: cargo build --release
+      - name: Compile benchmarks
+        run: cargo bench --no-run
