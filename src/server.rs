@@ -85,12 +85,22 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
                         Ok(_) => {
                             let db = database.clone();
                             let active = active_clients.clone();
-                            thread::spawn(move || {
-                                let _guard = ConnectionGuard(active);
-                                if let Err(error) = handle_client(stream, db) {
-                                    eprintln!("client error: {error}");
+                            let active_on_failure = active_clients.clone();
+                            match thread::Builder::new()
+                                .name("postemberdb-client".into())
+                                .spawn(move || {
+                                    let _guard = ConnectionGuard(active);
+                                    if let Err(error) = handle_client(stream, db) {
+                                        eprintln!("client error: {error}");
+                                    }
+                                })
+                            {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    active_on_failure.fetch_sub(1, Ordering::AcqRel);
+                                    eprintln!("could not start client worker: {error}");
                                 }
-                            });
+                            }
                             break;
                         }
                         Err(observed) => current = observed,
@@ -107,6 +117,7 @@ fn handle_client(
     mut stream: TcpStream,
     database: std::sync::Arc<std::sync::Mutex<Database>>,
 ) -> io::Result<()> {
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))?;
     let reader_stream = stream.try_clone()?;
