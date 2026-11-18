@@ -662,12 +662,7 @@ impl Database {
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
         let mut store = extent::ExtentFile::open(&page_path)?;
-        if !removed.is_empty() {
-            page_tree::remove_many(&mut store, &tree_wal_path, &removed)?;
-        }
-        if !inserted.is_empty() {
-            page_tree::insert_many(&mut store, &tree_wal_path, &inserted)?;
-        }
+        page_tree::apply_mutations(&mut store, &tree_wal_path, &removed, &inserted)?;
         Ok(true)
     }
 }
