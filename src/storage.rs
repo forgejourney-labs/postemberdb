@@ -338,6 +338,12 @@ mod tests {
         let mut reopened = Database::open(&path).unwrap();
         let query = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap();
         assert_eq!(query.rows.len(), 700);
+        let limited = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a' LIMIT 5").unwrap();
+        assert_eq!(limited.rows.len(), 5);
+        assert_eq!(limited.rows[0].values[1], Value::Integer(0));
+        assert_eq!(limited.rows[4].values[1], Value::Integer(4));
+        let empty = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a' LIMIT 0").unwrap();
+        assert!(empty.rows.is_empty());
         drop(reopened);
 
         let mut store = extent::ExtentFile::open(&page_path).unwrap();
