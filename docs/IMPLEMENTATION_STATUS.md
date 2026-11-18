@@ -149,7 +149,7 @@ The incremental insert/delete APIs are now used by SQL transaction commits for t
 
 ## Native Key-Value and Registry storage
 
-Implemented a standalone `KeyValueStore` backed by the native page-backed CoW B+ Tree. It supports arbitrary byte keys, page-sized byte values, exact get/put/delete, batched upserts, mixed mutation batches, ordered prefix scans, and prefix deletion. Each batch is one redo-WAL transaction and one root publication. The store uses separate `.pages`, `.pages.wal`, and exclusive `.lock` sidecars.
+Implemented a standalone `KeyValueStore` backed by the native page-backed CoW B+ Tree. It supports arbitrary byte keys, byte values that fit alongside their keys in one leaf entry, exact get/put/delete, batched upserts, mixed mutation batches, ordered prefix scans, and prefix deletion. Each batch is one redo-WAL transaction and one root publication. The store uses separate `.pages`, `.pages.wal`, and exclusive `.lock` sidecars.
 
 Implemented a typed `Registry` layered on that KV engine. It provides top-level hives, nested keys, case-insensitive slash/backslash paths, named values (including the default empty-name value), enumeration, and safe non-recursive or recursive key deletion. Supported value types are String, Integer, Boolean, Binary, and JSON text. JSON text is not parsed or schema-validated by the database.
 
