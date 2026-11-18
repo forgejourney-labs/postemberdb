@@ -305,6 +305,44 @@ struct EmberIndexDelta {
     insert: bool,
 }
 
+fn build_row_index_deltas(
+    table_name: &str,
+    table: &Table,
+    row: &Row,
+    only_index: Option<&str>,
+    insert: bool,
+) -> Result<Option<Vec<EmberIndexDelta>>, DbError> {
+    let mut deltas = Vec::new();
+    for (index_name, index) in &table.indexes {
+        if only_index.is_some_and(|selected| selected != index_name) {
+            continue;
+        }
+        let key = IndexKey::from_columns(&row.values, &index.column_indices);
+        let Some(key) = storage::encode_ember_index_entry(table_name, index_name, &key, row.row_id)? else {
+            return Ok(None);
+        };
+        deltas.push(EmberIndexDelta { key, insert });
+    }
+    Ok(Some(deltas))
+}
+
+fn build_rows_index_deltas(
+    table_name: &str,
+    table: &Table,
+    rows: &[Row],
+    only_index: Option<&str>,
+    insert: bool,
+) -> Result<Option<Vec<EmberIndexDelta>>, DbError> {
+    let mut all = Vec::new();
+    for row in rows {
+        let Some(mut row_deltas) = build_row_index_deltas(table_name, table, row, only_index, insert)? else {
+            return Ok(None);
+        };
+        all.append(&mut row_deltas);
+    }
+    Ok(Some(all))
+}
+
 #[derive(Debug, Default)]
 pub struct Database {
     tables: BTreeMap<String, Table>,
@@ -320,6 +358,13 @@ pub struct Database {
 
 impl Database {
     pub fn new() -> Self { Self::default() }
+
+    fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
+        match deltas {
+            Some(mut deltas) => self.ember_index_journal.append(&mut deltas),
+            None => self.ember_journal_supported = false,
+        }
+    }
 
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -552,9 +597,13 @@ impl Database {
         if index_name.is_empty() || column_name.is_empty() {
             return Err(DbError::Parse("index and column names are required".into()));
         }
-        let table = self.tables.get_mut(&table_name)
-            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        table.add_index(index_name.clone(), &column_name)?;
+        let deltas = {
+            let table = self.tables.get_mut(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            table.add_index(index_name.clone(), &column_name)?;
+            build_rows_index_deltas(&table_name, table, &table.rows.clone(), Some(&index_name), true)?
+        };
+        self.append_ember_journal(deltas);
         Ok(QueryResult::message(format!("index {index_name} created on {table_name}({column_name})")))
     }
 
@@ -599,8 +648,32 @@ impl Database {
             validate_value(column, value)?;
         }
 
-        if !upsert_clause.trim().is_empty() && apply_upsert(table, &values, upsert_clause)? {
-            return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+        if !upsert_clause.trim().is_empty() {
+            let existing_row_index = table.indexes.values().filter(|index| index.unique).find_map(|index| {
+                let key = IndexKey::from_columns(&values, &index.column_indices);
+                index.entries.get(&key).and_then(|positions| positions.first()).copied()
+            });
+            let old_row = existing_row_index.and_then(|position| table.rows.get(position).cloned());
+            if apply_upsert(table, &values, upsert_clause)? {
+                let new_row = existing_row_index.and_then(|position| table.rows.get(position).cloned());
+                let mut deltas = Vec::new();
+                if let Some(row) = old_row {
+                    let Some(mut old) = build_row_index_deltas(&table_name, table, &row, None, false)? else {
+                        self.ember_journal_supported = false;
+                        return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+                    };
+                    deltas.append(&mut old);
+                }
+                if let Some(row) = new_row {
+                    let Some(mut new) = build_row_index_deltas(&table_name, table, &row, None, true)? else {
+                        self.ember_journal_supported = false;
+                        return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+                    };
+                    deltas.append(&mut new);
+                }
+                self.ember_index_journal.append(&mut deltas);
+                return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+            }
         }
         table.validate_unique(&values)?;
         let row_id = table.next_row_id;
@@ -610,6 +683,9 @@ impl Database {
         let row_index = table.rows.len() - 1;
         table.row_positions.insert(row_id, row_index);
         table.index_row(row_index);
+        let inserted_row = table.rows[row_index].clone();
+        let deltas = build_row_index_deltas(&table_name, table, &inserted_row, None, true)?;
+        self.append_ember_journal(deltas);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row inserted".into() })
     }
 
