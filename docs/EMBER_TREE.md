@@ -151,3 +151,8 @@ TTL must not silently delete data based on an untrusted or backwards-moving wall
 ## SQL transaction delta integration
 
 After the canonical SQL WAL commit is durable, the database now compares the previous and next in-memory index entry sets and applies only removed row-reference keys with `remove_many` and new keys with `insert_many`. Unchanged persistent subtrees are retained by copy-on-write path updates. If the mirror update fails, the SQL transaction remains committed and the engine falls back to in-memory indexes; startup can rebuild the derived mirror from the SQL snapshot/WAL. This first delta implementation still scans all in-memory index entries to calculate the set difference, so delta discovery is O(total indexed entries). Because SQL row references are positional, deleting a row can shift references for later rows and produce a larger delta. Stable row identifiers and direct mutation journaling are future optimizations. SQL rows/catalog are still not page-backed.
+
+
+## Atomic mixed mutation batches
+
+The persistent page-tree API now exposes `apply_mutations`, which accepts removals and upserts together. It evaluates removals first and upserts second (so an upsert wins for a key present in both lists), stages the combined copy-on-write changes, writes one redo record, and publishes one root. SQL transaction delta synchronization now uses this combined operation instead of publishing a delete root followed by a separate insert root. This closes the intermediate-root window between the two halves of one derived-index update. The SQL WAL remains authoritative; mirror failures still fall back to in-memory indexes. The mixed-batch API does not change the current O(N) delta discovery or positional row-reference limitations.
