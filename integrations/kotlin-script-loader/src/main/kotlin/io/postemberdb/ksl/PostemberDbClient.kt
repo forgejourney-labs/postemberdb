@@ -94,7 +94,7 @@ class PostemberDbClient internal constructor(
                 throw PostemberDbException(response["error"]?.jsonPrimitive?.contentOrNull ?: "unknown database error")
             }
             val columns = response["columns"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            val rows = response["rows"]?.jsonArray?.map { it.jsonArray.toList() } ?: emptyList()
+            val rows = response["rows"]?.jsonArray?.map { row -> row.jsonArray.map { it.toNativeValue() } } ?: emptyList()
             return PostemberQueryResult(
                 message = response["message"]?.jsonPrimitive?.contentOrNull ?: "OK",
                 affectedRows = response["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L,
