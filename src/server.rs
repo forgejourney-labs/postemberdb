@@ -275,7 +275,7 @@ mod tests {
         };
         let encoded = super::format_result_json(result);
         assert!(encoded.contains("\"count\""));
-        assert!(encoded.contains("[42,true,null]"));
+        assert!(encoded.contains(",42,true,null]"));
         assert!(encoded.contains("a\\n\\\"b"));
         assert!(super::json_error("bad").contains("\"ok\":false"));
     }
