@@ -13,7 +13,9 @@ import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class PostemberQueryResult(
@@ -36,7 +38,11 @@ class PostemberDbClient internal constructor(
     workerThreads: Int
 ) : Closeable {
     private val closed = AtomicBoolean(false)
-    private val executor: ExecutorService = Executors.newFixedThreadPool(workerThreads.coerceIn(1, 8))
+    private val workerCount = workerThreads.coerceIn(1, 8)
+    private val executor: ExecutorService = ThreadPoolExecutor(
+        workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(256), ThreadPoolExecutor.AbortPolicy()
+    )
     private val json = Json { ignoreUnknownKeys = true }
 
     init {
