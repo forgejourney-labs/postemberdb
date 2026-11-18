@@ -56,9 +56,7 @@ impl Database {
         }
         db.replay_wal()?;
         recover_page_tree(&path)?;
-        db.ember_indexes_valid = false;
-        db.sync_ember_indexes()?;
-        db.ember_indexes_valid = true;
+        db.ember_indexes_valid = db.sync_ember_indexes()?;
         Ok(db)
     }
 
@@ -607,8 +605,8 @@ fn page_tree_wal_file_path(path: &Path) -> PathBuf {
 /// Rebuild the durable EmberTree index mirror from the SQL-WAL-recovered state.
 /// SQL snapshots/WAL remain authoritative; this operation is idempotent and repairable.
 impl Database {
-    pub(crate) fn sync_ember_indexes(&self) -> Result<(), DbError> {
-        let Some(database_path) = self.storage_path.as_deref() else { return Ok(()); };
+    pub(crate) fn sync_ember_indexes(&self) -> Result<bool, DbError> {
+        let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
         let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
@@ -617,13 +615,16 @@ impl Database {
             for (index_name, index) in &table.indexes {
                 let upper = super::IndexKey::Composite(vec![super::IndexAtom::Boolean(true); 256]);
                 for (key, rows) in index.entries.scan_range(&super::IndexKey::Null, &upper) {
-                    let encoded = index_codec::encode_index_key(&key)?;
+                    let encoded = match index_codec::encode_index_key(&key) {
+                        Ok(encoded) => encoded,
+                        Err(_) => return Ok(false),
+                    };
                     let mut disk_key = Vec::with_capacity(4 + table_name.len() + index_name.len() + encoded.len());
                     put_namespace_part(&mut disk_key, table_name.as_bytes())?;
                     put_namespace_part(&mut disk_key, index_name.as_bytes())?;
                     disk_key.extend_from_slice(&encoded);
                     if disk_key.len() > 1015 {
-                        return Err(DbError::Storage("namespaced SQL index key leaves no room for its row-reference suffix".into()));
+                        return Ok(false);
                     }
                     for row in rows {
                         let row = u64::try_from(row)
@@ -638,15 +639,16 @@ impl Database {
         }
 
         if entries.is_empty() && !page_path.exists() && !tree_wal_path.exists() {
-            return Ok(());
+            return Ok(true);
         }
         let mut store = extent::ExtentFile::open(&page_path)?;
         if entries.is_empty() {
             store.publish_root(None)?;
-            return Ok(());
+            return Ok(true);
         }
         let encoded = entries.into_iter().collect::<Vec<_>>();
-        page_tree::replace_all(&mut store, &tree_wal_path, &encoded)
+        page_tree::replace_all(&mut store, &tree_wal_path, &encoded)?;
+        Ok(true)
     }
 }
 
