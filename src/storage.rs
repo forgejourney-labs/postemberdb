@@ -348,6 +348,46 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+
+    #[test]
+    fn checkpoint_does_not_replay_committed_wal_twice() {
+        let path = test_path("checkpoint");
+        let wal = wal_file_path(&path);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE checkpointed (value INTEGER)").unwrap();
+            db.execute("INSERT INTO checkpointed VALUES (42)").unwrap();
+            db.checkpoint().unwrap();
+            assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM checkpointed").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Integer(42));
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).unwrap();
+    }
+
+    #[test]
+    fn recovery_discards_an_incomplete_final_wal_frame() {
+        let path = test_path("torn-wal");
+        let wal = wal_file_path(&path);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE torn (value INTEGER)").unwrap();
+            db.execute("INSERT INTO torn VALUES (9)").unwrap();
+        }
+        let valid_len = fs::metadata(&wal).unwrap().len();
+        OpenOptions::new().append(true).open(&wal).unwrap().write_all(b"PWT2partial").unwrap();
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.execute("SELECT * FROM torn").unwrap().rows.len(), 1);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), valid_len);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).unwrap();
+    }
+
     #[test]
     fn failed_statement_does_not_replace_persisted_state() {
         let path = test_path("failed-write");
