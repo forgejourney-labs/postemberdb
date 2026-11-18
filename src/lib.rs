@@ -71,6 +71,7 @@ pub enum DbError {
     Constraint(String),
     Unsupported(String),
     Storage(String),
+    TransactionConflict,
 }
 
 impl fmt::Display for DbError {
@@ -84,6 +85,7 @@ impl fmt::Display for DbError {
             DbError::Constraint(s) => write!(f, "constraint violation: {s}"),
             DbError::Unsupported(s) => write!(f, "unsupported SQL: {s}"),
             DbError::Storage(s) => write!(f, "storage error: {s}"),
+            DbError::TransactionConflict => write!(f, "transaction conflict: database changed since the session began"),
         }
     }
 }
@@ -152,6 +154,7 @@ pub struct Database {
     storage_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
     wal_sequence: u64,
+    revision: u64,
 }
 
 impl Database {
@@ -161,7 +164,7 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "CREATE INDEX") || starts_with_kw(statement, "INSERT INTO");
-        if is_write && self.storage_path.is_some() {
+        if is_write {
             return self.transaction(|transaction| transaction.execute(statement));
         }
         self.execute_inner(statement)
@@ -189,6 +192,36 @@ impl Database {
         result
     }
 
+    /// Start an owned optimistic session for a client connection.
+    pub fn begin_session(&self) -> DatabaseSession {
+        DatabaseSession {
+            base_revision: self.revision,
+            staged: Database {
+                tables: self.tables.clone(),
+                storage_path: None,
+                wal_path: None,
+                wal_sequence: self.wal_sequence,
+                revision: self.revision,
+            },
+            statements: Vec::new(),
+        }
+    }
+
+    /// Commit a previously staged session if no other writer changed the database.
+    pub fn commit_session(&mut self, session: DatabaseSession) -> Result<(), DbError> {
+        if session.base_revision != self.revision {
+            return Err(DbError::TransactionConflict);
+        }
+        if session.statements.is_empty() { return Ok(()); }
+        if self.wal_path.is_some() {
+            let sequence = self.append_wal_transaction(&session.statements)?;
+            self.wal_sequence = sequence;
+        }
+        self.tables = session.staged.tables;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
+    }
+
     /// Run multiple SQL statements as one atomic transaction.
     /// The transaction is durable only after its WAL commit record is synced.
     pub fn transaction<F, T>(&mut self, operation: F) -> Result<T, DbError>
@@ -200,6 +233,7 @@ impl Database {
             storage_path: None,
             wal_path: None,
             wal_sequence: self.wal_sequence,
+            revision: self.revision,
         };
         let mut transaction = Transaction {
             database: self,
@@ -246,34 +280,14 @@ impl Database {
             }
         }
 
-        if self.storage_path.is_some() {
-            let inserted = batch.len();
-            return self.transaction(|transaction| {
-                for values in batch {
-                    let encoded = values.iter().map(value_to_sql).collect::<Vec<_>>().join(", ");
-                    transaction.execute(&format!("INSERT INTO {normalized} VALUES ({encoded})"))?;
-                }
-                Ok(inserted)
-            });
-        }
-
-        let table = self.tables.get_mut(&normalized).expect("table checked above");
-        let previous_len = table.rows.len();
-        table.rows.extend(batch.drain(..).map(|values| Row { values }));
-        for row_index in previous_len..table.rows.len() {
-            table.index_row(row_index);
-        }
-        let inserted = table.rows.len() - previous_len;
-
-        if self.storage_path.is_some() {
-            if let Err(error) = self.save() {
-                if let Some(table) = self.tables.get_mut(&normalized) {
-                    table.rows.truncate(previous_len);
-                }
-                return Err(error);
+        let inserted = batch.len();
+        self.transaction(|transaction| {
+            for values in batch {
+                let encoded = values.iter().map(value_to_sql).collect::<Vec<_>>().join(", ");
+                transaction.execute(&format!("INSERT INTO {normalized} VALUES ({encoded})"))?;
             }
-        }
-        Ok(inserted)
+            Ok(inserted)
+        })
     }
 
     fn create_table(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -484,6 +498,34 @@ fn validate_value(column: &Column, value: &Value) -> Result<(), DbError> {
 }
 
 
+
+/// An owned transaction session suitable for request/response server protocols.
+/// Changes remain private until Database::commit_session accepts the base revision.
+pub struct DatabaseSession {
+    base_revision: u64,
+    staged: Database,
+    statements: Vec<String>,
+}
+
+impl DatabaseSession {
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let statement = sql.trim().trim_end_matches(';').trim();
+        let is_write = starts_with_kw(statement, "CREATE TABLE")
+            || starts_with_kw(statement, "CREATE INDEX")
+            || starts_with_kw(statement, "INSERT INTO");
+        let result = self.staged.execute_inner(statement)?;
+        if is_write { self.statements.push(statement.to_owned()); }
+        Ok(result)
+    }
+
+    pub fn execute_params(&mut self, sql: &str, parameters: &[Value]) -> Result<QueryResult, DbError> {
+        let bound = bind_parameters(sql, parameters)?;
+        self.execute(&bound)
+    }
+
+    pub fn has_writes(&self) -> bool { !self.statements.is_empty() }
+}
+
 /// A transaction stages changes privately until its commit record is durable.
 pub struct Transaction<'a> {
     database: &'a mut Database,
@@ -511,9 +553,12 @@ impl Transaction<'_> {
 
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
-        if !self.statements.is_empty() && self.database.wal_path.is_some() {
-            let sequence = self.database.append_wal_transaction(&self.statements)?;
-            self.database.wal_sequence = sequence;
+        if !self.statements.is_empty() {
+            if self.database.wal_path.is_some() {
+                let sequence = self.database.append_wal_transaction(&self.statements)?;
+                self.database.wal_sequence = sequence;
+            }
+            self.database.revision = self.database.revision.wrapping_add(1);
         }
         self.database.tables = self.staged.tables;
         Ok(())
@@ -742,6 +787,20 @@ mod tests {
         drop(reopened);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
+
+    #[test]
+    fn owned_session_commits_atomically_and_detects_conflicts() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE sessions (value INTEGER)").unwrap();
+        let mut first = db.begin_session();
+        let mut second = db.begin_session();
+        first.execute("INSERT INTO sessions VALUES (1)").unwrap();
+        second.execute("INSERT INTO sessions VALUES (2)").unwrap();
+        db.commit_session(first).unwrap();
+        assert!(matches!(db.commit_session(second), Err(DbError::TransactionConflict)));
+        assert_eq!(db.execute("SELECT * FROM sessions").unwrap().rows.len(), 1);
     }
 
     #[test]
