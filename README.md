@@ -64,6 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Roadmap
 
+Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
 2. Add a bounded page cache and lazy page reads over the fixed-size page file.
 3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
