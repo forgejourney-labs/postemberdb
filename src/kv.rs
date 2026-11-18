@@ -118,7 +118,38 @@ impl KeyValueStore {
         page_tree::scan_range_limited(&mut self.store, &lower, &upper, limit)
     }
 
+    /// Removes up to `max_items` keys under a prefix in one atomic CoW batch.
+    ///
+    /// The batch is bounded to 5,000 keys. Call repeatedly until this returns
+    /// zero to drain a larger prefix without materializing the entire range.
+    /// Each call is atomic, but a sequence of calls is not one global transaction.
+    pub fn delete_prefix_bounded(&mut self, prefix: &[u8], max_items: usize) -> Result<usize, DbError> {
+        if prefix.len() > MAX_KEY_BYTES {
+            return Err(DbError::Constraint("prefix cannot exceed 1024 bytes".into()));
+        }
+        const MAX_DELETE_BATCH: usize = 5_000;
+        if max_items > MAX_DELETE_BATCH {
+            return Err(DbError::Constraint(format!(
+                "bounded prefix deletion cannot exceed {MAX_DELETE_BATCH} keys per batch"
+            )));
+        }
+        if max_items == 0 {
+            return Ok(0);
+        }
+
+        let entries = self.scan_prefix(prefix, Some(max_items))?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let removals = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let (removed, _) = page_tree::apply_mutations(&mut self.store, &self.wal_path, &removals, &[])?;
+        Ok(removed)
+    }
+
     /// Removes every key under a prefix in one CoW publication.
+    ///
+    /// This convenience method may materialize the complete matching key set.
+    /// Use `delete_prefix_bounded` when the prefix may contain a large range.
     pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<usize, DbError> {
         let entries = self.scan_prefix(prefix, None)?;
         let removals = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
@@ -384,6 +415,32 @@ mod tests {
         for suffix in [".lock", ".pages", ".pages.wal"] {
             let _ = fs::remove_file(with_suffix(&path, suffix));
         }
+    }
+
+    #[test]
+    fn key_value_store_prefix_delete_is_bounded_and_repeatable() {
+        let path = temp_path("kv-bounded-delete");
+        {
+            let mut store = KeyValueStore::open(&path).unwrap();
+            store.put_many(&[
+                (b"players/1".to_vec(), b"one".to_vec()),
+                (b"players/2".to_vec(), b"two".to_vec()),
+                (b"players/3".to_vec(), b"three".to_vec()),
+                (b"players/4".to_vec(), b"four".to_vec()),
+                (b"config/mode".to_vec(), b"survival".to_vec()),
+            ]).unwrap();
+
+            assert_eq!(store.delete_prefix_bounded(b"players/", 2).unwrap(), 2);
+            assert_eq!(store.scan_prefix(b"players/", None).unwrap().len(), 2);
+            assert_eq!(store.delete_prefix_bounded(b"players/", 2).unwrap(), 2);
+            assert_eq!(store.delete_prefix_bounded(b"players/", 2).unwrap(), 0);
+            assert_eq!(store.delete_prefix_bounded(b"config/", 0).unwrap(), 0);
+            assert!(store.delete_prefix_bounded(b"config/", 5_001).is_err());
+            assert_eq!(store.get(b"config/mode").unwrap(), Some(b"survival".to_vec()));
+        }
+        let _ = fs::remove_file(with_suffix(&path, ".lock"));
+        let _ = fs::remove_file(with_suffix(&path, ".pages"));
+        let _ = fs::remove_file(with_suffix(&path, ".pages.wal"));
     }
 
     #[test]
