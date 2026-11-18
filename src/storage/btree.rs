@@ -27,11 +27,11 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
         }
     }
 
-    pub(super) fn len(&self) -> usize { self.len }
-    pub(super) fn is_empty(&self) -> bool { self.len == 0 }
+    pub(crate) fn len(&self) -> usize { self.len }
+    pub(crate) fn is_empty(&self) -> bool { self.len == 0 }
 
     /// Inserts a key or replaces its value. Returns the previous value, if any.
-    pub(super) fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         let (previous, split) = insert_recursive::<K, V, ORDER>(&mut self.root, key, value);
         if let Some((separator, right)) = split {
             let left = std::mem::replace(
@@ -47,7 +47,14 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
         previous
     }
 
-    pub(super) fn get(&self, key: &K) -> Option<&V> {
+    pub(crate) fn contains_key(&self, key: &K) -> bool { self.get(key).is_some() }
+
+    pub(crate) fn clear(&mut self) {
+        self.root = Box::new(Node::Leaf { keys: Vec::new(), values: Vec::new() });
+        self.len = 0;
+    }
+
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
         let mut node = self.root.as_ref();
         loop {
             match node {
@@ -63,7 +70,7 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
     }
 
     /// Returns key/value pairs in the inclusive range, in ascending key order.
-    pub(super) fn scan_range(&self, lower: &K, upper: &K) -> Vec<(K, V)>
+    pub(crate) fn scan_range(&self, lower: &K, upper: &K) -> Vec<(K, V)>
     where
         V: Clone,
     {
@@ -75,7 +82,7 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
     }
 
     /// Checks ordering, separator correctness, occupancy and equal leaf depth.
-    pub(super) fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         let mut leaf_depth = None;
         validate_node(&self.root, true, 0, &mut leaf_depth)?;
         let mut count = 0;
