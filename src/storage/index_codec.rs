@@ -176,7 +176,7 @@ impl<'a> Decoder<'a> {
         Ok(value as i64)
     }
     fn text(&mut self) -> Result<String, DbError> {
-        let len = self.u16()?;
+        let len = u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as usize;
         String::from_utf8(self.take(len)?.to_vec())
             .map_err(|_| storage_error("SQL index text component is not UTF-8"))
     }
