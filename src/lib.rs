@@ -5,6 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
+
+mod storage;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -67,6 +70,7 @@ pub enum DbError {
     TypeMismatch { column: String, expected: DataType },
     Constraint(String),
     Unsupported(String),
+    Storage(String),
 }
 
 impl fmt::Display for DbError {
@@ -79,6 +83,7 @@ impl fmt::Display for DbError {
             DbError::TypeMismatch { column, expected } => write!(f, "type mismatch for {column}; expected {expected:?}"),
             DbError::Constraint(s) => write!(f, "constraint violation: {s}"),
             DbError::Unsupported(s) => write!(f, "unsupported SQL: {s}"),
+            DbError::Storage(s) => write!(f, "storage error: {s}"),
         }
     }
 }
@@ -94,6 +99,7 @@ struct Table {
 #[derive(Debug, Default)]
 pub struct Database {
     tables: BTreeMap<String, Table>,
+    storage_path: Option<PathBuf>,
 }
 
 impl Database {
@@ -102,7 +108,8 @@ impl Database {
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
-        if starts_with_kw(statement, "CREATE TABLE") {
+        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "INSERT INTO");
+        let result = if starts_with_kw(statement, "CREATE TABLE") {
             self.create_table(statement)
         } else if starts_with_kw(statement, "INSERT INTO") {
             self.insert(statement)
@@ -110,7 +117,11 @@ impl Database {
             self.select(statement)
         } else {
             Err(DbError::Unsupported(statement.to_owned()))
+        };
+        if result.is_ok() && is_write && self.storage_path.is_some() {
+            self.save()?;
         }
+        result
     }
 
     fn create_table(&mut self, sql: &str) -> Result<QueryResult, DbError> {
