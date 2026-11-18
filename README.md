@@ -16,13 +16,13 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 The project is at an early development stage. The first prototype provides:
 
 - an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`;
-- basic `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT * FROM` statements;
+- basic `CREATE TABLE`, `INSERT INTO ... VALUES`, `CREATE INDEX`, and `SELECT ... WHERE column = value` statements;
 - integer, text, boolean, and nullable values;
 - basic column type and `NOT NULL` validation;
 - a versioned, fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - secondary B-tree indexes with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
-- temporary-file writes followed by rename when saving the database;
+- temporary-file writes followed by rename when checkpointing the database;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
@@ -35,6 +35,7 @@ Requires a recent stable Rust toolchain.
 ```bash
 cargo test
 cargo build --release
+cargo bench --no-run
 ```
 
 ## Run the server
