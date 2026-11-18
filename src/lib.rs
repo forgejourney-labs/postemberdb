@@ -101,6 +101,7 @@ pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
+    wal_sequence: u64,
 }
 
 impl Database {
@@ -139,6 +140,7 @@ impl Database {
             tables: self.tables.clone(),
             storage_path: None,
             wal_path: None,
+            wal_sequence: self.wal_sequence,
         };
         let mut transaction = Transaction {
             database: self,
@@ -361,7 +363,7 @@ impl Transaction<'_> {
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
         if !self.statements.is_empty() && self.database.wal_path.is_some() {
-            self.database.append_wal_transaction(&self.statements)?;
+            self.database.wal_sequence = self.database.append_wal_transaction(&self.statements)?;
         }
         self.database.tables = self.staged.tables;
         Ok(())
