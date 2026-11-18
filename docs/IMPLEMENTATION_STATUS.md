@@ -24,12 +24,13 @@ This file tracks implemented behavior separately from planned work. A checked bo
 
 ## 2. Indexes
 
-- [x] Single-column typed B-tree equality indexes.
+- [x] Single-column typed B+ tree equality indexes backed by the engine-owned B+ tree implementation.
 - [x] CREATE INDEX and SELECT equality predicates.
 - [x] Index maintenance during INSERT and bounded bulk insert.
 - [x] Persist index definitions and rebuild index entries after snapshot load.
 - [x] Restore index definitions through WAL replay.
 - [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
+- [x] Native B+ tree node splitting, point lookup, inclusive in-memory range scan, and structural validation; SQL equality indexes now use this tree.
 - [ ] User-defined general composite indexes, range scans, ordering, and a cost-aware index planner.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
@@ -45,9 +46,9 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
 - [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
-- [ ] B+ tree deletion/rebalancing, leaf-page links, page serialization, and integration with SQL indexes/catalog.
+- [ ] B+ tree deletion/rebalancing, linked-leaf navigation, page serialization, and catalog/page-file integration.
 
-The native B+ tree is currently an isolated in-memory data structure; it is not yet used by SQL indexes, catalog storage, or the page-file codec. It supports insert/replace, point lookup, inclusive range scans, and structural validation, but not deletion or disk persistence. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The native B+ tree now backs SQL index equality lookups and is also available as an in-memory range-scan primitive. Tree nodes and index entries are still memory-resident; index definitions are persisted and entries are rebuilt from rows on open. B+ tree deletion/rebalancing and page-backed persistence are not implemented. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
