@@ -45,6 +45,7 @@ The current page format is a physical layout milestone only. Startup still recon
 
 - [x] Typed positional SQL parameters in the Rust API.
 - [x] Typed positional parameters inside transaction sessions.
+- [x] SQL LIMIT clause for bounded result sets.
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
 - [ ] Stable framed client/server protocol.
@@ -80,7 +81,8 @@ KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL ba
 
 - [x] SQL parsing helpers moved to src/sql.rs.
 - [x] Development server and its tests moved to src/server.rs.
-- [ ] Split storage into codec, WAL, page-file, and allocator modules.
+- [x] WAL and fixed-page codec moved into src/storage/wal.rs and src/storage/pages.rs.
+- [ ] Split storage into codec and allocator modules.
 - [ ] Split the engine into catalog, index, execution, transaction, and buffer-pool modules.
 
 ## 8. Storage roadmap
