@@ -25,6 +25,18 @@ EmberTree separates logical identity from physical placement:
 
 A bounded buffer pool caches pages by logical page ID and generation. Cache misses read only requested pages. Range scans walk adjacent B+ tree leaves in bounded batches. Rows are not stored in one ever-growing in-memory Vec.
 
+## Current page-file prototype
+
+The existing PPG1 format wraps the current serialized database snapshot in fixed 4 KiB pages. It still loads the complete snapshot and is not a lazy page store.
+
+A separate experimental `ExtentFile` primitive now provides:
+- EPG1 fixed-size data pages with logical page IDs, generations, payload lengths, checksums bound to page identity/generation, and canonical zero padding.
+- EAM1 allocator metadata in two alternating metadata slots, with monotonically increasing generations and checksums.
+- First-fit contiguous extent allocation, adjacent free-range coalescing, page-ID reuse, and persisted allocator statistics.
+- Reopen tests for pages and metadata, plus corruption tests.
+
+This prototype is deliberately not wired into `Database`, B+ tree node serialization, catalog roots, or the existing WAL. The allocator is single-owner and has no persisted root-set protocol, extent pinning, or transactional reclamation. A corrupted non-empty metadata slot fails closed rather than silently rolling back to an older allocation state. Recovery from a torn metadata write requires the still-pending WAL-coordinated metadata protocol and fault-injection tests. Do not use `ExtentFile` as the active database file format yet.
+
 ## Update modes
 
 StorageMode::Cow and StorageMode::InPlace are planned explicit choices.
