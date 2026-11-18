@@ -34,7 +34,9 @@ pub(super) fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
     let version = u32::from_le_bytes(file[4..8].try_into().unwrap());
     let page_size = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
     let page_count = u32::from_le_bytes(file[12..16].try_into().unwrap()) as usize;
-    let payload_len = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
+    let payload_len_u64 = u64::from_le_bytes(file[16..24].try_into().unwrap());
+    let payload_len = usize::try_from(payload_len_u64)
+        .map_err(|_| DbError::Storage("page-file payload length does not fit this platform".into()))?;
     let expected_checksum = u64::from_le_bytes(file[24..32].try_into().unwrap());
 
     if version != 1 || page_size != PAGE_SIZE {
@@ -47,8 +49,8 @@ pub(super) fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
     if page_count != expected_pages {
         return Err(DbError::Storage("page count does not match payload length".into()));
     }
-    let expected_file_len = 32usize.checked_add(page_count.checked_mul(PAGE_SIZE)
-        .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?)
+    let expected_file_len = page_count.checked_mul(PAGE_SIZE)
+        .and_then(|pages_len| 32usize.checked_add(pages_len))
         .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?;
     if file.len() != expected_file_len {
         return Err(DbError::Storage("page-file length mismatch".into()));
@@ -73,4 +75,47 @@ pub(super) fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
         return Err(DbError::Storage("page-file payload checksum mismatch".into()));
     }
     Ok(payload)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_payload_round_trips_without_data_pages() {
+        let encoded = encode_pages(&[]).unwrap();
+        assert_eq!(encoded.len(), 32);
+        assert!(decode_pages(&encoded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_non_canonical_page_padding() {
+        let mut encoded = encode_pages(b"hello").unwrap();
+        let padding_offset = 32 + PAGE_META_SIZE + 5;
+        encoded[padding_offset] = 1;
+        let error = decode_pages(&encoded).unwrap_err();
+        assert!(error.to_string().contains("padding"));
+    }
+
+    #[test]
+    fn rejects_non_canonical_page_payload_lengths() {
+        let mut encoded = encode_pages(&vec![7; PAGE_PAYLOAD_SIZE + 1]).unwrap();
+        // The first page must be full; changing its used length must be rejected
+        // even if the per-page checksum is recomputed.
+        encoded[36..40].copy_from_slice(&((PAGE_PAYLOAD_SIZE - 1) as u32).to_le_bytes());
+        let error = decode_pages(&encoded).unwrap_err();
+        assert!(error.to_string().contains("page metadata"));
+    }
+
+    #[test]
+    fn rejects_payload_length_that_cannot_be_represented() {
+        let mut encoded = encode_pages(b"x").unwrap();
+        encoded[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        let error = decode_pages(&encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("platform") ||
+            error.to_string().contains("512 MiB")
+        );
+    }
 }
