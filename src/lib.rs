@@ -93,14 +93,14 @@ impl fmt::Display for DbError {
 impl std::error::Error for DbError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum IndexKey {
+enum IndexAtom {
     Null,
     Integer(i64),
     Text(String),
     Boolean(bool),
 }
 
-impl From<&Value> for IndexKey {
+impl From<&Value> for IndexAtom {
     fn from(value: &Value) -> Self {
         match value {
             Value::Null => Self::Null,
@@ -111,9 +111,39 @@ impl From<&Value> for IndexKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum IndexKey {
+    Null,
+    Integer(i64),
+    Text(String),
+    Boolean(bool),
+    Composite(Vec<IndexAtom>),
+}
+
+impl From<&Value> for IndexKey {
+    fn from(value: &Value) -> Self {
+        match IndexAtom::from(value) {
+            IndexAtom::Null => Self::Null,
+            IndexAtom::Integer(value) => Self::Integer(value),
+            IndexAtom::Text(value) => Self::Text(value),
+            IndexAtom::Boolean(value) => Self::Boolean(value),
+        }
+    }
+}
+
+impl IndexKey {
+    fn from_columns(values: &[Value], columns: &[usize]) -> Self {
+        if columns.len() == 1 {
+            return Self::from(&values[columns[0]]);
+        }
+        Self::Composite(columns.iter().map(|index| IndexAtom::from(&values[*index])).collect())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Index {
-    column_index: usize,
+    column_indices: Vec<usize>,
+    unique: bool,
     entries: BTreeMap<IndexKey, Vec<usize>>,
 }
 
@@ -126,24 +156,50 @@ struct Table {
 
 impl Table {
     fn add_index(&mut self, index_name: String, column_name: &str) -> Result<(), DbError> {
+        self.add_index_columns(index_name, &[column_name.to_owned()], false)
+    }
+
+    fn add_index_columns(&mut self, index_name: String, column_names: &[String], unique: bool) -> Result<(), DbError> {
         if self.indexes.contains_key(&index_name) {
             return Err(DbError::Constraint(format!("index already exists: {index_name}")));
         }
-        let column_index = self.columns.iter().position(|column| column.name == normalize_ident(column_name))
-            .ok_or_else(|| DbError::ColumnNotFound(column_name.to_owned()))?;
-        let mut index = Index { column_index, entries: BTreeMap::new() };
+        if column_names.is_empty() {
+            return Err(DbError::Constraint("an index must contain at least one column".into()));
+        }
+        let column_indices = column_names.iter().map(|name| {
+            self.columns.iter().position(|column| column.name == normalize_ident(name))
+                .ok_or_else(|| DbError::ColumnNotFound(name.clone()))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut index = Index { column_indices, unique, entries: BTreeMap::new() };
         for (row_index, row) in self.rows.iter().enumerate() {
-            index.entries.entry(IndexKey::from(&row.values[column_index])).or_default().push(row_index);
+            let key = IndexKey::from_columns(&row.values, &index.column_indices);
+            let positions = index.entries.entry(key).or_default();
+            if unique && !positions.is_empty() {
+                return Err(DbError::Constraint(format!("duplicate key while building unique index {index_name}")));
+            }
+            positions.push(row_index);
         }
         self.indexes.insert(index_name, index);
+        Ok(())
+    }
+
+    fn validate_unique(&self, values: &[Value]) -> Result<(), DbError> {
+        for (name, index) in &self.indexes {
+            if index.unique {
+                let key = IndexKey::from_columns(values, &index.column_indices);
+                if index.entries.contains_key(&key) {
+                    return Err(DbError::Constraint(format!("duplicate key for unique index {name}")));
+                }
+            }
+        }
         Ok(())
     }
 
     fn index_row(&mut self, row_index: usize) {
         let row = &self.rows[row_index];
         for index in self.indexes.values_mut() {
-            index.entries.entry(IndexKey::from(&row.values[index.column_index]))
-                .or_default().push(row_index);
+            let key = IndexKey::from_columns(&row.values, &index.column_indices);
+            index.entries.entry(key).or_default().push(row_index);
         }
     }
 
@@ -151,14 +207,14 @@ impl Table {
         for index in self.indexes.values_mut() {
             index.entries.clear();
             for (row_index, row) in self.rows.iter().enumerate() {
-                index.entries.entry(IndexKey::from(&row.values[index.column_index]))
-                    .or_default().push(row_index);
+                let key = IndexKey::from_columns(&row.values, &index.column_indices);
+                index.entries.entry(key).or_default().push(row_index);
             }
         }
     }
 
     fn matching_rows(&self, column_index: usize, value: &Value) -> Vec<usize> {
-        if let Some(index) = self.indexes.values().find(|index| index.column_index == column_index) {
+        if let Some(index) = self.indexes.values().find(|index| index.column_indices.as_slice() == [column_index]) {
             index.entries.get(&IndexKey::from(value)).cloned().unwrap_or_default()
         } else {
             self.rows.iter().enumerate()
@@ -366,14 +422,8 @@ impl Database {
             if primary_key_columns.contains(&column.name) { column.nullable = false; }
         }
         let mut table = Table { columns, rows: Vec::new(), indexes: BTreeMap::new() };
-        for column_name in primary_key_columns {
-            if !table.columns.iter().any(|column| column.name == column_name) {
-                return Err(DbError::ColumnNotFound(column_name));
-            }
-            let index_name = format!("__pk_{name}_{column_name}");
-            if !table.indexes.contains_key(&index_name) {
-                table.add_index(index_name, &column_name)?;
-            }
+        if !primary_key_columns.is_empty() {
+            table.add_index_columns(format!("__pk_{name}"), &primary_key_columns, true)?;
         }
         self.tables.insert(name.clone(), table);
         Ok(QueryResult::message(format!("table {name} created")))
@@ -439,6 +489,7 @@ impl Database {
         for (column, value) in table.columns.iter().zip(values.iter()) {
             validate_value(column, value)?;
         }
+        table.validate_unique(&values)?;
         table.rows.push(Row { values });
         let row_index = table.rows.len() - 1;
         table.index_row(row_index);
