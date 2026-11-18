@@ -321,6 +321,35 @@ mod tests {
     }
 
     #[test]
+    fn committed_sql_indexes_are_mirrored_into_persistent_ember_tree() {
+        let path = test_path("ember-index-mirror");
+        let page_path = page_tree_file_path(&path);
+        let tree_wal_path = page_tree_wal_file_path(&path);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("CREATE INDEX idx_players_uuid ON players (uuid)").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-a', 10)").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-a', 20)").unwrap();
+        }
+
+        let mut store = extent::ExtentFile::open(&page_path).unwrap();
+        let mut disk_key = Vec::new();
+        put_namespace_part(&mut disk_key, b"players").unwrap();
+        put_namespace_part(&mut disk_key, b"idx_players_uuid").unwrap();
+        disk_key.extend_from_slice(&index_codec::encode_index_key(
+            &super::super::IndexKey::from(&Value::Text("player-a".into()))
+        ).unwrap());
+        let encoded_rows = page_tree::get(&mut store, &disk_key).unwrap().unwrap();
+        assert_eq!(index_codec::decode_row_refs(&encoded_rows).unwrap(), vec![0, 1]);
+        drop(store);
+
+        for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn database_reopens_with_persisted_rows() {
         let path = test_path("roundtrip");
         {
