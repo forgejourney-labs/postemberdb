@@ -1,0 +1,6 @@
+database:
+  host: 127.0.0.1
+  port: 7432
+  connect-timeout-ms: 2000
+  read-timeout-ms: 10000
+  worker-threads: 2
