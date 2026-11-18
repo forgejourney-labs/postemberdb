@@ -253,6 +253,9 @@ impl Database {
         let table = self.tables.get_mut(&normalized).expect("table checked above");
         let previous_len = table.rows.len();
         table.rows.extend(batch.drain(..).map(|values| Row { values }));
+        for row_index in previous_len..table.rows.len() {
+            table.index_row(row_index);
+        }
         let inserted = table.rows.len() - previous_len;
 
         if self.storage_path.is_some() {
@@ -295,9 +298,10 @@ impl Database {
 
     fn create_index(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let rest = sql["CREATE INDEX".len()..].trim();
-        let on_pos = find_kw(rest, "ON").ok_or_else(|| DbError::Parse("expected ON in CREATE INDEX".into()))?;
+        let on_pos = rest.to_ascii_uppercase().find(" ON ")
+            .ok_or_else(|| DbError::Parse("expected ON in CREATE INDEX".into()))?;
         let index_name = normalize_ident(rest[..on_pos].trim());
-        let target = rest[on_pos + 2..].trim();
+        let target = rest[on_pos + 4..].trim();
         let open = target.find('(').ok_or_else(|| DbError::Parse("expected '(' with indexed column".into()))?;
         let close = target.rfind(')').ok_or_else(|| DbError::Parse("expected ')' after indexed column".into()))?;
         let table_name = normalize_ident(target[..open].trim());
@@ -629,6 +633,19 @@ mod tests {
         drop(reopened);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
+
+    #[test]
+    fn bulk_insert_updates_existing_index() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER)").unwrap();
+        db.execute("CREATE INDEX idx_uuid ON players (uuid)").unwrap();
+        db.insert_many("players", vec![
+            vec![Value::Text("bulk-a".into()), Value::Integer(1)],
+            vec![Value::Text("bulk-b".into()), Value::Integer(2)],
+        ]).unwrap();
+        assert_eq!(db.execute("SELECT * FROM players WHERE uuid = 'bulk-b'").unwrap().rows.len(), 1);
     }
 
     #[test]
