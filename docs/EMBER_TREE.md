@@ -35,7 +35,7 @@ A separate experimental `ExtentFile` primitive now provides:
 - First-fit contiguous extent allocation, adjacent free-range coalescing, page-ID reuse, and persisted allocator statistics.
 - Reopen tests for pages and metadata, plus corruption tests.
 
-The `page_tree` module (the persistent part of EmberTree) builds immutable B+ tree leaf/internal pages in an `ExtentFile`, records page images in a separate redo WAL, syncs those pages, and atomically publishes the new root through EAM3 metadata. `Database::open` now checks the sidecars `<database>.pages` and `<database>.pages.btree.wal` when present, then replays pending tree redo before returning the database. This recovery is deliberately separate from the SQL transaction WAL: the persistent tree is not yet connected to SQL index lookups, the catalog, row pages, or SQL transaction commits. It rebuilds the full tree per replacement and retains old pages until a reachability-aware reclamation protocol exists. The allocator is single-owner and still has no page pinning or transactional reclamation. Each successful metadata commit syncs the new generation to both slots; one damaged copy is repaired from the other, while two invalid copies fail closed. A write error poisons the current handle until reopen. Do not treat this isolated primitive as the active SQL storage backend yet.
+The `page_tree` module (the persistent part of EmberTree) builds immutable B+ tree leaf/internal pages in an `ExtentFile`, records page images in a separate redo WAL, syncs those pages, and atomically publishes the new root through EAM3 metadata. `Database::open` now checks the sidecars `<database>.pages` and `<database>.pages.btree.wal` when present, then replays pending tree redo before returning the database. This recovery is deliberately separate from the SQL transaction WAL: the persistent tree is not yet connected to SQL index lookups, the catalog, row pages, or SQL transaction commits. It supports both full `replace_all` rebuilds and incremental copy-on-write `insert_or_replace` / `insert_many` operations. Incremental batches copy only affected search paths, split overflowing leaf/internal pages, write one redo record, and publish one new root; unchanged subtrees retain their page IDs. The SQL mirror still uses full rebuilds, and old pages remain allocated until a reachability-aware reclamation protocol exists. The allocator is single-owner and still has no page pinning or transactional reclamation. Each successful metadata commit syncs the new generation to both slots; one damaged copy is repaired from the other, while two invalid copies fail closed. A write error poisons the current handle until reopen. Do not treat this isolated primitive as the active SQL storage backend yet.
 
 ## Update modes
 
@@ -119,6 +119,10 @@ The current PPG1/PDB4 snapshot format is a prototype, not EmberTree. The new for
 7. Add manual fragmentation metrics and budgeted relocation.
 8. Add compression, snapshots, verified backup/restore, and CLI commands.
 9. Integrate the Rust/JVM boundary and run KSL/Minecraft load tests.
+
+## Incremental page-tree write API
+
+`insert_or_replace` updates one key and `insert_many` applies ordered mutations with last-write-wins behavior for duplicate keys. Each batch stages immutable page images, journals them together, syncs them, then atomically publishes the root. A crash before the redo record is durable can leak reserved but unreachable page IDs; it cannot expose a partially updated root. A crash after the redo record is durable is completed by recovery. Deletion, SQL delta integration, and page reclamation are not implemented yet.
 
 ## Non-goals
 
