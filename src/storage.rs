@@ -712,7 +712,7 @@ fn collect_ember_index_entries(
                     return Ok(None);
                 }
                 for row_position in rows {
-                    let row = table.rows.get(*row_position)
+                    let row = table.rows.get(row_position)
                         .ok_or_else(|| DbError::Storage("in-memory SQL index contains an invalid row position".into()))?;
                     if row.row_id == 0 {
                         return Err(DbError::Storage("in-memory SQL row has a zero stable identifier".into()));
