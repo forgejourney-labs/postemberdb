@@ -59,16 +59,19 @@ pub(super) fn apply_upsert(table: &mut Table, values: &[Value], clause: &str) ->
         return Err(DbError::Unsupported(format!("upsert clause: {trimmed}")));
     };
 
-    let existing = if let Some(index) = conflict_index {
+    let existing_row_id = if let Some(index) = conflict_index {
         let key = IndexKey::from_columns(values, &index.column_indices);
-        index.entries.get(&key).and_then(|rows| rows.first()).copied()
+        index.entries.get(&key).and_then(|row_ids| row_ids.first()).copied()
     } else {
         table.indexes.values().filter(|index| index.unique).find_map(|index| {
             let key = IndexKey::from_columns(values, &index.column_indices);
-            index.entries.get(&key).and_then(|rows| rows.first()).copied()
+            index.entries.get(&key).and_then(|row_ids| row_ids.first()).copied()
         })
     };
-    let Some(row_index) = existing else { return Ok(false); };
+    let Some(row_id) = existing_row_id else { return Ok(false); };
+    let Some(row_index) = table.row_positions.get(&row_id).copied() else {
+        return Err(DbError::Storage("unique index references an unknown stable row identifier".into()));
+    };
 
     let mut updates = Vec::new();
     for assignment in split_csv(assignments) {
@@ -100,10 +103,11 @@ pub(super) fn apply_upsert(table: &mut Table, values: &[Value], clause: &str) ->
             return Err(DbError::Constraint("upsert cannot modify a primary-key column".into()));
         }
     }
+    let old_values = table.rows[row_index].values.clone();
     for (target_index, value) in updates {
         table.rows[row_index].values[target_index] = value;
     }
-    table.rebuild_indexes();
+    table.reindex_row(row_index, &old_values);
     Ok(true)
 }
 
