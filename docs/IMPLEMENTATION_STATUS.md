@@ -44,8 +44,10 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
 - [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
 - [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
+- [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
+- [ ] B+ tree deletion/rebalancing, leaf-page links, page serialization, and integration with SQL indexes/catalog.
 
-The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The native B+ tree is currently an isolated in-memory data structure; it is not yet used by SQL indexes, catalog storage, or the page-file codec. It supports insert/replace, point lookup, inclusive range scans, and structural validation, but not deletion or disk persistence. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
@@ -94,7 +96,7 @@ KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL ba
 
 ## 8. Storage roadmap
 
-- [ ] EmberTree page-oriented B+ tree and extent allocator.
+- [ ] EmberTree page-oriented B+ tree and extent allocator (the in-memory B+ tree core exists; page-backed integration and extent management remain pending).
 - [ ] Explicit CoW and in-place update modes with crash-safe recovery.
 - [ ] FragmentationStats and manually budgeted defrag APIs.
 - [ ] Per-page LZ4/Snappy compression with decompression limits.
