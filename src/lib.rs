@@ -944,6 +944,32 @@ mod tests {
 
 
     #[test]
+    fn persistent_index_falls_back_for_keys_larger_than_ember_tree_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-long-index-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let value = "x".repeat(2048);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE long_keys (key TEXT)").unwrap();
+            db.execute("CREATE INDEX idx_long_key ON long_keys (key)").unwrap();
+            db.execute_params("INSERT INTO long_keys VALUES (?)", &[Value::Text(value.clone())]).unwrap();
+            assert!(!db.ember_indexes_valid);
+            let result = db.execute_params(
+                "SELECT * FROM long_keys WHERE key = ?",
+                &[Value::Text(value.clone())],
+            ).unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].values[0], Value::Text(value));
+        }
+        for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
     fn persistent_index_is_rebuilt_after_checkpoint_and_reopen() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-index-{}-{}.pdb",
