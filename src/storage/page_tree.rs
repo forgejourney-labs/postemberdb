@@ -1027,7 +1027,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn mixed_mutations_publish_once_and_recover_atomically() {
         let (path, wal) = paths("mixed-mutations");
         let mut store = ExtentFile::open(&path).unwrap();
