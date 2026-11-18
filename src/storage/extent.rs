@@ -44,9 +44,19 @@ pub(crate) struct ExtentStats {
 pub(crate) struct ExtentFile {
     file: File,
     metadata: AllocatorMetadata,
+    poisoned: bool,
 }
 
 impl ExtentFile {
+    fn ensure_healthy(&self) -> Result<(), DbError> {
+        if self.poisoned {
+            return Err(DbError::Storage(
+                "extent file has an uncertain write outcome; close and reopen it before continuing".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Opens or initializes a page file. A single process must own the file.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref();
@@ -73,6 +83,7 @@ impl ExtentFile {
                     next_page_id: 0,
                     free_extents: BTreeMap::new(),
                 },
+                poisoned: false,
             };
             let initial = store.metadata.clone();
             store.commit_metadata(initial)?;
@@ -126,13 +137,14 @@ impl ExtentFile {
             ));
         }
 
-        Ok(Self { file, metadata })
+        Ok(Self { file, metadata, poisoned: false })
     }
 
     /// Reserves a contiguous range of page IDs using first-fit extent allocation.
     /// A crash after this call but before the pages are written can leak reserved
     /// space, but cannot cause the allocator to hand out the same IDs twice.
     pub(crate) fn allocate_extent(&mut self, page_count: u64) -> Result<u64, DbError> {
+        self.ensure_healthy()?
         if page_count == 0 {
             return Err(DbError::Storage("cannot allocate an empty extent".into()));
         }
@@ -142,8 +154,14 @@ impl ExtentFile {
         // metadata commit fails, the extra tail is harmless and may be reused.
         let required_len = page_offset(next.next_page_id)?;
         if self.file.metadata().map_err(storage_error)?.len() < required_len {
-            self.file.set_len(required_len).map_err(storage_error)?;
-            self.file.sync_data().map_err(storage_error)?;
+            if let Err(error) = self.file.set_len(required_len) {
+                self.poisoned = true;
+                return Err(storage_error(error));
+            }
+            if let Err(error) = self.file.sync_data() {
+                self.poisoned = true;
+                return Err(storage_error(error));
+            }
         }
         self.commit_metadata(next)?;
         Ok(start)
@@ -153,6 +171,7 @@ impl ExtentFile {
     /// metadata. This order ensures an uncommitted allocation is never returned
     /// to a caller before its bytes and allocation state are durable.
     pub(crate) fn allocate_page(&mut self, payload: &[u8]) -> Result<u64, DbError> {
+        self.ensure_healthy()?
         if payload.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::Storage(format!(
                 "page payload exceeds the {PAGE_PAYLOAD_SIZE}-byte limit"
@@ -164,8 +183,14 @@ impl ExtentFile {
         let mut next = self.metadata.clone();
         let page_id = reserve_extent(&mut next, 1)?;
         let encoded = encode_data_page(page_id, generation, payload);
-        write_at(&mut self.file, page_offset(page_id)?, &encoded)?;
-        self.file.sync_data().map_err(storage_error)?;
+        if let Err(error) = write_at(&mut self.file, page_offset(page_id)?, &encoded) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(storage_error(error));
+        }
         self.commit_metadata(next)?;
         Ok(page_id)
     }
@@ -173,6 +198,7 @@ impl ExtentFile {
     /// Writes an allocated page. Until WAL-backed in-place updates exist, callers
     /// should only use this for reserved pages that are not reachable from a root.
     pub(crate) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), DbError> {
+        self.ensure_healthy()?
         if payload.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::Storage(format!(
                 "page payload exceeds the {PAGE_PAYLOAD_SIZE}-byte limit"
@@ -184,12 +210,20 @@ impl ExtentFile {
 
         let generation = self.metadata.generation;
         let encoded = encode_data_page(page_id, generation, payload);
-        write_at(&mut self.file, page_offset(page_id)?, &encoded)?;
-        self.file.sync_data().map_err(storage_error)
+        if let Err(error) = write_at(&mut self.file, page_offset(page_id)?, &encoded) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(storage_error(error));
+        }
+        Ok(())
     }
 
     /// Reads and validates one allocated page.
     pub(crate) fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>, DbError> {
+        self.ensure_healthy()?
         if !is_allocated(&self.metadata, page_id) {
             return Err(DbError::Storage(format!("page {page_id} is not allocated")));
         }
@@ -207,6 +241,7 @@ impl ExtentFile {
         start_page_id: u64,
         page_count: u64,
     ) -> Result<(), DbError> {
+        self.ensure_healthy()?;
         if page_count == 0 {
             return Err(DbError::Storage("cannot release an empty extent".into()));
         }
@@ -243,10 +278,25 @@ impl ExtentFile {
         // the acknowledged generation. If a crash interrupts the first write,
         // the untouched slot still contains the previous generation; if it
         // interrupts the mirror, the first slot already contains the new one.
-        write_at(&mut self.file, first_slot * PAGE_SIZE as u64, &encoded)?;
-        self.file.sync_all().map_err(storage_error)?;
-        write_at(&mut self.file, second_slot * PAGE_SIZE as u64, &encoded)?;
-        self.file.sync_all().map_err(storage_error)?;
+        if let Err(error) = write_at(&mut self.file, first_slot * PAGE_SIZE as u64, &encoded) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(storage_error(error));
+        }
+        // The first durable copy is now the committed generation, even if
+        // mirroring the second copy subsequently fails.
+        self.metadata = next.clone();
+        if let Err(error) = write_at(&mut self.file, second_slot * PAGE_SIZE as u64, &encoded) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(storage_error(error));
+        }
         self.metadata = next;
         Ok(())
     }
