@@ -1,6 +1,6 @@
 # EmberTree Storage Model
 
-**EmberTree** is the working name for PostemberDB's planned tree-oriented storage architecture. This is the target architecture, not a claim that the complete engine already exists. The repository now contains an initial engine-owned in-memory B+ tree in src/storage/btree.rs: insertion/replacement, point lookup, inclusive range scans, node splitting, and structural validation are implemented with focused tests. It is not yet connected to SQL indexes or disk pages; deletion, leaf links, page serialization, and crash-safe persistence remain future work.
+**EmberTree** is the working name for PostemberDB's planned tree-oriented storage architecture. This is the target architecture, not a claim that the complete engine already exists. The repository now contains an engine-owned in-memory B+ tree in src/storage/btree.rs: insertion/replacement, point lookup, inclusive range scans, node splitting, and structural validation are implemented with focused tests. SQL equality indexes now use this tree. Tree nodes are not yet persisted as pages; deletion, linked-leaf navigation, page serialization, and crash-safe persistence remain future work.
 
 ## Goals and invariants
 
@@ -98,7 +98,7 @@ The current PPG1/PDB4 snapshot format is a prototype, not EmberTree. The new for
 
 ## Implementation order
 
-1. Complete the in-memory B+ tree with deletion/rebalancing, leaf navigation, property tests, and SQL index integration.
+1. Complete the in-memory B+ tree with deletion/rebalancing, linked-leaf navigation, and property tests (SQL equality index integration is now in place).
 2. Specify and property-test the EmberTree on-disk format.
 3. Implement page-file abstraction, durable extent allocator, dual metadata roots, and checksummed page I/O.
 4. Implement bounded buffer pool and persist B+ tree nodes as pages.
