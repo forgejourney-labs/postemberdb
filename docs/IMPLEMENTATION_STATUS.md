@@ -15,7 +15,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Development server `BEGIN`, `COMMIT`, and `ROLLBACK` commands.
 - [ ] WAL streaming recovery (the current implementation reads the WAL into memory).
 - [ ] Savepoints, explicit SQL BEGIN/COMMIT/ROLLBACK, and transaction isolation levels.
-- [ ] Multi-process file locking and concurrent-writer coordination.
+- [x] OS-level exclusive sidecar lock for the same database path.
+- [ ] Hard-link alias detection and broader multi-writer coordination.
 - [ ] Fault-injection tests for power loss at every write/sync/rename boundary.
 
 ## 2. Indexes
