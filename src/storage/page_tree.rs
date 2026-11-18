@@ -73,6 +73,7 @@ pub(crate) fn replace_all(
         store.write_page(*page_id, payload)?;
     }
     store.publish_root(Some(root_page_id))?;
+    validate_tree(store)?;
     truncate_wal(wal_path)?;
     Ok(())
 }
@@ -113,6 +114,7 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
         store.write_page(page_id, &payload)?;
     }
     store.publish_root(Some(root_page_id))?;
+    validate_tree(store)?;
     file.set_len(0).map_err(storage_error)?;
     file.sync_all().map_err(storage_error)?;
     Ok(())
@@ -432,6 +434,7 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
     }
     let mut offset = 0usize;
     let mut pages = Vec::with_capacity(count);
+    let mut page_ids = HashSet::with_capacity(count);
     for _ in 0..count {
         if offset + 12 > payload.len() { return Err(DbError::Storage("truncated B+ tree WAL page record".into())); }
         let page_id = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
@@ -439,12 +442,17 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
         offset += 12;
         let end = offset.checked_add(len).ok_or_else(|| DbError::Storage("B+ tree WAL page length overflow".into()))?;
         if end > payload.len() { return Err(DbError::Storage("truncated B+ tree WAL page payload".into())); }
-        pages.push((page_id, payload[offset..end].to_vec()));
+        if !page_ids.insert(page_id) {
+            return Err(DbError::Storage("B+ tree WAL contains duplicate page IDs".into()));
+        }
+        let page = payload[offset..end].to_vec();
+        decode_node(&page)?;
+        pages.push((page_id, page));
         offset = end;
     }
     if offset != payload.len() { return Err(DbError::Storage("trailing bytes in B+ tree WAL".into())); }
-    if pages.is_empty() || !pages.iter().any(|(page_id, _)| *page_id == root) {
-        return Err(DbError::Storage("B+ tree WAL root is not present in its page set".into()));
+    if pages.is_empty() || page_ids.iter().filter(|page_id| **page_id == root).count() != 1 {
+        return Err(DbError::Storage("B+ tree WAL root must appear exactly once in its page set".into()));
     }
     Ok((root, pages))
 }
