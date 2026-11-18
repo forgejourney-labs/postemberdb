@@ -84,14 +84,15 @@ impl Database {
     }
 
     fn decode_file(path: &Path) -> Result<Self, DbError> {
-        let mut file = File::open(path).map_err(storage_error)?;
+        let file = File::open(path).map_err(storage_error)?;
         let mut bytes = Vec::new();
-        file.take((512 * 1024 * 1024) as u64 + 1).read_to_end(&mut bytes).map_err(storage_error)?;
+        let mut limited = file.take((512 * 1024 * 1024) as u64 + 1);
+        limited.read_to_end(&mut bytes).map_err(storage_error)?;
         if bytes.len() > 512 * 1024 * 1024 {
             return Err(DbError::Storage("database file exceeds 512 MiB safety limit".into()));
         }
         let mut input = Decoder { bytes: &bytes, offset: 0 };
-        if input.take(4)? != MAGIC {
+        if input.take(4)? != MAGIC.as_slice() {
             return Err(DbError::Storage("invalid database file header".into()));
         }
         let table_count = input.count()?;
