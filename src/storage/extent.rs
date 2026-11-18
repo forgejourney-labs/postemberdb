@@ -598,7 +598,7 @@ fn storage_error(error: std::io::Error) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtentFile, PAGE_SIZE};
+    use super::{decode_metadata, ExtentFile, PAGE_SIZE};
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
