@@ -981,6 +981,48 @@ mod tests {
     }
 
     #[test]
+    fn persistent_ember_index_applies_incremental_sql_insert_update_delete_deltas() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-index-delta-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE delta_players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-a', 10)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-b', 20)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-c', 30)").unwrap();
+            db.execute("CREATE INDEX idx_delta_uuid ON delta_players (uuid)").unwrap();
+            assert!(db.ember_indexes_valid);
+
+            db.execute("INSERT INTO delta_players VALUES ('player-d', 40)").unwrap();
+            assert!(db.ember_indexes_valid);
+            db.execute("UPDATE delta_players SET uuid = 'player-a2' WHERE uuid = 'player-a'").unwrap();
+            assert!(db.ember_indexes_valid);
+            db.execute("DELETE FROM delta_players WHERE uuid = 'player-b'").unwrap();
+            assert!(db.ember_indexes_valid);
+
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a'").unwrap().rows.len(), 0);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-d'").unwrap().rows.len(), 1);
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        assert!(reopened.ember_indexes_valid);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+        drop(reopened);
+        for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
+            let candidate = format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix));
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn persistent_index_is_rebuilt_after_checkpoint_and_reopen() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-index-{}-{}.pdb",
