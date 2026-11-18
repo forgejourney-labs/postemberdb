@@ -118,3 +118,19 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 ## Release gate
 
 Do not label PostemberDB production-ready until the page cache, transaction/recovery tests, network security, JDBC/KSL integration, backup/restore process, and repeatable performance tests are complete.
+
+
+## 9. Incremental EmberTree writes
+
+- [x] Copy-on-write single-key insert/replace API for the persistent page tree.
+- [x] Batch insert/replace API with ordered last-write-wins semantics for duplicate keys.
+- [x] Recursive leaf/internal path copying and leaf/internal page splitting.
+- [x] One redo record and one root publication for an insert batch.
+- [x] Preserve untouched child page IDs when a path is updated.
+- [x] Reopen/recovery tests for incremental writes and root publication.
+- [ ] Incremental deletion with redistribution, merge, and root collapse.
+- [ ] SQL transaction delta integration; the SQL index mirror still uses a full rebuild.
+- [ ] Reachability-aware reclamation and vacuum; old CoW pages remain allocated.
+- [ ] Fault injection at allocation, redo sync, page write, and root publication boundaries.
+
+The incremental API currently belongs to the page-tree storage layer. It is not yet used by SQL index synchronization, and it does not make SQL table rows page-backed. Allocation metadata is committed as new pages are reserved; an interrupted operation before its redo record can leave unreachable allocated pages. This is safe for correctness but requires future vacuum/reclamation support.
