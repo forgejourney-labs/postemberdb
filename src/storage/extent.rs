@@ -415,7 +415,7 @@ fn is_allocated(metadata: &AllocatorMetadata, page_id: u64) -> bool {
         return false;
     }
     match metadata.free_extents.range(..=page_id).next_back() {
-        Some((start, len)) => page_id >= *start + *len,
+        Some((start, len)) => page_id >= start.saturating_add(*len),
         None => true,
     }
 }
