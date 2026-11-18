@@ -564,7 +564,9 @@ fn split_and_conditions(input: &str) -> Vec<&str> {
             cursor += 1;
             continue;
         }
-        if input[position..].len() >= 5 && input[position..position + 5].eq_ignore_ascii_case(" AND ") {
+        if input.as_bytes().get(position..position + 5)
+            .map(|bytes| bytes.eq_ignore_ascii_case(b" AND "))
+            .unwrap_or(false) {
             result.push(input[start..position].trim());
             start = position + 5;
             while cursor < chars.len() && chars[cursor].0 < start { cursor += 1; }
