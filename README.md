@@ -9,7 +9,7 @@ PostemberDB is not a wrapper around SQLite or PostgreSQL. Its storage, execution
 
 ## KSL and Minecraft integration
 
-KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert API (up to 5,000 rows per call) so persistent storage is written once per batch. This fits common KSL and Minecraft workloads such as player statistics and economy updates. A JVM/JDBC-compatible adapter is not implemented yet; see [KSL and Minecraft integration](docs/KSL_MINECRAFT.md) for the current contract and roadmap.
+KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert API (up to 5,000 rows per call) so persistent storage is written once per batch. This fits common KSL and Minecraft workloads such as player statistics and economy updates. A separate optional KSL addon is included in [integrations/kotlin-script-loader](integrations/kotlin-script-loader/README.md). It exposes an asynchronous service over the versioned loopback JSONL/1 protocol; it is not a JDBC driver or a selectable KSL SQL dialect yet. See [KSL and Minecraft integration](docs/KSL_MINECRAFT.md) for its limits.
 
 ## Storage architecture
 
@@ -30,9 +30,9 @@ The project is at an early development stage. The first prototype provides:
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
-- a minimal line-oriented TCP server for development and experimentation.
+- a loopback-only TCP server with a versioned JSONL/1 protocol for the optional KSL addon.
 
-**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
+**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
 
 ## CLI
 
@@ -54,7 +54,7 @@ cargo bench --no-run
 cargo run -- server 127.0.0.1:7432
 ```
 
-The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. It is not yet a stable JDBC wire protocol.
+The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. The server supports the versioned JSONL/1 protocol for the optional KSL addon; it is not JDBC and is not suitable for untrusted networks.
 
 ## Use as an embedded library
 
