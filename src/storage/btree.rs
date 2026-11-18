@@ -75,10 +75,10 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
         V: Clone,
     {
         let mut entries = Vec::new();
-        collect_entries(&self.root, &mut entries);
-        entries.into_iter()
-            .filter(|(key, _)| key >= lower && key <= upper)
-            .collect()
+        if lower <= upper {
+            collect_range(&self.root, lower, upper, &mut entries);
+        }
+        entries
     }
 
     /// Checks ordering, separator correctness, occupancy and equal leaf depth.
@@ -139,11 +139,28 @@ fn insert_recursive<K: Ord + Clone, V, const ORDER: usize>(
     }
 }
 
-fn collect_entries<K: Clone, V: Clone>(node: &Node<K, V>, out: &mut Vec<(K, V)>) {
+fn collect_range<K: Ord + Clone, V: Clone>(
+    node: &Node<K, V>,
+    lower: &K,
+    upper: &K,
+    out: &mut Vec<(K, V)>,
+) {
     match node {
-        Node::Leaf { keys, values } => out.extend(keys.iter().cloned().zip(values.iter().cloned())),
-        Node::Internal { children, .. } => {
-            for child in children { collect_entries(child, out); }
+        Node::Leaf { keys, values } => {
+            let start = keys.partition_point(|key| key < lower);
+            for index in start..keys.len() {
+                if keys[index] > *upper { break; }
+                out.push((keys[index].clone(), values[index].clone()));
+            }
+        }
+        Node::Internal { keys, children } => {
+            // A separator is the first key in its right child.
+            let first_child = keys.partition_point(|separator| lower >= separator);
+            let after_last_child = (keys.partition_point(|separator| upper >= separator) + 1)
+                .min(children.len());
+            for child_index in first_child..after_last_child {
+                collect_range(&children[child_index], lower, upper, out);
+            }
         }
     }
 }
