@@ -36,7 +36,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 ## 3. Page-oriented storage
 
 - [x] Fixed 4 KiB page-file snapshots.
-- [x] Page identifiers, per-page checksums, and whole-payload checksum.
+- [x] Page identifiers, per-page checksums, and whole-payload checksum.\n- [x] Strict page validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
