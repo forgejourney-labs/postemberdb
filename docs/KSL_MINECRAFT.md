@@ -42,7 +42,7 @@ Good initial use cases include player statistics, economy ledgers, quest progres
 
 ## KSL addon integration (initial implementation)
 
-The next integration layer should expose the Rust engine through a supported JVM boundary and adapt it to KSL's asynchronous database API. The adapter must preserve KSL's runtime-generation cancellation, query timeouts, result-row limits, batch limits, and transaction semantics. It must not expose raw pointers, Rust-owned buffers, or live database cursors to Kotlin scripts.
+The integration is implemented as an optional addon in this repository. It uses KSL's public addon/service API and exposes asynchronous query and write calls; it does not modify KSL core or its existing JDBC subsystem.
 
 An initial separate addon now lives in integrations/kotlin-script-loader. It registers a postemberdb service through KSL's public addon API and exposes query/queryAsync/execute/executeAsync methods. It connects to the Rust server through the versioned JSONL/1 protocol, uses one short-lived connection per statement, and refuses non-loopback destinations. The upstream KotlinScriptLoader repository has not been modified.
 
@@ -91,7 +91,7 @@ CREATE INDEX idx_player_uuid ON player_stats (uuid);
 SELECT * FROM player_stats WHERE uuid = 'player-uuid';
 ```
 
-Index definitions are stored in the snapshot and rebuilt from table rows on open. New inserts update the index. The first implementation is an in-memory B-tree map from typed key values to row positions; it accelerates equality lookups but is not yet a page-backed persistent index, composite index, or range-scan planner.
+Index definitions are stored in the snapshot and rebuilt from table rows on open. New inserts update the index. The first implementation is our engine-owned in-memory B+ tree from typed key values to row positions; it accelerates equality lookups but is not yet a page-backed persistent index, composite index, or range-scan planner.
 
 ## Minecraft workload benchmark
 
@@ -126,7 +126,7 @@ Parameters are encoded from typed `Value` variants and quoted by the engine; cal
 
 ## Exact KSL adapter status
 
-KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its published dialect set is SQLite, MySQL, MariaDB, and PostgreSQL; PostemberDB is not yet a selectable KSL dialect. A production adapter therefore still needs a stable server protocol, a JDBC driver, and KSL dialect/migration support. The Rust TCP server now supports the versioned JSONL/1 protocol used by the separate KSL addon. It remains a loopback-only integration protocol, not JDBC and not a production remote-network protocol.
+KSL's existing SQL backend still uses HikariCP and JDBC drivers for SQLite, MySQL, MariaDB, and PostgreSQL. PostemberDB is currently accessed through the separate PostemberDBKSL service addon, not through KSL's database.type setting. JSONL/1 is a versioned loopback protocol, not JDBC or a secure remote-network protocol. A JDBC driver, KSL dialect/migration support, and end-to-end compatibility tests remain future work.
 
 
 ## Client sessions and server transactions
@@ -138,7 +138,7 @@ The engine now exposes an owned `DatabaseSession`. A session works against a pri
 
 The Rust SQL subset now accepts the core DDL patterns used by KSL's schema migrations: `CREATE TABLE IF NOT EXISTS`, `VARCHAR(n)`, `TEXT`/`LONGTEXT`, integer types, quoted identifiers, and composite primary keys. Composite primary-key uniqueness is enforced and its B-tree index can serve matching equality predicates. The insert path supports both `ON CONFLICT (...) DO UPDATE SET ... EXCLUDED.column` and `ON DUPLICATE KEY UPDATE ... VALUES(column)` upserts. Column-list inserts, projections, `UPDATE`, `DELETE`, and `AND`-joined equality predicates are also implemented.
 
-This brings the engine closer to KSL's SQL usage, but does not complete the integration. The current engine still lacks a JDBC driver, full JDBC semantics, some SQL features used by arbitrary scripts, row/result limits, and the production wire protocol. KSL itself has not yet been modified to add a PostemberDB dialect.
+This brings the engine closer to KSL's SQL usage, but does not complete the integration. The current engine still lacks a JDBC driver, full JDBC semantics, some SQL features used by arbitrary scripts, protocol-level row limits/cancellation, and a secure remote protocol. KSL itself has not been modified; the integration is a separate addon.
 
 
 The Rust SQL layer also supports `COUNT(*) AS alias` for common aggregate lookups. It still does not implement the full SQL grammar or every feature used by arbitrary KSL scripts.
