@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"PDB3";
+const MAGIC: &[u8; 4] = b"PDB4";
 const PAGE_MAGIC: &[u8; 4] = b"PPG1";
 const PAGE_SIZE: usize = 4096;
 const PAGE_META_SIZE: usize = 16;
@@ -171,9 +171,13 @@ impl Database {
             put_u32(&mut out, checked_count(table.indexes.len())?);
             for (index_name, index) in &table.indexes {
                 put_string(&mut out, index_name)?;
-                let column = table.columns.get(index.column_index)
-                    .ok_or_else(|| DbError::Storage("index column is outside table schema".into()))?;
-                put_string(&mut out, &column.name)?;
+                out.push(u8::from(index.unique));
+                put_u32(&mut out, checked_count(index.column_indices.len())?);
+                for column_index in &index.column_indices {
+                    let column = table.columns.get(*column_index)
+                        .ok_or_else(|| DbError::Storage("index column is outside table schema".into()))?;
+                    put_string(&mut out, &column.name)?;
+                }
             }
             put_u32(&mut out, checked_count(table.rows.len())?);
             for row in &table.rows {
@@ -210,7 +214,9 @@ impl Database {
         let bytes = payload;
         let mut input = Decoder { bytes: &bytes, offset: 0 };
         let header = input.take(4)?;
-        let (format_version, wal_sequence) = if header == b"PDB3" {
+        let (format_version, wal_sequence) = if header == b"PDB4" {
+            (4, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
+        } else if header == b"PDB3" {
             (3, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
         } else if header == b"PDB2" {
             (2, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
@@ -241,10 +247,24 @@ impl Database {
                 columns.push(Column { name: column_name, data_type, nullable });
             }
             let mut index_definitions = Vec::new();
-            if format_version >= 3 {
+            if format_version >= 4 {
                 let index_count = input.count()?;
                 for _ in 0..index_count {
-                    index_definitions.push((input.string()?, input.string()?));
+                    let index_name = input.string()?;
+                    let unique = match input.byte()? {
+                        0 => false, 1 => true,
+                        _ => return Err(DbError::Storage("invalid unique-index flag".into())),
+                    };
+                    let index_columns = input.count()?;
+                    if index_columns == 0 { return Err(DbError::Storage("index has no columns".into())); }
+                    let mut column_names = Vec::with_capacity(index_columns);
+                    for _ in 0..index_columns { column_names.push(input.string()?); }
+                    index_definitions.push((index_name, column_names, unique));
+                }
+            } else if format_version == 3 {
+                let index_count = input.count()?;
+                for _ in 0..index_count {
+                    index_definitions.push((input.string()?, vec![input.string()?], false));
                 }
             }
             let row_count = input.count()?;
@@ -274,8 +294,8 @@ impl Database {
                 rows.push(Row { values });
             }
             let mut table = Table { columns, rows, indexes: BTreeMap::new() };
-            for (index_name, column_name) in index_definitions {
-                table.add_index(index_name, &column_name)?;
+            for (index_name, column_names, unique) in index_definitions {
+                table.add_index_columns(index_name, &column_names, unique)?;
             }
             if tables.insert(name.clone(), table).is_some() {
                 return Err(DbError::Storage(format!("duplicate table {name} in database file")));
