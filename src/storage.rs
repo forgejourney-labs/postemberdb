@@ -602,7 +602,7 @@ impl Database {
         let Some(database_path) = self.storage_path.as_deref() else { return Ok(()); };
         let page_path = page_tree_file_path(database_path);
         let tree_wal_path = page_tree_wal_file_path(database_path);
-        let mut entries = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+        let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
         for (table_name, table) in &self.tables {
             for (index_name, index) in &table.indexes {
