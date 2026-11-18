@@ -195,7 +195,7 @@ impl Database {
     fn decode_file(path: &Path) -> Result<Self, DbError> {
         let file = File::open(path).map_err(storage_error)?;
         let mut bytes = Vec::new();
-        let mut limited = file.take((512 * 1024 * 1024) as u64 + 1);
+        let mut limited = file.take((MAX_SNAPSHOT_SIZE + 16 * 1024 * 1024) as u64 + 1);
         limited.read_to_end(&mut bytes).map_err(storage_error)?;
         if bytes.len() > MAX_SNAPSHOT_SIZE + 64 * 1024 * 1024 {
             return Err(DbError::Storage("database file exceeds snapshot safety limit".into()));
@@ -438,8 +438,8 @@ mod tests {
         let mut reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.execute("SELECT * FROM page_data").unwrap().rows.len(), 300);
         drop(reopened);
-        fs::remove_file(path).unwrap();
-        fs::remove_file(test_path("unused")).ok();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(wal_file_path(&path)).ok();
     }
 
     #[test]
@@ -454,8 +454,8 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let error = Database::open(&path).unwrap_err();
         assert!(error.to_string().contains("checksum"));
-        fs::remove_file(path).unwrap();
-        fs::remove_file(wal_file_path(&test_path("unused"))).ok();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(wal_file_path(&path)).ok();
     }
 
     #[test]
