@@ -2,7 +2,7 @@
 
 use super::{checksum, checked_count, put_string, put_u32, storage_error, Database, DbError, Decoder};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 impl Database {
@@ -35,28 +35,39 @@ impl Database {
     pub(super) fn replay_wal(&mut self) -> Result<(), DbError> {
         let Some(path) = self.wal_path.clone() else { return Ok(()); };
         if !path.exists() { return Ok(()); }
-        let bytes = fs::read(&path).map_err(storage_error)?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let remaining = bytes.len() - offset;
-            if remaining < 24 { break; } // incomplete final frame
-            if &bytes[offset..offset + 4] != b"PWT2" {
+        // Stream frames instead of loading the complete WAL into memory.
+        // Only one bounded (maximum 64 MiB) transaction payload is resident.
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(storage_error)?;
+        let mut offset = 0u64;
+        let mut truncated_tail = false;
+        loop {
+            let mut header = [0u8; 24];
+            match file.read(&mut header[..1]).map_err(storage_error)? {
+                0 => break,
+                _ => {}
+            }
+            if file.read_exact(&mut header[1..]).is_err() {
+                truncated_tail = true;
+                break;
+            }
+            if &header[..4] != b"PWT2" {
                 return Err(DbError::Storage(format!("invalid WAL frame header at byte {offset}")));
             }
-            let sequence = u64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
-            let expected = u64::from_le_bytes(bytes[offset + 16..offset + 24].try_into().unwrap());
+            let sequence = u64::from_le_bytes(header[4..12].try_into().unwrap());
+            let len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let expected = u64::from_le_bytes(header[16..24].try_into().unwrap());
             if len > 64 * 1024 * 1024 {
                 return Err(DbError::Storage("WAL frame exceeds 64 MiB".into()));
             }
-            let end = offset.checked_add(24).and_then(|n| n.checked_add(len))
-                .ok_or_else(|| DbError::Storage("WAL offset overflow".into()))?;
-            if end > bytes.len() { break; } // incomplete final frame
-            let payload = &bytes[offset + 24..end];
-            if checksum(payload) != expected {
+            let mut payload = vec![0u8; len];
+            if file.read_exact(&mut payload).is_err() {
+                truncated_tail = true;
+                break;
+            }
+            if checksum(&payload) != expected {
                 return Err(DbError::Storage(format!("WAL checksum mismatch at byte {offset}")));
             }
-            let mut decoder = Decoder { bytes: payload, offset: 0 };
+            let mut decoder = Decoder { bytes: &payload, offset: 0 };
             let count = decoder.count()?;
             let mut statements = Vec::with_capacity(count);
             for _ in 0..count { statements.push(decoder.string()?); }
@@ -87,11 +98,11 @@ impl Database {
                 self.wal_sequence = sequence;
                 self.revision = sequence;
             }
-            offset = end;
+            offset = offset.checked_add(24 + len as u64)
+                .ok_or_else(|| DbError::Storage("WAL offset overflow".into()))?;
         }
-        if offset < bytes.len() {
-            let file = OpenOptions::new().write(true).open(&path).map_err(storage_error)?;
-            file.set_len(offset as u64).map_err(storage_error)?;
+        if truncated_tail {
+            file.set_len(offset).map_err(storage_error)?;
             file.sync_all().map_err(storage_error)?;
         }
         self.revision = self.wal_sequence;
