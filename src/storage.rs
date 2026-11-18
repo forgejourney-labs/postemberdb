@@ -329,8 +329,10 @@ mod tests {
             let mut db = Database::open(&path).unwrap();
             db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER)").unwrap();
             db.execute("CREATE INDEX idx_players_uuid ON players (uuid)").unwrap();
-            db.execute("INSERT INTO players VALUES ('player-a', 10)").unwrap();
-            db.execute("INSERT INTO players VALUES ('player-a', 20)").unwrap();
+            db.insert_many("players", (0..700).map(|coins| vec![
+                Value::Text("player-a".into()),
+                Value::Integer(coins),
+            ])).unwrap();
         }
 
         let mut store = extent::ExtentFile::open(&page_path).unwrap();
@@ -350,7 +352,9 @@ mod tests {
             .into_iter()
             .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
             .collect::<Vec<_>>();
-        assert_eq!(refs, vec![0, 1]);
+        assert_eq!(refs.len(), 700);
+        assert_eq!(refs.first(), Some(&0));
+        assert_eq!(refs.last(), Some(&699));
         drop(store);
 
         for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
