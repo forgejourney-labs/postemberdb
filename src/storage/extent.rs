@@ -176,7 +176,7 @@ impl ExtentFile {
         let mut encoded = [0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(page_offset(page_id)?)).map_err(storage_error)?;
         self.file.read_exact(&mut encoded).map_err(storage_error)?;
-        decode_data_page(page_id, &encoded)
+        decode_data_page(page_id, &encoded, self.metadata.generation)
     }
 
     /// Releases a contiguous range. Adjacent free extents are coalesced before
@@ -392,12 +392,25 @@ fn encode_data_page(
     page[4..12].copy_from_slice(&page_id.to_le_bytes());
     page[12..20].copy_from_slice(&generation.to_le_bytes());
     page[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    page[24..32].copy_from_slice(&super::checksum(payload).to_le_bytes());
+    page[24..32].copy_from_slice(&data_page_checksum(page_id, generation, payload).to_le_bytes());
     page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload.len()].copy_from_slice(payload);
     page
 }
 
-fn decode_data_page(page_id: u64, page: &[u8; PAGE_SIZE]) -> Result<Vec<u8>, DbError> {
+fn data_page_checksum(page_id: u64, generation: u64, payload: &[u8]) -> u64 {
+    let mut bytes = Vec::with_capacity(20 + payload.len());
+    bytes.extend_from_slice(&page_id.to_le_bytes());
+    bytes.extend_from_slice(&generation.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(payload);
+    super::checksum(&bytes)
+}
+
+fn decode_data_page(
+    page_id: u64,
+    page: &[u8; PAGE_SIZE],
+    max_generation: u64,
+) -> Result<Vec<u8>, DbError> {
     if &page[0..4] != DATA_PAGE_MAGIC {
         return Err(DbError::Storage(format!("invalid data-page magic for page {page_id}")));
     }
@@ -405,13 +418,17 @@ fn decode_data_page(page_id: u64, page: &[u8; PAGE_SIZE]) -> Result<Vec<u8>, DbE
     if stored_page_id != page_id {
         return Err(DbError::Storage(format!("data-page ID mismatch for page {page_id}")));
     }
+    let generation = u64::from_le_bytes(page[12..20].try_into().unwrap());
+    if generation == 0 || generation > max_generation {
+        return Err(DbError::Storage(format!("invalid generation for page {page_id}")));
+    }
     let used = u32::from_le_bytes(page[20..24].try_into().unwrap()) as usize;
     if used > PAGE_PAYLOAD_SIZE {
         return Err(DbError::Storage(format!("invalid payload length for page {page_id}")));
     }
     let payload = &page[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + used];
     let expected_checksum = u64::from_le_bytes(page[24..32].try_into().unwrap());
-    if super::checksum(payload) != expected_checksum {
+    if data_page_checksum(page_id, generation, payload) != expected_checksum {
         return Err(DbError::Storage(format!("data-page checksum mismatch for page {page_id}")));
     }
     if page[PAGE_HEADER_SIZE + used..].iter().any(|byte| *byte != 0) {
@@ -500,6 +517,26 @@ mod tests {
         let mut reopened = ExtentFile::open(&path).unwrap();
         assert_eq!(reopened.read_page(0).unwrap(), b"reused");
         assert_eq!(reopened.stats().allocated_pages, 1);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reserves_contiguous_extents_and_persists_written_pages() {
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        let start = store.allocate_extent(3).unwrap();
+        assert_eq!(start, 0);
+        store.write_page(start, b"first").unwrap();
+        store.write_page(start + 1, b"second").unwrap();
+        store.write_page(start + 2, b"third").unwrap();
+        assert_eq!(store.read_page(start + 1).unwrap(), b"second");
+        assert_eq!(store.stats().allocated_pages, 3);
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.read_page(start).unwrap(), b"first");
+        assert_eq!(reopened.read_page(start + 2).unwrap(), b"third");
         drop(reopened);
         fs::remove_file(path).unwrap();
     }
