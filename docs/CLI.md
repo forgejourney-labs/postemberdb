@@ -10,7 +10,7 @@ The CLI is being built in Rust alongside the database engine. Current commands a
 - postemberdb check [data-file] — open the database, decode the snapshot, and replay/validate the WAL. Opening may truncate an incomplete final WAL frame, so this is a recovery check rather than a read-only forensic check.
 - postemberdb checkpoint [data-file] — recover the database, write a snapshot, sync it, and safely truncate the WAL.
 
-The data-file argument defaults to postemberdb.pdb for the commands that accept it. Check and checkpoint require an existing database file; they do not silently create one.
+The data-file argument defaults to postemberdb.pbd for the commands that accept it. Check and checkpoint require an existing database file; they do not silently create one.
 
 ## Planned command groups
 
