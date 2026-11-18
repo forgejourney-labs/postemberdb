@@ -167,6 +167,13 @@ impl Database {
         self.execute_inner(statement)
     }
 
+    /// Execute SQL with typed positional parameters. Placeholders inside quoted
+    /// string literals are left untouched; the parameter count must match exactly.
+    pub fn execute_params(&mut self, sql: &str, parameters: &[Value]) -> Result<QueryResult, DbError> {
+        let bound = bind_parameters(sql, parameters)?;
+        self.execute(&bound)
+    }
+
     fn execute_inner(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         let result = if starts_with_kw(statement, "CREATE TABLE") {
             self.create_table(statement)
@@ -376,6 +383,43 @@ impl Database {
     }
 }
 
+
+fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
+    let mut output = String::with_capacity(sql.len() + parameters.len() * 8);
+    let mut parameter_index = 0usize;
+    let mut quote = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            output.push(ch);
+            if ch == active_quote {
+                if chars.peek() == Some(&active_quote) {
+                    output.push(chars.next().expect("peeked quote"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            output.push(ch);
+        } else if ch == '?' {
+            let value = parameters.get(parameter_index)
+                .ok_or_else(|| DbError::Parse("not enough SQL parameters".into()))?;
+            output.push_str(&value_to_sql(value));
+            parameter_index += 1;
+        } else {
+            output.push(ch);
+        }
+    }
+    if parameter_index != parameters.len() {
+        return Err(DbError::Parse(format!(
+            "expected {parameter_index} SQL parameters, received {}", parameters.len()
+        )));
+    }
+    Ok(output)
+}
 
 fn value_to_sql(value: &Value) -> String {
     match value {
@@ -646,6 +690,30 @@ mod tests {
             vec![Value::Text("bulk-b".into()), Value::Integer(2)],
         ]).unwrap();
         assert_eq!(db.execute("SELECT * FROM players WHERE uuid = 'bulk-b'").unwrap().rows.len(), 1);
+    }
+
+
+    #[test]
+    fn prepared_parameters_are_typed_and_quoted_safely() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE messages (id INTEGER, body TEXT)").unwrap();
+        db.execute_params(
+            "INSERT INTO messages VALUES (?, ?)",
+            &[Value::Integer(1), Value::Text("x'); DROP TABLE messages; --".into())],
+        ).unwrap();
+        let result = db.execute_params(
+            "SELECT * FROM messages WHERE id = ?",
+            &[Value::Integer(1)],
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[1], Value::Text("x'); DROP TABLE messages; --".into()));
+    }
+
+    #[test]
+    fn prepared_parameter_count_must_match() {
+        let mut db = Database::new();
+        assert!(db.execute_params("SELECT * FROM missing WHERE id = ?", &[]).is_err());
+        assert!(db.execute_params("SELECT * FROM missing", &[Value::Integer(1)]).is_err());
     }
 
     #[test]
