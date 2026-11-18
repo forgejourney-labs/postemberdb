@@ -28,6 +28,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] CREATE INDEX and SELECT equality predicates.
 - [x] Index maintenance during INSERT and bounded bulk insert.
 - [x] In-memory SQL index entries store stable table-local row IDs and resolve them through the row-position map.
+- [x] KeyValueStore supports bounded prefix deletion in atomic batches of up to 5,000 keys, avoiding full-range materialization for repeated cleanup.
 - [x] Incremental index-key maintenance for UPDATE, DELETE, and UPSERT; deleting rows no longer rebuilds index trees.
 - [x] Unique-index collision validation for multi-row UPDATE before staged rows are mutated.
 - [x] Persist index definitions and rebuild index entries after snapshot load.
