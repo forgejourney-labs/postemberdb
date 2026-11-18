@@ -638,7 +638,7 @@ impl Database {
             let table = self.tables.get_mut(&table_name)
                 .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             table.add_index(index_name.clone(), &column_name)?;
-            build_rows_index_deltas(&table_name, table, &table.rows.clone(), Some(&index_name), true)?
+            build_rows_index_deltas(&table_name, table, &table.rows, Some(&index_name), true)?
         };
         self.append_ember_journal(deltas);
         Ok(QueryResult::message(format!("index {index_name} created on {table_name}({column_name})")))
