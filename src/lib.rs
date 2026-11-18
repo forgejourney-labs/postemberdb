@@ -1,7 +1,7 @@
 //! PostemberDB: an independent, Rust-native SQL-like database engine.
 //!
-//! The engine supports both in-memory databases and an initial persistent file format.
-//! Transactions, indexing, and crash recovery remain future engine layers.
+//! The engine supports in-memory and persistent SQL databases, transaction WAL,
+//! a derived persistent SQL-index mirror, plus independent native KV and Registry sidecars.
 
 use std::collections::BTreeMap;
 use crate::storage::btree::BPlusTree;
