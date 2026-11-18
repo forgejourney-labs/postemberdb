@@ -45,7 +45,7 @@ impl Database {
         };
         db.storage_path = Some(path.clone());
         db.wal_path = Some(wal_file_path(&path));
-        db.lock_file = Some(std::sync::Arc::new(lock_file));
+        db._lock_file = Some(std::sync::Arc::new(lock_file));
         if !path.exists() {
             db.write_snapshot()?;
         }
