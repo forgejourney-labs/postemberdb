@@ -117,6 +117,13 @@ impl ExtentFile {
         }
         let mut next = self.metadata.clone();
         let start = reserve_extent(&mut next, page_count)?;
+        // Extend the file before publishing a larger high-water mark. If the
+        // metadata commit fails, the extra tail is harmless and may be reused.
+        let required_len = page_offset(next.next_page_id)?;
+        if self.file.metadata().map_err(storage_error)?.len() < required_len {
+            self.file.set_len(required_len).map_err(storage_error)?;
+            self.file.sync_data().map_err(storage_error)?;
+        }
         self.commit_metadata(next)?;
         Ok(start)
     }
