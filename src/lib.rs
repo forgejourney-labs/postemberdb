@@ -592,6 +592,18 @@ impl Database {
             (0..table.rows.len()).collect()
         };
 
+        let projection_upper = projection.to_ascii_uppercase();
+        if projection_upper.starts_with("COUNT(*)") {
+            let alias = projection_upper.find(" AS ").map(|position| normalize_ident(&projection[position + 4..]))
+                .unwrap_or_else(|| "count".into());
+            return Ok(QueryResult {
+                columns: vec![alias],
+                rows: vec![Row { values: vec![Value::Integer(selected_rows.len() as i64)] }],
+                message: "1 row(s)".into(),
+                affected_rows: 0,
+            });
+        }
+
         let projection_indices = if projection == "*" {
             (0..table.columns.len()).collect::<Vec<_>>()
         } else {
@@ -1331,6 +1343,19 @@ mod tests {
             &[Value::Text("economy".into()), Value::Text("balance".into())],
         ).unwrap();
         assert_eq!(result.rows[0].values[0], Value::Text("300".into()));
+    }
+
+
+    #[test]
+    fn supports_count_star_with_where_predicates() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE player_notes (uuid TEXT, note TEXT)").unwrap();
+        db.execute("INSERT INTO player_notes VALUES ('a', 'one')").unwrap();
+        db.execute("INSERT INTO player_notes VALUES ('a', 'two')").unwrap();
+        db.execute("INSERT INTO player_notes VALUES ('b', 'three')").unwrap();
+        let result = db.execute("SELECT COUNT(*) AS total FROM player_notes WHERE uuid = 'a'").unwrap();
+        assert_eq!(result.columns, vec!["total"]);
+        assert_eq!(result.rows[0].values[0], Value::Integer(2));
     }
 
     #[test]
