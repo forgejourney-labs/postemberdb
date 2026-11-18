@@ -319,29 +319,60 @@ impl Database {
     }
 
     fn create_table(&mut self, sql: &str) -> Result<QueryResult, DbError> {
-        let rest = sql["CREATE TABLE".len()..].trim();
+        let mut rest = sql["CREATE TABLE".len()..].trim();
+        let if_not_exists = starts_with_kw(rest, "IF NOT EXISTS");
+        if if_not_exists { rest = rest["IF NOT EXISTS".len()..].trim(); }
         let open = rest.find('(').ok_or_else(|| DbError::Parse("expected '(' after table name".into()))?;
         let close = rest.rfind(')').ok_or_else(|| DbError::Parse("expected ')'".into()))?;
         let name = normalize_ident(rest[..open].trim());
         if name.is_empty() { return Err(DbError::Parse("missing table name".into())); }
-        if self.tables.contains_key(&name) { return Err(DbError::TableExists(name)); }
+        if self.tables.contains_key(&name) {
+            return if if_not_exists {
+                Ok(QueryResult::message(format!("table {name} already exists")))
+            } else {
+                Err(DbError::TableExists(name))
+            };
+        }
 
         let mut columns = Vec::new();
+        let mut primary_key_columns = Vec::new();
         for definition in split_csv(&rest[open + 1..close]) {
+            let upper = definition.to_ascii_uppercase();
+            if upper.starts_with("PRIMARY KEY") {
+                let key_open = definition.find('(').ok_or_else(|| DbError::Parse("expected '(' in PRIMARY KEY".into()))?;
+                let key_close = definition.rfind(')').ok_or_else(|| DbError::Parse("expected ')' in PRIMARY KEY".into()))?;
+                primary_key_columns.extend(split_csv(&definition[key_open + 1..key_close]).into_iter().map(normalize_ident));
+                continue;
+            }
+
             let mut parts = definition.split_whitespace();
             let column_name = parts.next().ok_or_else(|| DbError::Parse("empty column definition".into()))?;
-            let type_name = parts.next().ok_or_else(|| DbError::Parse(format!("missing type for {column_name}")))?;
-            let data_type = match type_name.to_ascii_uppercase().as_str() {
-                "INT" | "INTEGER" | "BIGINT" => DataType::Integer,
-                "TEXT" | "VARCHAR" | "STRING" => DataType::Text,
+            let type_token = parts.next().ok_or_else(|| DbError::Parse(format!("missing type for {column_name}")))?;
+            let type_name = type_token.split('(').next().unwrap_or(type_token).to_ascii_uppercase();
+            let data_type = match type_name.as_str() {
+                "INT" | "INTEGER" | "BIGINT" | "SMALLINT" => DataType::Integer,
+                "TEXT" | "LONGTEXT" | "MEDIUMTEXT" | "VARCHAR" | "CHAR" | "STRING" => DataType::Text,
                 "BOOL" | "BOOLEAN" => DataType::Boolean,
                 other => return Err(DbError::Unsupported(format!("column type {other}"))),
             };
-            let nullable = !definition.to_ascii_uppercase().contains("NOT NULL");
-            columns.push(Column { name: normalize_ident(column_name), data_type, nullable });
+            let primary = upper.contains("PRIMARY KEY");
+            let nullable = !upper.contains("NOT NULL") && !primary;
+            let normalized_column = normalize_ident(column_name);
+            if primary { primary_key_columns.push(normalized_column.clone()); }
+            columns.push(Column { name: normalized_column, data_type, nullable });
         }
         if columns.is_empty() { return Err(DbError::Parse("a table needs at least one column".into())); }
-        self.tables.insert(name.clone(), Table { columns, rows: Vec::new(), indexes: BTreeMap::new() });
+        let mut table = Table { columns, rows: Vec::new(), indexes: BTreeMap::new() };
+        for column_name in primary_key_columns {
+            if !table.columns.iter().any(|column| column.name == column_name) {
+                return Err(DbError::ColumnNotFound(column_name));
+            }
+            let index_name = format!("__pk_{name}_{column_name}");
+            if !table.indexes.contains_key(&index_name) {
+                table.add_index(index_name, &column_name)?;
+            }
+        }
+        self.tables.insert(name.clone(), table);
         Ok(QueryResult::message(format!("table {name} created")))
     }
 
@@ -638,11 +669,15 @@ fn normalize_ident(input: &str) -> String {
 
 fn split_csv(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
-    let (mut start, mut quoted, mut quote_char) = (0, false, '\0');
+    let (mut start, mut quoted, mut quote_char, mut depth) = (0, false, '\0', 0i32);
     for (i, ch) in input.char_indices() {
         if (ch == '\'' || ch == '"') && (!quoted || ch == quote_char) {
             if quoted { quoted = false; } else { quoted = true; quote_char = ch; }
-        } else if ch == ',' && !quoted {
+        } else if !quoted && ch == '(' {
+            depth += 1;
+        } else if !quoted && ch == ')' {
+            depth -= 1;
+        } else if ch == ',' && !quoted && depth == 0 {
             parts.push(input[start..i].trim());
             start = i + 1;
         }
