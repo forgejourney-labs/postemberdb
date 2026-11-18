@@ -1,5 +1,5 @@
 use postemberdb::{Database, DatabaseSession, QueryResult};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,6 +69,20 @@ fn main() {
             eprintln!("  postemberdb version");
         }
     }
+}
+
+fn validate_bind_address(address: &str) -> io::Result<SocketAddr> {
+    let socket_address: SocketAddr = address.parse().map_err(|_| io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "server address must be an explicit loopback socket address until TLS and authentication are implemented",
+    ))?;
+    if !socket_address.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing non-loopback bind: this development protocol has no TLS or authentication",
+        ));
+    }
+    Ok(socket_address)
 }
 
 fn run_server(address: &str, data_path: &str) -> io::Result<()> {
