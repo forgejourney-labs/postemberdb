@@ -1,4 +1,4 @@
-use postemberdb::Database;
+use postemberdb::{Database, DatabaseSession, QueryResult};
 use std::io::{self, BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -55,29 +55,73 @@ fn handle_client(
 ) -> io::Result<()> {
     let reader_stream = stream.try_clone()?;
     let reader = io::BufReader::new(reader_stream);
+    let mut session: Option<DatabaseSession> = None;
     writeln!(stream, "PostemberDB/0.1 ready; send one SQL statement per line")?;
     for line in reader.lines() {
         let sql = line?;
-        if sql.trim().eq_ignore_ascii_case("QUIT") { break; }
-        let response = match database.lock() {
-            Ok(mut db) => match db.execute(&sql) {
-                Ok(result) if !result.columns.is_empty() => {
-                    let mut output = format!("OK {}\n", result.message);
-                    for column in &result.columns { output.push_str(&format!("{column}\t")); }
-                    output.push('\n');
-                    for row in result.rows {
-                        for value in row.values { output.push_str(&format!("{value}\t")); }
-                        output.push('\n');
+        let command = sql.trim();
+        if command.eq_ignore_ascii_case("QUIT") { break; }
+
+        let response = if command.eq_ignore_ascii_case("BEGIN") || command.eq_ignore_ascii_case("BEGIN TRANSACTION") {
+            if session.is_some() {
+                "ERROR transaction already active\n".to_owned()
+            } else {
+                match database.lock() {
+                    Ok(db) => {
+                        session = Some(db.begin_session());
+                        "OK transaction started\n".to_owned()
                     }
-                    output
+                    Err(_) => "ERROR database lock poisoned\n".to_owned(),
                 }
-                Ok(result) => format!("OK {}\n", result.message),
+            }
+        } else if command.eq_ignore_ascii_case("COMMIT") {
+            match session.take() {
+                None => "ERROR no active transaction\n".to_owned(),
+                Some(transaction) => match database.lock() {
+                    Ok(mut db) => match db.commit_session(transaction) {
+                        Ok(()) => "OK transaction committed\n".to_owned(),
+                        Err(error) => format!("ERROR {error}\n"),
+                    },
+                    Err(_) => "ERROR database lock poisoned\n".to_owned(),
+                }
+            }
+        } else if command.eq_ignore_ascii_case("ROLLBACK") {
+            if session.take().is_some() {
+                "OK transaction rolled back\n".to_owned()
+            } else {
+                "ERROR no active transaction\n".to_owned()
+            }
+        } else if let Some(transaction) = session.as_mut() {
+            match transaction.execute(&sql) {
+                Ok(result) => format_result(result),
                 Err(error) => format!("ERROR {error}\n"),
-            },
-            Err(_) => "ERROR database lock poisoned\n".to_owned(),
+            }
+        } else {
+            match database.lock() {
+                Ok(mut db) => match db.execute(&sql) {
+                    Ok(result) => format_result(result),
+                    Err(error) => format!("ERROR {error}\n"),
+                },
+                Err(_) => "ERROR database lock poisoned\n".to_owned(),
+            }
         };
         stream.write_all(response.as_bytes())?;
         stream.flush()?;
     }
+    // An uncommitted session is dropped and therefore rolled back on disconnect.
     Ok(())
+}
+
+fn format_result(result: QueryResult) -> String {
+    if result.columns.is_empty() {
+        return format!("OK {}\n", result.message);
+    }
+    let mut output = format!("OK {}\n", result.message);
+    for column in &result.columns { output.push_str(&format!("{column}\t")); }
+    output.push('\n');
+    for row in result.rows {
+        for value in row.values { output.push_str(&format!("{value}\t")); }
+        output.push('\n');
+    }
+    output
 }
