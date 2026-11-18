@@ -369,12 +369,15 @@ impl Database {
             let sequence = self.append_wal_transaction(&session.statements)?;
             self.wal_sequence = sequence;
         }
-        self.tables = session.staged.tables;
+        let previous_mirror_valid = self.ember_indexes_valid;
+        let previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
-        // The SQL WAL is the commit authority. A derived EmberTree mirror
-        // failure must not report a committed SQL transaction as rolled back.
-        self.ember_indexes_valid = self.sync_ember_indexes().unwrap_or(false);
+        // The SQL WAL is the commit authority. Apply a derived index delta only
+        // after the SQL commit is durable; on failure queries use memory indexes.
+        self.ember_indexes_valid = self
+            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .unwrap_or(false);
         Ok(())
     }
 
@@ -790,18 +793,22 @@ impl Transaction<'_> {
 
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
-        if !self.statements.is_empty() {
-            if self.database.wal_path.is_some() {
-                let sequence = self.database.append_wal_transaction(&self.statements)?;
-                self.database.wal_sequence = sequence;
-            }
-            self.database.revision = self.database.revision.wrapping_add(1);
+        if self.statements.is_empty() {
+            return Ok(());
         }
-        self.database.tables = self.staged.tables;
+        if self.database.wal_path.is_some() {
+            let sequence = self.database.append_wal_transaction(&self.statements)?;
+            self.database.wal_sequence = sequence;
+        }
+        let previous_mirror_valid = self.database.ember_indexes_valid;
+        let previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
+        self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
-        // The SQL WAL is already durable at this point; keep the transaction
-        // committed and fall back to in-memory indexes if the mirror fails.
-        self.database.ember_indexes_valid = self.database.sync_ember_indexes().unwrap_or(false);
+        // The SQL WAL is already durable at this point. Update only changed
+        // EmberTree entries; failure leaves SQL committed and enables fallback.
+        self.database.ember_indexes_valid = self.database
+            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .unwrap_or(false);
         Ok(())
     }
 }
@@ -970,6 +977,48 @@ mod tests {
         }
         for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
+    fn persistent_ember_index_applies_incremental_sql_insert_update_delete_deltas() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-index-delta-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE delta_players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-a', 10)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-b', 20)").unwrap();
+            db.execute("INSERT INTO delta_players VALUES ('player-c', 30)").unwrap();
+            db.execute("CREATE INDEX idx_delta_uuid ON delta_players (uuid)").unwrap();
+            assert!(db.ember_indexes_valid);
+
+            db.execute("INSERT INTO delta_players VALUES ('player-d', 40)").unwrap();
+            assert!(db.ember_indexes_valid);
+            db.execute("UPDATE delta_players SET uuid = 'player-a2' WHERE uuid = 'player-a'").unwrap();
+            assert!(db.ember_indexes_valid);
+            db.execute("DELETE FROM delta_players WHERE uuid = 'player-b'").unwrap();
+            assert!(db.ember_indexes_valid);
+
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a'").unwrap().rows.len(), 0);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-d'").unwrap().rows.len(), 1);
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        assert!(reopened.ember_indexes_valid);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+        drop(reopened);
+        for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
+            let candidate = format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix));
+            let _ = std::fs::remove_file(candidate);
         }
     }
 
