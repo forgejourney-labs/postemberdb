@@ -8,6 +8,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] One WAL frame per committed transaction.
 - [x] Sync the WAL before publishing staged writes in memory.
 - [x] Replay complete frames in sequence order during open.
+- [x] Apply each WAL transaction atomically during recovery; failed frames cannot publish partial table state.
 - [x] Discard and truncate an incomplete final frame.
 - [x] Sequence-aware snapshot checkpointing to avoid duplicate replay after a crash.
 - [x] In-memory transaction rollback when the callback returns an error.
