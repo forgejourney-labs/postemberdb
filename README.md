@@ -19,14 +19,14 @@ The project is at an early development stage. The first prototype provides:
 - basic `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT * FROM` statements;
 - integer, text, boolean, and nullable values;
 - basic column type and `NOT NULL` validation;
-- a versioned binary on-disk format with automatic persistence after successful table creation and inserts;
+- a versioned, fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - secondary B-tree indexes with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
 - temporary-file writes followed by rename when saving the database;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** WAL transactions are implemented, but the engine still replays SQL records and stores table rows in memory; page-oriented storage, range/composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** WAL transactions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range/composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
 
 ## Build and test
 
@@ -66,10 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
 2. Evolve the initial file snapshot format into page-oriented storage.
 3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
-4. Extend indexes to range/composite keys and add a cost-aware query planner.
-5. Harden the server protocol with authentication, framing, and resource limits.
-6. Add a stable KSL/JVM adapter and benchmark it against the general API.
-7. Run the Minecraft workload benchmark with `cargo bench --bench minecraft_workload`.
+4. Add a bounded page cache and streaming table scans over the fixed-size page store.
+5. Extend indexes to range/composite keys and add a cost-aware query planner.
+6. Replace the development line protocol with a framed, parameter-aware server protocol.
+7. Add a stable KSL/JVM JDBC adapter and benchmark it against the general API.
+8. Run the Minecraft workload benchmark with `cargo bench --bench minecraft_workload`.
 
 ## Development branches
 
