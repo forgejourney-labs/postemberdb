@@ -247,7 +247,7 @@ impl Database {
         if input.offset != bytes.len() {
             return Err(DbError::Storage("trailing bytes in database file".into()));
         }
-        Ok(Database { tables, storage_path: None, wal_path: None, wal_sequence, revision: wal_sequence })
+        Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence })
     }
 }
 
