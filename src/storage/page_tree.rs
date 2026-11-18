@@ -562,6 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn redo_wal_rejects_duplicate_page_ids() {
+        let page = encode_leaf(&[(b"one".to_vec(), b"value".to_vec())]).unwrap();
+        let frame = encode_wal(7, &[(7, page.clone()), (7, page)]).unwrap();
+        assert!(decode_wal(&frame).is_err());
+    }
+
+    #[test]
+    fn redo_wal_rejects_invalid_page_images_before_replay() {
+        let frame = encode_wal(9, &[(9, b"not-a-node".to_vec())]).unwrap();
+        assert!(decode_wal(&frame).is_err());
+    }
+
+    #[test]
     fn validates_tree_structure_after_reopen() {
         let (path, wal) = paths("validate");
         let entries = (0..900)
