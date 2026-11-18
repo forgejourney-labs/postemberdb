@@ -124,6 +124,33 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn failed_recovery_does_not_publish_earlier_frames() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-pass-atomic-{}-{nonce}.wal",
+            std::process::id()
+        ));
+
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE first_frame (value INTEGER)".into(),
+        ]).unwrap();
+        writer.wal_sequence = 1;
+        writer.append_wal_transaction(&[
+            "INSERT INTO missing_table VALUES (1)".into(),
+        ]).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        assert!(recovered.replay_wal().is_err());
+        assert!(!recovered.tables.contains_key("first_frame"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn replay_truncates_an_incomplete_payload_without_applying_it() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!(
