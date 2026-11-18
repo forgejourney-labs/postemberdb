@@ -56,7 +56,9 @@ impl Database {
         }
         db.replay_wal()?;
         recover_page_tree(&path)?;
+        db.ember_indexes_valid = false;
         db.sync_ember_indexes()?;
+        db.ember_indexes_valid = true;
         Ok(db)
     }
 
@@ -254,7 +256,7 @@ impl Database {
         if input.offset != bytes.len() {
             return Err(DbError::Storage("trailing bytes in database file".into()));
         }
-        Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence })
+        Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence, ember_indexes_valid: false })
     }
 }
 
