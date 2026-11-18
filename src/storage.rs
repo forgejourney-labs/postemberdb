@@ -7,6 +7,7 @@ use fs2::FileExt;
 
 mod allocator;
 pub(crate) mod btree;
+pub(crate) mod extent;
 mod pages;
 mod wal;
 
