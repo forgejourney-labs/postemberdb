@@ -56,3 +56,25 @@ This adapter is not implemented yet. The current release is a Rust library and a
 6. Load tests using realistic player counts, write rates, and restart/recovery scenarios.
 
 Performance claims will be made only after reproducible benchmarks against the existing KSL SQLite path and the target deployment hardware.
+
+
+## WAL and transaction state
+
+The Rust engine now has an append-only write-ahead log. Each committed transaction is encoded as one checksummed frame and synced before the staged table state is published in memory. Recovery replays complete frames in sequence order and discards an incomplete final frame. A snapshot records the last applied WAL sequence, so checkpointing can safely replace the snapshot and truncate older log records without replaying them twice after a crash.
+
+Rust transaction example:
+
+```rust
+use postemberdb::{Database, Value};
+
+let mut db = Database::open("./data/game.pdb")?;
+db.transaction(|tx| {
+    tx.execute("INSERT INTO player_stats VALUES ('player-a', 100)")?;
+    tx.execute("INSERT INTO player_stats VALUES ('player-b', 250)")?;
+    Ok(())
+})?;
+db.checkpoint()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The current WAL records SQL statements, not physical page changes. It is an initial durability layer, not yet a high-throughput storage engine. The database still loads table rows into memory at startup, and there is not yet a cross-process file lock or concurrent writer protocol. Do not open one embedded database file from multiple server processes.
