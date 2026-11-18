@@ -4,6 +4,7 @@
 //! Transactions, indexing, and crash recovery remain future engine layers.
 
 use std::collections::BTreeMap;
+use crate::storage::btree::BPlusTree;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -152,7 +153,7 @@ impl IndexKey {
 struct Index {
     column_indices: Vec<usize>,
     unique: bool,
-    entries: BTreeMap<IndexKey, Vec<usize>>,
+    entries: BPlusTree<IndexKey, Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,14 +179,15 @@ impl Table {
             self.columns.iter().position(|column| column.name == normalize_ident(name))
                 .ok_or_else(|| DbError::ColumnNotFound(name.clone()))
         }).collect::<Result<Vec<_>, _>>()?;
-        let mut index = Index { column_indices, unique, entries: BTreeMap::new() };
+        let mut index = Index { column_indices, unique, entries: BPlusTree::new() };
         for (row_index, row) in self.rows.iter().enumerate() {
             let key = IndexKey::from_columns(&row.values, &index.column_indices);
-            let positions = index.entries.entry(key).or_default();
+            let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
             if unique && !positions.is_empty() {
                 return Err(DbError::Constraint(format!("duplicate key while building unique index {index_name}")));
             }
             positions.push(row_index);
+            index.entries.insert(key, positions);
         }
         self.indexes.insert(index_name, index);
         Ok(())
@@ -207,7 +209,9 @@ impl Table {
         let row = &self.rows[row_index];
         for index in self.indexes.values_mut() {
             let key = IndexKey::from_columns(&row.values, &index.column_indices);
-            index.entries.entry(key).or_default().push(row_index);
+            let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
+            positions.push(row_index);
+            index.entries.insert(key, positions);
         }
     }
 
@@ -216,7 +220,9 @@ impl Table {
             index.entries.clear();
             for (row_index, row) in self.rows.iter().enumerate() {
                 let key = IndexKey::from_columns(&row.values, &index.column_indices);
-                index.entries.entry(key).or_default().push(row_index);
+                let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
+            positions.push(row_index);
+            index.entries.insert(key, positions);
             }
         }
     }
