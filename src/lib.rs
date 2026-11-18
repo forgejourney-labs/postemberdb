@@ -1009,6 +1009,31 @@ mod tests {
     }
 
     #[test]
+    fn stable_row_ids_are_not_reused_after_delete_all_and_checkpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-stable-row-id-empty-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE row_id_reuse (value TEXT)").unwrap();
+            db.execute("INSERT INTO row_id_reuse VALUES ('first')").unwrap();
+            db.execute("INSERT INTO row_id_reuse VALUES ('second')").unwrap();
+            db.execute("DELETE FROM row_id_reuse").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        reopened.execute("INSERT INTO row_id_reuse VALUES ('third')").unwrap();
+        let row = reopened.execute("SELECT * FROM row_id_reuse WHERE value = 'third'").unwrap();
+        assert_eq!(row.rows[0].row_id, 3, "checkpoint must preserve the next ID even when no rows remain");
+        drop(reopened);
+        for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
     fn persistent_ember_index_applies_incremental_sql_insert_update_delete_deltas() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-index-delta-{}-{}.pdb",
