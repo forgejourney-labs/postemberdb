@@ -29,6 +29,200 @@ enum DecodedNode {
     Internal(Vec<(Vec<u8>, u64)>),
 }
 
+/// Inserts or replaces one key using copy-on-write path updates. Unchanged
+/// subtrees retain their existing page IDs; only the search path and split
+/// ancestors are written to the redo WAL.
+pub(crate) fn insert_or_replace(
+    store: &mut ExtentFile,
+    wal_path: &Path,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), DbError> {
+    insert_many(store, wal_path, &[(key.to_vec(), value.to_vec())])
+}
+
+/// Applies a batch of key replacements and insertions, publishing one root.
+/// Mutations are processed in input order; the last value for a duplicate key
+/// wins. All new page images share one redo record and one root publication.
+pub(crate) fn insert_many(
+    store: &mut ExtentFile,
+    wal_path: &Path,
+    mutations: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(), DbError> {
+    recover(store, wal_path)?;
+    for (key, value) in mutations {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(DbError::Storage("B+ tree keys must contain 1..=1024 bytes".into()));
+        }
+        if value.len() > super::extent::page_payload_size() {
+            return Err(DbError::Storage("B+ tree value exceeds one page".into()));
+        }
+    }
+    if mutations.is_empty() { return Ok(()); }
+
+    let mut staged = Vec::new();
+    let mut root = store.root_page_id();
+    for (key, value) in mutations {
+        root = Some(match root {
+            None => {
+                let id = store.allocate_extent(1)?;
+                let page = encode_leaf(&[(key.clone(), value.clone())])?;
+                staged.push((id, page));
+                id
+            }
+            Some(root_id) => {
+                let replacements = insert_recursive(store, &mut staged, root_id, key, value)?;
+                if replacements.len() == 1 {
+                    replacements[0].page_id
+                } else {
+                    let id = store.allocate_extent(1)?;
+                    let children = replacements.iter().map(|node| {
+                        NodeRef { page_id: node.page_id, first_key: node.first_key.clone() }
+                    }).collect::<Vec<_>>();
+                    staged.push((id, encode_internal(&children)?));
+                    id
+                }
+            }
+        });
+    }
+    let root = root.expect("non-empty mutation batch always creates a root");
+    let frame = encode_wal(root, &staged)?;
+    write_wal(wal_path, &frame)?;
+    for (page_id, payload) in &staged {
+        store.write_page(*page_id, payload)?;
+    }
+    store.publish_root(Some(root))?;
+    validate_tree(store)?;
+    truncate_wal(wal_path)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct StagedNode {
+    page_id: u64,
+    first_key: Vec<u8>,
+}
+
+fn read_staged_node(
+    store: &mut ExtentFile,
+    staged: &[(u64, Vec<u8>)],
+    page_id: u64,
+) -> Result<DecodedNode, DbError> {
+    if let Some((_, bytes)) = staged.iter().rev().find(|(id, _)| *id == page_id) {
+        decode_node(bytes)
+    } else {
+        decode_node(&store.read_page(page_id)?)
+    }
+}
+
+fn subtree_first_key(
+    store: &mut ExtentFile,
+    staged: &[(u64, Vec<u8>)],
+    mut page_id: u64,
+) -> Result<Vec<u8>, DbError> {
+    loop {
+        match read_staged_node(store, staged, page_id)? {
+            DecodedNode::Leaf(entries) => return entries.first().map(|entry| entry.0.clone())
+                .ok_or_else(|| DbError::Storage("empty non-root B+ tree leaf".into())),
+            DecodedNode::Internal(children) => page_id = children[0].1,
+        }
+    }
+}
+
+fn stage_leaf(
+    store: &mut ExtentFile,
+    staged: &mut Vec<(u64, Vec<u8>)>,
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<StagedNode, DbError> {
+    let page_id = store.allocate_extent(1)?;
+    let first_key = entries.first().ok_or_else(|| DbError::Storage("cannot stage empty leaf".into()))?.0.clone();
+    staged.push((page_id, encode_leaf(entries)?));
+    Ok(StagedNode { page_id, first_key })
+}
+
+fn insert_recursive(
+    store: &mut ExtentFile,
+    staged: &mut Vec<(u64, Vec<u8>)>,
+    page_id: u64,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Vec<StagedNode>, DbError> {
+    match read_staged_node(store, staged, page_id)? {
+        DecodedNode::Leaf(mut entries) => {
+            match entries.binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key)) {
+                Ok(index) => entries[index].1 = value.to_vec(),
+                Err(index) => entries.insert(index, (key.to_vec(), value.to_vec())),
+            }
+            if encode_leaf(&entries).is_ok() {
+                return Ok(vec![stage_leaf(store, staged, &entries)?]);
+            }
+            let mut best_split: Option<(usize, usize)> = None;
+            for split in 1..entries.len() {
+                if let (Ok(left), Ok(right)) = (encode_leaf(&entries[..split]), encode_leaf(&entries[split..])) {
+                    let imbalance = left.len().abs_diff(right.len());
+                    if best_split.map_or(true, |(_, best)| imbalance < best) {
+                        best_split = Some((split, imbalance));
+                    }
+                }
+            }
+            let split = best_split.map(|(split, _)| split)
+                .ok_or_else(|| DbError::Storage("B+ tree leaf entry cannot be split into valid pages".into()))?;
+            Ok(vec![
+                stage_leaf(store, staged, &entries[..split])?,
+                stage_leaf(store, staged, &entries[split..])?,
+            ])
+        }
+        DecodedNode::Internal(children) => {
+            let child_index = children[1..].partition_point(|(separator, _)| key >= separator.as_slice());
+            let child_id = children[child_index].1;
+            let replacements = insert_recursive(store, staged, child_id, key, value)?;
+            let mut updated = Vec::with_capacity(children.len() + 1);
+            for (index, (_, id)) in children.into_iter().enumerate() {
+                if index == child_index {
+                    for replacement in &replacements {
+                        updated.push(NodeRef {
+                            page_id: replacement.page_id,
+                            first_key: replacement.first_key.clone(),
+                        });
+                    }
+                } else {
+                    updated.push(NodeRef {
+                        page_id: id,
+                        first_key: subtree_first_key(store, staged, id)?,
+                    });
+                }
+            }
+            if let Ok(payload) = encode_internal(&updated) {
+                let id = store.allocate_extent(1)?;
+                staged.push((id, payload));
+                return Ok(vec![StagedNode {
+                    page_id: id,
+                    first_key: updated[0].first_key.clone(),
+                }]);
+            }
+            let mut best_split: Option<(usize, usize)> = None;
+            for split in 2..=updated.len().saturating_sub(2) {
+                if let (Ok(left), Ok(right)) = (encode_internal(&updated[..split]), encode_internal(&updated[split..])) {
+                    let imbalance = left.len().abs_diff(right.len());
+                    if best_split.is_none_or(|(_, best)| imbalance < best) {
+                        best_split = Some((split, imbalance));
+                    }
+                }
+            }
+            let split = best_split.map(|(split, _)| split)
+                .ok_or_else(|| DbError::Storage("B+ tree internal node cannot be split safely".into()))?;
+            let left_id = store.allocate_extent(1)?;
+            let right_id = store.allocate_extent(1)?;
+            staged.push((left_id, encode_internal(&updated[..split])?));
+            staged.push((right_id, encode_internal(&updated[split..])?));
+            Ok(vec![
+                StagedNode { page_id: left_id, first_key: updated[0].first_key.clone() },
+                StagedNode { page_id: right_id, first_key: updated[split].first_key.clone() },
+            ])
+        }
+    }
+}
+
 /// Rebuilds a sorted key/value tree using immutable pages and atomically swaps
 /// its root. Keys must be unique and sorted in ascending byte order.
 pub(crate) fn replace_all(
@@ -509,6 +703,63 @@ mod tests {
         let mut wal = base.as_os_str().to_os_string();
         wal.push(".btree.wal");
         (base, wal.into())
+    }
+
+    #[test]
+    fn incremental_insert_splits_leaves_and_preserves_unmodified_subtrees() {
+        let (path, wal) = paths("incremental-insert");
+        let entries = (0u64..700)
+            .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut store = ExtentFile::open(&path).unwrap();
+        replace_all(&mut store, &wal, &entries).unwrap();
+        let old_root = store.root_page_id().unwrap();
+        let old_root_children = match decode_node(&store.read_page(old_root).unwrap()).unwrap() {
+            DecodedNode::Internal(children) => children,
+            DecodedNode::Leaf(_) => panic!("expected a multi-page tree"),
+        };
+        insert_or_replace(&mut store, &wal, b"key-0350", b"updated").unwrap();
+        assert_eq!(get(&mut store, b"key-0350").unwrap(), Some(b"updated".to_vec()));
+        // Force a byte-balanced leaf split with a large but valid value near
+        // the start of the first leaf, while retaining the distant subtrees.
+        insert_or_replace(&mut store, &wal, b"key-0000a", &vec![b'x'; 2500]).unwrap();
+        assert_eq!(get(&mut store, b"key-0000a").unwrap(), Some(vec![b'x'; 2500]));
+        assert_ne!(store.root_page_id(), Some(old_root));
+        assert_eq!(get(&mut store, b"key-0699").unwrap(), Some(699u64.to_le_bytes().to_vec()));
+        let new_root_children = match decode_node(&store.read_page(store.root_page_id().unwrap()).unwrap()).unwrap() {
+            DecodedNode::Internal(children) => children,
+            DecodedNode::Leaf(_) => panic!("expected a multi-page tree"),
+        };
+        assert!(old_root_children.iter().any(|old| new_root_children.iter().any(|new| old.1 == new.1)));
+        drop(store);
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        recover(&mut reopened, &wal).unwrap();
+        assert_eq!(get(&mut reopened, b"key-0350").unwrap(), Some(b"updated".to_vec()));
+        assert_eq!(get(&mut reopened, b"key-0000a").unwrap(), Some(vec![b'x'; 2500]));
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn incremental_batch_insert_is_published_as_one_root() {
+        let (path, wal) = paths("incremental-batch");
+        let mut store = ExtentFile::open(&path).unwrap();
+        insert_many(&mut store, &wal, &[
+            (b"alpha".to_vec(), b"1".to_vec()),
+            (b"beta".to_vec(), b"2".to_vec()),
+            (b"gamma".to_vec(), b"3".to_vec()),
+            (b"beta".to_vec(), b"replaced".to_vec()),
+        ]).unwrap();
+        assert_eq!(get(&mut store, b"beta").unwrap(), Some(b"replaced".to_vec()));
+        assert_eq!(scan_range(&mut store, b"alpha", b"gamma").unwrap().len(), 3);
+        drop(store);
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        recover(&mut reopened, &wal).unwrap();
+        assert_eq!(get(&mut reopened, b"gamma").unwrap(), Some(b"3".to_vec()));
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
     }
 
     #[test]
