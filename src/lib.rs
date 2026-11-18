@@ -960,6 +960,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sql_transactions_journal_only_affected_index_rows() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE journal_players (uuid TEXT, coins INTEGER)").unwrap();
+        db.execute("INSERT INTO journal_players VALUES ('player-a', 10)").unwrap();
+        db.execute("INSERT INTO journal_players VALUES ('player-b', 20)").unwrap();
+        db.execute("CREATE INDEX journal_players_uuid ON journal_players(uuid)").unwrap();
+
+        db.transaction(|tx| {
+            tx.execute("INSERT INTO journal_players VALUES ('player-c', 30)")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 1, "one inserted row should journal one index key");
+            tx.execute("UPDATE journal_players SET uuid = 'player-a2' WHERE uuid = 'player-a'")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 3, "an indexed-key update should journal one removal and one insertion");
+            tx.execute("DELETE FROM journal_players WHERE uuid = 'player-b'")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 4, "one deleted row should journal one removal");
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+    }
+
+    #[test]
     fn creates_inserts_and_selects() {
         let mut db = Database::new();
         db.execute("CREATE TABLE users (id INTEGER NOT NULL, name TEXT)").unwrap();
