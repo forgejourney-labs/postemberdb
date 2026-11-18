@@ -36,19 +36,24 @@ This file tracks implemented behavior separately from planned work. A checked bo
 
 ## 3. Page-oriented storage
 
-- [x] Fixed 4 KiB page-file snapshots.
-- [x] Page identifiers, per-page checksums, and whole-payload checksum.
-- [x] Strict page validation for canonical payload lengths, zero padding, and platform-safe length conversion.
+- [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums.
+- [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
+- [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
+- [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata is upgraded on open, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
+- [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
 - [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
-- [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
+- [x] Standalone page-backed B+ tree snapshots with immutable leaf/internal pages, redo WAL, and atomic root publication through EAM3 metadata.
+- [ ] Integrate the persistent tree as the source of truth for SQL indexes/catalog and coordinate it with the SQL transaction WAL; old-page reclamation and crash-safe vacuum remain pending.
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
-- [ ] B+ tree deletion/rebalancing, linked-leaf navigation, page serialization, and catalog/page-file integration.
+- [x] In-memory B+ tree deletion with leaf/internal borrowing, merging, root collapse, and strict occupancy validation; focused and deterministic reference tests added.
+- [x] Stack-based successor-leaf traversal for in-memory range scans.
+- [ ] Persistent leaf sibling links (optional follow-up), page serialization, persistent index nodes, and catalog/page-file integration.
 
-The native B+ tree now backs SQL index equality lookups and is also available as an in-memory range-scan primitive. Tree nodes and index entries are still memory-resident; index definitions are persisted and entries are rebuilt from rows on open. B+ tree deletion/rebalancing and page-backed persistence are not implemented. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The PPG1 snapshot format remains a physical snapshot layout, not a lazy page store. A separate experimental ExtentFile primitive persists EPG1 data pages and mirrored EAM3 metadata, including the B+ tree root page. The page_tree module builds immutable B+ tree leaf/internal pages, writes a redo record, syncs pages, and publishes the root only after page writes; startup recovery can replay a pending tree redo record. This is a standalone page-backed tree API, not yet the source of truth for SQL indexes/catalog and not yet coordinated with the SQL statement WAL. Each replacement rebuilds the complete tree and retains old pages; reclamation is pending. Database startup still reconstructs the PPG1 snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
@@ -99,7 +104,7 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 
 ## 8. Storage roadmap
 
-- [ ] EmberTree page-oriented B+ tree and extent allocator (the in-memory B+ tree core exists; page-backed integration and extent management remain pending).
+- [ ] EmberTree page-oriented B+ tree (the in-memory B+ tree and an experimental persistent extent-file primitive exist; catalog/root integration and WAL-coordinated page commits remain pending).
 - [ ] Explicit CoW and in-place update modes with crash-safe recovery.
 - [ ] FragmentationStats and manually budgeted defrag APIs.
 - [ ] Per-page LZ4/Snappy compression with decompression limits.
