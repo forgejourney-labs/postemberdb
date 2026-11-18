@@ -158,7 +158,8 @@ impl IndexKey {
 struct Index {
     column_indices: Vec<usize>,
     unique: bool,
-    entries: BPlusTree<IndexKey, Vec<usize>>,
+    /// Stable table-local row identifiers; never vector positions.
+    entries: BPlusTree<IndexKey, Vec<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,14 +188,14 @@ impl Table {
                 .ok_or_else(|| DbError::ColumnNotFound(name.clone()))
         }).collect::<Result<Vec<_>, _>>()?;
         let mut index = Index { column_indices, unique, entries: BPlusTree::new() };
-        for (row_index, row) in self.rows.iter().enumerate() {
+        for row in &self.rows {
             let key = IndexKey::from_columns(&row.values, &index.column_indices);
-            let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
-            if unique && !positions.is_empty() {
+            let mut row_ids = index.entries.get(&key).cloned().unwrap_or_default();
+            if unique && !row_ids.is_empty() {
                 return Err(DbError::Constraint(format!("duplicate key while building unique index {index_name}")));
             }
-            positions.push(row_index);
-            index.entries.insert(key, positions);
+            row_ids.push(row.row_id);
+            index.entries.insert(key, row_ids);
         }
         self.indexes.insert(index_name, index);
         Ok(())
@@ -212,13 +213,96 @@ impl Table {
         Ok(())
     }
 
+    /// Validates a single-column UPDATE against every unique index it changes.
+    /// All rows in the statement are considered together, so a bulk update
+    /// cannot introduce duplicates among the rows being changed.
+    fn validate_unique_update(
+        &self,
+        row_positions: &[usize],
+        target_column: usize,
+        new_value: &Value,
+    ) -> Result<(), DbError> {
+        let changing_ids = row_positions.iter()
+            .filter_map(|position| self.rows.get(*position).map(|row| row.row_id))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for (name, index) in &self.indexes {
+            if !index.unique || !index.column_indices.contains(&target_column) {
+                continue;
+            }
+
+            let mut seen = std::collections::BTreeSet::new();
+            for row in &self.rows {
+                if changing_ids.contains(&row.row_id) {
+                    continue;
+                }
+                seen.insert(IndexKey::from_columns(&row.values, &index.column_indices));
+            }
+
+            for position in row_positions {
+                let Some(row) = self.rows.get(*position) else { continue; };
+                let mut values = row.values.clone();
+                values[target_column] = new_value.clone();
+                let key = IndexKey::from_columns(&values, &index.column_indices);
+                if !seen.insert(key) {
+                    return Err(DbError::Constraint(format!("duplicate key for unique index {name}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_row_id(index: &mut Index, key: IndexKey, row_id: u64) {
+        let mut row_ids = index.entries.get(&key).cloned().unwrap_or_default();
+        match row_ids.binary_search(&row_id) {
+            Ok(_) => return,
+            Err(position) => row_ids.insert(position, row_id),
+        }
+        index.entries.insert(key, row_ids);
+    }
+
+    fn remove_row_id(index: &mut Index, key: &IndexKey, row_id: u64) {
+        let Some(mut row_ids) = index.entries.get(key).cloned() else { return; };
+        if let Ok(position) = row_ids.binary_search(&row_id) {
+            row_ids.remove(position);
+        } else {
+            return;
+        }
+        if row_ids.is_empty() {
+            index.entries.remove(key);
+        } else {
+            index.entries.insert(key.clone(), row_ids);
+        }
+    }
+
     fn index_row(&mut self, row_index: usize) {
         let row = &self.rows[row_index];
+        let row_id = row.row_id;
         for index in self.indexes.values_mut() {
             let key = IndexKey::from_columns(&row.values, &index.column_indices);
-            let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
-            positions.push(row_index);
-            index.entries.insert(key, positions);
+            Self::insert_row_id(index, key, row_id);
+        }
+    }
+
+    fn remove_index_row(&mut self, row: &Row) {
+        for index in self.indexes.values_mut() {
+            let key = IndexKey::from_columns(&row.values, &index.column_indices);
+            Self::remove_row_id(index, &key, row.row_id);
+        }
+    }
+
+    /// Updates only index trees whose key actually changes for this row.
+    fn reindex_row(&mut self, row_index: usize, old_values: &[Value]) {
+        let row = &self.rows[row_index];
+        let row_id = row.row_id;
+        for index in self.indexes.values_mut() {
+            let old_key = IndexKey::from_columns(old_values, &index.column_indices);
+            let new_key = IndexKey::from_columns(&row.values, &index.column_indices);
+            if old_key == new_key {
+                continue;
+            }
+            Self::remove_row_id(index, &old_key, row_id);
+            Self::insert_row_id(index, new_key, row_id);
         }
     }
 
@@ -232,13 +316,19 @@ impl Table {
     fn rebuild_indexes(&mut self) {
         for index in self.indexes.values_mut() {
             index.entries.clear();
-            for (row_index, row) in self.rows.iter().enumerate() {
+            for row in &self.rows {
                 let key = IndexKey::from_columns(&row.values, &index.column_indices);
-                let mut positions = index.entries.get(&key).cloned().unwrap_or_default();
-            positions.push(row_index);
-            index.entries.insert(key, positions);
+                let mut row_ids = index.entries.get(&key).cloned().unwrap_or_default();
+                row_ids.push(row.row_id);
+                index.entries.insert(key, row_ids);
             }
         }
+    }
+
+    fn positions_for_row_ids(&self, row_ids: &[u64]) -> Vec<usize> {
+        row_ids.iter()
+            .filter_map(|row_id| self.row_positions.get(row_id).copied())
+            .collect()
     }
 
     fn matching_rows_for_predicates(&self, predicates: &[(usize, Value)]) -> Vec<usize> {
@@ -246,7 +336,9 @@ impl Table {
         if let Some(index) = self.indexes.values().find(|index| index.column_indices == columns) {
             let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
             let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
-            return index.entries.get(&key).cloned().unwrap_or_default();
+            return index.entries.get(&key)
+                .map(|row_ids| self.positions_for_row_ids(row_ids))
+                .unwrap_or_default();
         }
         let (first_column, first_value) = &predicates[0];
         self.matching_rows(*first_column, first_value).into_iter().filter(|row_index| {
@@ -265,7 +357,9 @@ impl Table {
             let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
             let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
             return index.entries.get(&key)
-                .map(|rows| rows.iter().take(take).copied().collect())
+                .map(|row_ids| row_ids.iter().take(take)
+                    .filter_map(|row_id| self.row_positions.get(row_id).copied())
+                    .collect())
                 .unwrap_or_default();
         }
 
@@ -276,7 +370,8 @@ impl Table {
             let Some(candidates) = index.entries.get(&IndexKey::from(first_value)) else {
                 return Vec::new();
             };
-            return candidates.iter().copied()
+            return candidates.iter()
+                .filter_map(|row_id| self.row_positions.get(row_id).copied())
                 .filter(|row_index| predicates.iter().all(|(column_index, value)| {
                     self.rows[*row_index].values[*column_index] == *value
                 }))
@@ -293,7 +388,9 @@ impl Table {
 
     fn matching_rows(&self, column_index: usize, value: &Value) -> Vec<usize> {
         if let Some(index) = self.indexes.values().find(|index| index.column_indices.len() == 1 && index.column_indices[0] == column_index) {
-            index.entries.get(&IndexKey::from(value)).cloned().unwrap_or_default()
+            index.entries.get(&IndexKey::from(value))
+                .map(|row_ids| self.positions_for_row_ids(row_ids))
+                .unwrap_or_default()
         } else {
             self.rows.iter().enumerate()
                 .filter_map(|(row_index, row)| (row.values[column_index] == *value).then_some(row_index))
@@ -688,7 +785,7 @@ impl Database {
         if !upsert_clause.trim().is_empty() {
             let existing_row_index = table.indexes.values().filter(|index| index.unique).find_map(|index| {
                 let key = IndexKey::from_columns(&values, &index.column_indices);
-                index.entries.get(&key).and_then(|positions| positions.first()).copied()
+                index.entries.get(&key).and_then(|row_ids| row_ids.first()).and_then(|row_id| table.row_positions.get(row_id)).copied()
             });
             let old_row = existing_row_index.and_then(|position| table.rows.get(position).cloned());
             if apply_upsert(table, &values, upsert_clause)? {
@@ -752,11 +849,15 @@ impl Database {
             } else {
                 (0..table.rows.len()).collect()
             };
+            table.validate_unique_update(&matching, target_index, &new_value)?;
             let old_rows = matching.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
             for row_index in &matching {
-                table.rows[*row_index].values[target_index] = new_value.clone();
+                let old_values = table.rows[*row_index].values.clone();
+                if old_values[target_index] != new_value {
+                    table.rows[*row_index].values[target_index] = new_value.clone();
+                    table.reindex_row(*row_index, &old_values);
+                }
             }
-            table.rebuild_indexes();
             let new_rows = old_rows.iter().filter_map(|old| {
                 table.row_positions.get(&old.row_id).and_then(|position| table.rows.get(*position)).cloned()
             }).collect::<Vec<_>>();
@@ -789,12 +890,14 @@ impl Database {
             };
             let old_rows = matches.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
             let before = table.rows.len();
+            for row in &old_rows {
+                table.remove_index_row(row);
+            }
             let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
                 .collect::<Vec<_>>();
             table.rows = retained;
             table.rebuild_row_positions();
-            table.rebuild_indexes();
             let removed = before - table.rows.len();
             let deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
             (removed, deltas)
@@ -1669,4 +1772,73 @@ mod tests {
         db.execute("CREATE TABLE metrics (value INTEGER)").unwrap();
         assert!(db.execute("INSERT INTO metrics VALUES ('wrong')").is_err());
     }
+    #[test]
+    fn in_memory_indexes_store_stable_row_ids_and_update_incrementally() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE indexed_events (player TEXT, bucket TEXT, score INTEGER)").unwrap();
+        db.execute("INSERT INTO indexed_events VALUES ('a', 'hot', 1)").unwrap();
+        db.execute("INSERT INTO indexed_events VALUES ('b', 'hot', 2)").unwrap();
+        db.execute("INSERT INTO indexed_events VALUES ('c', 'hot', 3)").unwrap();
+        db.execute("CREATE INDEX idx_events_bucket ON indexed_events (bucket)").unwrap();
+
+        let original = db.execute("SELECT * FROM indexed_events WHERE bucket = 'hot'").unwrap()
+            .rows.into_iter().map(|row| row.row_id).collect::<Vec<_>>();
+        assert_eq!(original, vec![1, 2, 3]);
+        {
+            let table = db.tables.get("indexed_events").unwrap();
+            let key = IndexKey::from(&Value::Text("hot".into()));
+            assert_eq!(
+                table.indexes.get("idx_events_bucket").unwrap().entries.get(&key).unwrap(),
+                &vec![1, 2, 3],
+                "the in-memory index stores stable row IDs, not vector offsets"
+            );
+        }
+
+        db.execute("DELETE FROM indexed_events WHERE player = 'a'").unwrap();
+        let remaining = db.execute("SELECT * FROM indexed_events WHERE bucket = 'hot'").unwrap()
+            .rows.into_iter().map(|row| row.row_id).collect::<Vec<_>>();
+        assert_eq!(remaining, vec![2, 3], "compaction must not invalidate index references");
+
+        db.execute("UPDATE indexed_events SET bucket = 'cold' WHERE player = 'c'").unwrap();
+        assert_eq!(db.execute("SELECT * FROM indexed_events WHERE bucket = 'hot'").unwrap()
+            .rows.into_iter().map(|row| row.row_id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(db.execute("SELECT * FROM indexed_events WHERE bucket = 'cold'").unwrap()
+            .rows.into_iter().map(|row| row.row_id).collect::<Vec<_>>(), vec![3]);
+
+        db.execute("UPDATE indexed_events SET score = 99 WHERE player = 'b'").unwrap();
+        assert_eq!(db.execute("SELECT score FROM indexed_events WHERE bucket = 'hot'").unwrap().rows[0].values[0], Value::Integer(99));
+    }
+
+    #[test]
+    fn indexed_upsert_rekeys_only_the_affected_secondary_entry() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE indexed_upserts (sku TEXT PRIMARY KEY, category TEXT, quantity INTEGER)").unwrap();
+        db.execute("CREATE INDEX idx_upserts_category ON indexed_upserts (category)").unwrap();
+        db.execute("INSERT INTO indexed_upserts VALUES ('book', 'old', 1)").unwrap();
+        let original_id = db.execute("SELECT * FROM indexed_upserts WHERE sku = 'book'").unwrap().rows[0].row_id;
+
+        db.execute("INSERT INTO indexed_upserts VALUES ('book', 'new', 5) ON CONFLICT (sku) DO UPDATE SET category = EXCLUDED.category, quantity = EXCLUDED.quantity").unwrap();
+
+        assert!(db.execute("SELECT * FROM indexed_upserts WHERE category = 'old'").unwrap().rows.is_empty());
+        let updated = db.execute("SELECT * FROM indexed_upserts WHERE category = 'new'").unwrap();
+        assert_eq!(updated.rows.len(), 1);
+        assert_eq!(updated.rows[0].row_id, original_id);
+        assert_eq!(updated.rows[0].values[2], Value::Integer(5));
+    }
+
+    #[test]
+    fn unique_index_rejects_bulk_update_duplicates_atomically() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE unique_updates (group_name TEXT, email TEXT)").unwrap();
+        db.execute("CREATE UNIQUE INDEX idx_unique_email ON unique_updates (email)").unwrap();
+        db.execute("INSERT INTO unique_updates VALUES ('team', 'a@example.test')").unwrap();
+        db.execute("INSERT INTO unique_updates VALUES ('team', 'b@example.test')").unwrap();
+
+        assert!(db.execute("UPDATE unique_updates SET email = 'same@example.test' WHERE group_name = 'team'").is_err());
+        let rows = db.execute("SELECT * FROM unique_updates").unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0].values[1], Value::Text("a@example.test".into()));
+        assert_eq!(rows.rows[1].values[1], Value::Text("b@example.test".into()));
+    }
+
 }
