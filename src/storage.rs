@@ -135,7 +135,7 @@ impl Database {
                     return Err(DbError::Storage(format!("zero stable row identifier in table {name}")));
                 }
                 out.extend_from_slice(&row.row_id.to_le_bytes());
-                if row.values.len() != table.columns.len()) {
+                if row.values.len() != table.columns.len() {
                     return Err(DbError::Storage(format!("row width mismatch in table {name}")));
                 }
                 for value in &row.values {
@@ -711,12 +711,15 @@ fn collect_ember_index_entries(
                 if disk_key.len() > 1015 {
                     return Ok(None);
                 }
-                for row in rows {
-                    let row = u64::try_from(row)
-                        .map_err(|_| DbError::Storage("SQL row reference does not fit in u64".into()))?;
+                for row_position in rows {
+                    let row = table.rows.get(*row_position)
+                        .ok_or_else(|| DbError::Storage("in-memory SQL index contains an invalid row position".into()))?;
+                    if row.row_id == 0 {
+                        return Err(DbError::Storage("in-memory SQL row has a zero stable identifier".into()));
+                    }
                     let mut entry_key = disk_key.clone();
                     entry_key.push(0);
-                    entry_key.extend_from_slice(&row.to_be_bytes());
+                    entry_key.extend_from_slice(&row.row_id.to_be_bytes());
                     entries.insert(entry_key);
                 }
             }
@@ -740,7 +743,7 @@ pub(crate) fn lookup_ember_index(
     index_name: &str,
     key: &super::IndexKey,
     limit: Option<usize>,
-) -> Result<Option<Vec<usize>>, DbError> {
+) -> Result<Option<Vec<u64>>, DbError> {
     let page_path = page_tree_file_path(database_path);
     if !page_path.exists() {
         return Ok(None);
@@ -769,9 +772,11 @@ pub(crate) fn lookup_ember_index(
         if entry_key.len() != lower.len() {
             return Err(DbError::Storage("malformed persistent SQL index row-reference key".into()));
         }
-        let value = u64::from_be_bytes(entry_key[entry_key.len() - 8..].try_into().unwrap());
-        rows.push(usize::try_from(value)
-            .map_err(|_| DbError::Storage("persistent SQL row reference does not fit this platform".into()))?);
+        let row_id = u64::from_be_bytes(entry_key[entry_key.len() - 8..].try_into().unwrap());
+        if row_id == 0 {
+            return Err(DbError::Storage("persistent SQL index contains a zero stable row identifier".into()));
+        }
+        rows.push(row_id);
     }
     Ok(Some(rows))
 }
