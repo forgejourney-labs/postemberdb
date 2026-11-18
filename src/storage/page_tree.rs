@@ -145,6 +145,97 @@ pub(crate) fn remove_many(
     Ok(removed)
 }
 
+
+/// Applies removals and upserts as one copy-on-write transaction. Removals are
+/// evaluated first and upserts second, so an upsert wins if a key appears in
+/// both lists. The complete mutation set shares one redo record and one root
+/// publication, avoiding an observable intermediate tree state.
+pub(crate) fn apply_mutations(
+    store: &mut ExtentFile,
+    wal_path: &Path,
+    removals: &[Vec<u8>],
+    upserts: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(usize, usize), DbError> {
+    recover(store, wal_path)?;
+    for key in removals {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(DbError::Storage("B+ tree keys must contain 1..=1024 bytes".into()));
+        }
+    }
+    for (key, value) in upserts {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(DbError::Storage("B+ tree keys must contain 1..=1024 bytes".into()));
+        }
+        if value.len() > super::extent::page_payload_size() {
+            return Err(DbError::Storage("B+ tree value exceeds one page".into()));
+        }
+    }
+    if removals.is_empty() && upserts.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut staged = Vec::new();
+    let mut root = store.root_page_id();
+    let mut removed_count = 0usize;
+    let mut inserted_count = 0usize;
+
+    for key in removals {
+        let Some(root_id) = root else { break; };
+        if !contains_staged(store, &staged, root_id, key)? {
+            continue;
+        }
+        root = delete_recursive(store, &mut staged, root_id, key)?.map(|node| node.page_id);
+        removed_count += 1;
+        if let Some(mut root_id) = root {
+            loop {
+                match read_staged_node(store, &staged, root_id)? {
+                    DecodedNode::Internal(children) if children.len() == 1 => root_id = children[0].1,
+                    _ => break,
+                }
+            }
+            root = Some(root_id);
+        }
+    }
+
+    for (key, value) in upserts {
+        root = Some(match root {
+            None => {
+                let id = store.allocate_extent(1)?;
+                staged.push((id, encode_leaf(&[(key.clone(), value.clone())])?));
+                id
+            }
+            Some(root_id) => {
+                let replacements = insert_recursive(store, &mut staged, root_id, key, value)?;
+                if replacements.len() == 1 {
+                    replacements[0].page_id
+                } else {
+                    let id = store.allocate_extent(1)?;
+                    let children = replacements.iter().map(|node| NodeRef {
+                        page_id: node.page_id,
+                        first_key: node.first_key.clone(),
+                    }).collect::<Vec<_>>();
+                    staged.push((id, encode_internal(&children)?));
+                    id
+                }
+            }
+        });
+        inserted_count += 1;
+    }
+
+    if removed_count == 0 && inserted_count == 0 {
+        return Ok((0, 0));
+    }
+    let frame = encode_wal(root.unwrap_or(EMPTY_ROOT), &staged)?;
+    write_wal(wal_path, &frame)?;
+    for (page_id, payload) in &staged {
+        store.write_page(*page_id, payload)?;
+    }
+    store.publish_root(root)?;
+    validate_tree(store)?;
+    truncate_wal(wal_path)?;
+    Ok((removed_count, inserted_count))
+}
+
 fn contains_staged(
     store: &mut ExtentFile,
     staged: &[(u64, Vec<u8>)],
@@ -936,6 +1027,43 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn mixed_mutations_publish_once_and_recover_atomically() {
+        let (path, wal) = paths("mixed-mutations");
+        let mut store = ExtentFile::open(&path).unwrap();
+        replace_all(&mut store, &wal, &[
+            (b"alpha".to_vec(), b"old-a".to_vec()),
+            (b"beta".to_vec(), b"old-b".to_vec()),
+            (b"delta".to_vec(), b"old-d".to_vec()),
+        ]).unwrap();
+        let previous_root = store.root_page_id();
+        let (removed, upserted) = apply_mutations(
+            &mut store,
+            &wal,
+            &[b"beta".to_vec(), b"missing".to_vec()],
+            &[
+                (b"alpha".to_vec(), b"new-a".to_vec()),
+                (b"gamma".to_vec(), b"new-c".to_vec()),
+                (b"beta".to_vec(), b"restored-b".to_vec()),
+            ],
+        ).unwrap();
+        assert_eq!((removed, upserted), (1, 3));
+        assert_ne!(store.root_page_id(), previous_root);
+        assert_eq!(get(&mut store, b"alpha").unwrap(), Some(b"new-a".to_vec()));
+        assert_eq!(get(&mut store, b"beta").unwrap(), Some(b"restored-b".to_vec()));
+        assert_eq!(get(&mut store, b"gamma").unwrap(), Some(b"new-c".to_vec()));
+        assert_eq!(get(&mut store, b"delta").unwrap(), Some(b"old-d".to_vec()));
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        recover(&mut reopened, &wal).unwrap();
+        validate_tree(&mut reopened).unwrap();
+        assert_eq!(scan_range(&mut reopened, b"alpha", b"delta").unwrap().len(), 4);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
     fn cow_tree_round_trips_and_publishes_new_root() {
         let (path, wal) = paths("roundtrip");
         let entries = (0..800).map(|n: u64| (format!("key-{n:04}").into_bytes(), format!("value-{n}").into_bytes())).collect::<Vec<_>>();
