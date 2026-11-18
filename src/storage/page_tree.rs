@@ -141,32 +141,49 @@ pub(crate) fn scan_range(
     lower: &[u8],
     upper: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
+    scan_range_limited(store, lower, upper, None)
+}
+
+/// Scans an inclusive key range and stops as soon as the requested number of
+/// entries has been collected. Internal separators prune subtrees outside the
+/// upper bound, so LIMIT queries do not traverse the remainder of the tree.
+pub(crate) fn scan_range_limited(
+    store: &mut ExtentFile,
+    lower: &[u8],
+    upper: &[u8],
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
     let mut out = Vec::new();
-    if lower > upper { return Ok(out); }
+    if lower > upper || limit == Some(0) { return Ok(out); }
     let Some(root) = store.root_page_id() else { return Ok(out); };
-    scan_node(store, root, lower, upper, &mut out)?;
+    scan_node_limited(store, root, lower, upper, limit, &mut out)?;
     Ok(out)
 }
 
-fn scan_node(
+fn scan_node_limited(
     store: &mut ExtentFile,
     page_id: u64,
     lower: &[u8],
     upper: &[u8],
+    limit: Option<usize>,
     out: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<(), DbError> {
+    if limit.is_some_and(|maximum| out.len() >= maximum) { return Ok(()); }
     match decode_node(&store.read_page(page_id)?)? {
         DecodedNode::Leaf(entries) => {
             let start = entries.partition_point(|(key, _)| key.as_slice() < lower);
-            for (key, value) in entries.into_iter().skip(start) {
-                if key.as_slice() > upper { break; }
+            let end = entries.partition_point(|(key, _)| key.as_slice() <= upper);
+            for (key, value) in entries.into_iter().take(end).skip(start) {
                 out.push((key, value));
+                if limit.is_some_and(|maximum| out.len() >= maximum) { break; }
             }
         }
         DecodedNode::Internal(children) => {
             let first = children[1..].partition_point(|(separator, _)| separator.as_slice() <= lower);
-            for (_, child) in children.into_iter().skip(first) {
-                scan_node(store, child, lower, upper, out)?;
+            for (first_key, child) in children.into_iter().skip(first) {
+                if first_key.as_slice() > upper { break; }
+                scan_node_limited(store, child, lower, upper, limit, out)?;
+                if limit.is_some_and(|maximum| out.len() >= maximum) { break; }
             }
         }
     }
@@ -476,6 +493,27 @@ mod tests {
         recover(&mut store, &wal).unwrap();
         assert_eq!(store.root_page_id(), Some(page_id));
         assert_eq!(get(&mut store, b"durable").unwrap(), Some(b"value".to_vec()));
+        drop(store);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn bounded_range_scan_stops_at_limit_and_prunes_outside_subtrees() {
+        let (path, wal) = paths("bounded-scan");
+        let entries = (0..1200)
+            .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut store = ExtentFile::open(&path).unwrap();
+        replace_all(&mut store, &wal, &entries).unwrap();
+
+        let limited = scan_range_limited(&mut store, b"key-0200", b"key-0999", Some(7)).unwrap();
+        assert_eq!(limited.len(), 7);
+        assert_eq!(limited.first().unwrap().0, b"key-0200");
+        assert_eq!(limited.last().unwrap().0, b"key-0206");
+        assert!(scan_range_limited(&mut store, b"key-0200", b"key-0999", Some(0)).unwrap().is_empty());
+        assert_eq!(scan_range_limited(&mut store, b"key-0200", b"key-0202", None).unwrap().len(), 3);
+
         drop(store);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
