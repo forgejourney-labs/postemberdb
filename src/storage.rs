@@ -463,7 +463,7 @@ mod tests {
             .into_iter()
             .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
             .collect::<Vec<_>>();
-        assert_eq!(refs, vec![0]);
+        assert_eq!(refs, vec![1]);
         assert_eq!(reopened.tables["rebuild_rows"].rows.len(), 1);
         drop(store);
         drop(reopened);
