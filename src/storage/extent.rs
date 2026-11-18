@@ -19,9 +19,9 @@ const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 const METADATA_HEADER_SIZE: usize = 36;
 const EXTENT_ENTRY_SIZE: usize = 16;
 const MAX_FREE_EXTENTS: usize = (PAGE_SIZE - METADATA_HEADER_SIZE) / EXTENT_ENTRY_SIZE;
-const METADATA_MAGIC: &[u8; 4] = b"EAM1";
+const METADATA_MAGIC: &[u8; 4] = b"EAM2";
 const DATA_PAGE_MAGIC: &[u8; 4] = b"EPG1";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AllocatorMetadata {
@@ -83,15 +83,38 @@ impl ExtentFile {
             return Err(DbError::Storage("extent file is shorter than its metadata area".into()));
         }
 
-        let slot0 = read_metadata_slot(&mut file, 0)?;
-        let slot1 = read_metadata_slot(&mut file, 1)?;
+        let slot0 = read_metadata_slot(&mut file, 0);
+        let slot1 = read_metadata_slot(&mut file, 1);
         let metadata = match (slot0, slot1) {
-            (Some(left), Some(right)) => {
-                if left.generation >= right.generation { left } else { right }
+            (Ok(Some(left)), Ok(Some(right))) => {
+                if left.generation > right.generation {
+                    left
+                } else if right.generation > left.generation {
+                    right
+                } else if left == right {
+                    left
+                } else {
+                    return Err(DbError::Storage(
+                        "extent metadata slots disagree at the same generation".into(),
+                    ));
+                }
             }
-            (Some(valid), None) | (None, Some(valid)) => valid,
-            (None, None) => {
+            (Ok(Some(valid)), Ok(None))
+            | (Ok(None), Ok(Some(valid))
+            | (Ok(Some(valid)), Err(_))
+            | (Err(_), Ok(Some(valid))) => valid,
+            (Ok(None), Ok(None)) => {
                 return Err(DbError::Storage("both extent metadata slots are empty".into()));
+            }
+            (Ok(None), Err(error)) | (Err(error), Ok(None)) => {
+                return Err(DbError::Storage(format!(
+                    "one extent metadata slot is empty and the other is invalid: {error}"
+                )));
+            }
+            (Err(left), Err(right)) => {
+                return Err(DbError::Storage(format!(
+                    "both extent metadata slots are invalid (slot 0: {left}; slot 1: {right})"
+                )));
             }
         };
 
@@ -212,8 +235,17 @@ impl ExtentFile {
         next.generation = self.metadata.generation.checked_add(1)
             .ok_or_else(|| DbError::Storage("extent metadata generation exhausted".into()))?;
         let encoded = encode_metadata(&next)?;
-        let slot = next.generation % METADATA_SLOTS;
-        write_at(&mut self.file, slot * PAGE_SIZE as u64, &encoded)?;
+        let first_slot = next.generation % METADATA_SLOTS;
+        let second_slot = (first_slot + 1) % METADATA_SLOTS;
+
+        // Persist the new generation to one slot, then mirror it to the other.
+        // After this method returns, either metadata slot independently contains
+        // the acknowledged generation. If a crash interrupts the first write,
+        // the untouched slot still contains the previous generation; if it
+        // interrupts the mirror, the first slot already contains the new one.
+        write_at(&mut self.file, first_slot * PAGE_SIZE as u64, &encoded)?;
+        self.file.sync_all().map_err(storage_error)?;
+        write_at(&mut self.file, second_slot * PAGE_SIZE as u64, &encoded)?;
         self.file.sync_all().map_err(storage_error)?;
         self.metadata = next;
         Ok(())
@@ -557,25 +589,27 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_nonempty_metadata_slot_fails_closed() {
+    fn redundant_metadata_slot_recovers_latest_generation() {
         let path = temp_path();
         let mut store = ExtentFile::open(&path).unwrap();
-        store.allocate_page(b"durably-allocated").unwrap();
+        let page_id = store.allocate_page(b"durably-allocated").unwrap();
         drop(store);
 
-        // Generation two is stored in slot zero. A valid older generation must
-        // not be used to roll back an allocation that was already acknowledged.
+        // A successful metadata commit mirrors its generation to both slots.
+        // Corrupting either copy must not roll back the acknowledged allocation.
         let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"bad!").unwrap();
         file.sync_all().unwrap();
         drop(file);
 
-        let error = match ExtentFile::open(&path) {
-            Ok(_) => panic!("corrupt committed metadata must not roll back silently"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("invalid extent metadata magic"));
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.read_page(page_id).unwrap(), b"durably-allocated");
+        assert_eq!(reopened.stats().allocated_pages, 1);
+        let next_page = reopened.allocate_page(b"after-recovery").unwrap();
+        assert_eq!(next_page, 1);
+        assert_eq!(reopened.read_page(next_page).unwrap(), b"after-recovery");
+        drop(reopened);
         fs::remove_file(path).unwrap();
     }
 
