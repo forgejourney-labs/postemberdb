@@ -36,7 +36,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 
 ## 3. Page-oriented storage
 
-- [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums; current PDB5 payloads persist stable table-local row identifiers, while PDB4 and older formats remain readable.
+- [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums; current PDB5 payloads persist stable table-local row identifiers and their monotonic next-ID counters, while PDB4 and older formats remain readable.
 - [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
