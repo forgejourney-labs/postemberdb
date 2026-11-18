@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn reuses_lowest_page_id_and_coalesces_free_space_implicitly() {
+    fn reuses_lowest_page_id_in_sorted_order() {
         let mut allocator = PageAllocator::with_existing_pages(5);
         allocator.release(3).unwrap();
         allocator.release(1).unwrap();
