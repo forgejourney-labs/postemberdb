@@ -720,6 +720,10 @@ mod tests {
         };
         insert_or_replace(&mut store, &wal, b"key-0350", b"updated").unwrap();
         assert_eq!(get(&mut store, b"key-0350").unwrap(), Some(b"updated".to_vec()));
+        // Force a byte-balanced leaf split with a large but valid value near
+        // the start of the first leaf, while retaining the distant subtrees.
+        insert_or_replace(&mut store, &wal, b"key-0000a", &vec![b'x'; 2500]).unwrap();
+        assert_eq!(get(&mut store, b"key-0000a").unwrap(), Some(vec![b'x'; 2500]));
         assert_ne!(store.root_page_id(), Some(old_root));
         assert_eq!(get(&mut store, b"key-0699").unwrap(), Some(699u64.to_le_bytes().to_vec()));
         let new_root_children = match decode_node(&store.read_page(store.root_page_id().unwrap()).unwrap()).unwrap() {
@@ -731,6 +735,7 @@ mod tests {
         let mut reopened = ExtentFile::open(&path).unwrap();
         recover(&mut reopened, &wal).unwrap();
         assert_eq!(get(&mut reopened, b"key-0350").unwrap(), Some(b"updated".to_vec()));
+        assert_eq!(get(&mut reopened, b"key-0000a").unwrap(), Some(vec![b'x'; 2500]));
         drop(reopened);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
