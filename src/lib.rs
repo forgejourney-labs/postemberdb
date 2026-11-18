@@ -100,6 +100,7 @@ struct Table {
 pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
+    wal_path: Option<PathBuf>,
 }
 
 impl Database {
@@ -109,6 +110,13 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "INSERT INTO");
+        if is_write && self.storage_path.is_some() {
+            return self.transaction(|transaction| transaction.execute(statement));
+        }
+        self.execute_inner(statement)
+    }
+
+    fn execute_inner(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         let result = if starts_with_kw(statement, "CREATE TABLE") {
             self.create_table(statement)
         } else if starts_with_kw(statement, "INSERT INTO") {
@@ -118,10 +126,28 @@ impl Database {
         } else {
             Err(DbError::Unsupported(statement.to_owned()))
         };
-        if result.is_ok() && is_write && self.storage_path.is_some() {
-            self.save()?;
-        }
         result
+    }
+
+    /// Run multiple SQL statements as one atomic transaction.
+    /// The transaction is durable only after its WAL commit record is synced.
+    pub fn transaction<F, T>(&mut self, operation: F) -> Result<T, DbError>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> Result<T, DbError>,
+    {
+        let staged = Database {
+            tables: self.tables.clone(),
+            storage_path: None,
+            wal_path: None,
+        };
+        let mut transaction = Transaction {
+            database: self,
+            staged,
+            statements: Vec::new(),
+        };
+        let value = operation(&mut transaction)?;
+        transaction.commit()?;
+        Ok(value)
     }
 
     /// Insert a bounded batch of rows in one operation.
@@ -288,6 +314,36 @@ fn validate_value(column: &Column, value: &Value) -> Result<(), DbError> {
         (DataType::Boolean, Value::Boolean(_)));
     if valid { Ok(()) } else {
         Err(DbError::TypeMismatch { column: column.name.clone(), expected: column.data_type.clone() })
+    }
+}
+
+
+/// A transaction stages changes privately until its commit record is durable.
+pub struct Transaction<'a> {
+    database: &'a mut Database,
+    staged: Database,
+    statements: Vec<String>,
+}
+
+impl Transaction<'_> {
+    /// Execute SQL against the transaction's private view.
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let statement = sql.trim().trim_end_matches(';').trim();
+        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "INSERT INTO");
+        let result = self.staged.execute_inner(statement)?;
+        if is_write {
+            self.statements.push(statement.to_owned());
+        }
+        Ok(result)
+    }
+
+    /// Commit all staged writes as one WAL transaction.
+    pub fn commit(self) -> Result<(), DbError> {
+        if !self.statements.is_empty() && self.database.wal_path.is_some() {
+            self.database.append_wal_transaction(&self.statements)?;
+        }
+        self.database.tables = self.staged.tables;
+        Ok(())
     }
 }
 
