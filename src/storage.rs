@@ -16,7 +16,7 @@ mod wal;
 use pages::{decode_pages, encode_pages};
 use wal::wal_file_path;
 
-const MAGIC: &[u8; 4] = b"PDB4";
+const MAGIC: &[u8; 4] = b"PDB5";
 const PAGE_MAGIC: &[u8; 4] = b"PPG1";
 const PAGE_SIZE: usize = 4096;
 const PAGE_META_SIZE: usize = 16;
@@ -131,7 +131,11 @@ impl Database {
             }
             put_u32(&mut out, checked_count(table.rows.len())?);
             for row in &table.rows {
-                if row.values.len() != table.columns.len() {
+                if row.row_id == 0 {
+                    return Err(DbError::Storage(format!("zero stable row identifier in table {name}")));
+                }
+                out.extend_from_slice(&row.row_id.to_le_bytes());
+                if row.values.len() != table.columns.len()) {
                     return Err(DbError::Storage(format!("row width mismatch in table {name}")));
                 }
                 for value in &row.values {
@@ -164,7 +168,9 @@ impl Database {
         let bytes = payload;
         let mut input = Decoder { bytes: &bytes, offset: 0 };
         let header = input.take(4)?;
-        let (format_version, wal_sequence) = if header == b"PDB4" {
+        let (format_version, wal_sequence) = if header == b"PDB5" {
+            (5, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
+        } else if header == b"PDB4" {
             (4, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
         } else if header == b"PDB3" {
             (3, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
@@ -219,7 +225,20 @@ impl Database {
             }
             let row_count = input.count()?;
             let mut rows = Vec::with_capacity(row_count);
-            for _ in 0..row_count {
+            let mut row_positions = BTreeMap::new();
+            let mut next_row_id = 1u64;
+            for row_position in 0..row_count {
+                let row_id = if format_version >= 5 {
+                    u64::from_le_bytes(input.take(8)?.try_into().unwrap())
+                } else {
+                    u64::try_from(row_position).ok().and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| DbError::Storage("legacy row count exceeds stable identifier space".into()))?
+                };
+                if row_id == 0 || row_positions.insert(row_id, row_position).is_some() {
+                    return Err(DbError::Storage("zero or duplicate stable row identifier in database file".into()));
+                }
+                next_row_id = next_row_id.max(row_id.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("stable row identifier space exhausted".into()))?);
                 let mut values = Vec::with_capacity(column_count);
                 for column in &columns {
                     let value = match input.byte()? {
@@ -241,9 +260,15 @@ impl Database {
                     if !valid { return Err(DbError::Storage(format!("invalid value for column {}", column.name))); }
                     values.push(value);
                 }
-                rows.push(Row { values });
+                rows.push(Row { row_id, values });
             }
-            let mut table = Table { columns, rows, indexes: BTreeMap::new() };
+            let mut table = Table {
+                columns,
+                rows,
+                next_row_id,
+                row_positions,
+                indexes: BTreeMap::new(),
+            };
             for (index_name, column_names, unique) in index_definitions {
                 table.add_index_columns(index_name, &column_names, unique)?;
             }
