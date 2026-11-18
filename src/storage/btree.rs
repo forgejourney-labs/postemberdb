@@ -1,9 +1,9 @@
 //! A small, engine-owned B+ tree implementation.
 //!
 //! Values live only in leaves. Internal nodes contain separator keys and child
-//! pointers. This module deliberately does not wrap std::collections::BTreeMap.
-//! The first milestone supports insertion, point lookup, bounded scans and
-//! structural validation; deletion and disk-page persistence are separate work.
+//! pointers. Range scans seek to the first matching leaf once, then move to
+//! successor leaves with an ancestor stack instead of rescanning subtrees.
+//! Nodes are still in memory; page-backed persistence is a separate layer.
 
 #[derive(Debug, Clone)]
 enum Node<K, V> {
@@ -47,6 +47,31 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
         previous
     }
 
+    /// Removes a key and returns its value. Underflow is repaired by borrowing
+    /// from a sibling or merging nodes; an unnecessary root level is collapsed.
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        let removed = remove_recursive::<K, V, ORDER>(&mut self.root, key);
+        if removed.is_none() {
+            return None;
+        }
+
+        self.len -= 1;
+        loop {
+            let collapse = matches!(&*self.root, Node::Internal { keys, .. } if keys.is_empty());
+            if !collapse {
+                break;
+            }
+            let previous = std::mem::replace(
+                &mut self.root,
+                Box::new(Node::Leaf { keys: Vec::new(), values: Vec::new() }),
+            );
+            if let Node::Internal { mut children, .. } = *previous {
+                self.root = children.remove(0);
+            }
+        }
+        removed
+    }
+
     pub(crate) fn contains_key(&self, key: &K) -> bool { self.get(key).is_some() }
 
     pub(crate) fn clear(&mut self) {
@@ -70,13 +95,74 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
     }
 
     /// Returns key/value pairs in the inclusive range, in ascending key order.
+    ///
+    /// The initial seek is O(log n). Successor leaves are then found by walking
+    /// the saved ancestor path, so a range does not recursively revisit each
+    /// internal subtree between adjacent leaves.
     pub(crate) fn scan_range(&self, lower: &K, upper: &K) -> Vec<(K, V)>
     where
         V: Clone,
     {
         let mut entries = Vec::new();
-        if lower <= upper {
-            collect_range(&self.root, lower, upper, &mut entries);
+        if lower > upper {
+            return entries;
+        }
+
+        let mut ancestors: Vec<(&Node<K, V>, usize)> = Vec::new();
+        let mut current = self.root.as_ref();
+
+        // Seek directly to the leaf that can contain the lower bound.
+        loop {
+            match current {
+                Node::Leaf { .. } => break,
+                Node::Internal { keys, children } => {
+                    let child_index = keys.partition_point(|separator| lower >= separator);
+                    ancestors.push((current, child_index));
+                    current = children[child_index].as_ref();
+                }
+            }
+        }
+
+        loop {
+            if let Node::Leaf { keys, values } = current {
+                let start = keys.partition_point(|key| key < lower);
+                for index in start..keys.len() {
+                    if keys[index] > *upper {
+                        return entries;
+                    }
+                    entries.push((keys[index].clone(), values[index].clone()));
+                }
+            }
+
+            // Find the next subtree to the right, then descend through its
+            // leftmost children to the next leaf.
+            let mut successor = None;
+            while let Some((parent, child_index)) = ancestors.pop() {
+                let Node::Internal { children, .. } = parent else {
+                    unreachable!("ancestor path contains only internal nodes");
+                };
+                if child_index + 1 < children.len() {
+                    let next_index = child_index + 1;
+                    ancestors.push((parent, next_index));
+                    let mut next = children[next_index].as_ref();
+                    loop {
+                        match next {
+                            Node::Leaf { .. } => break,
+                            Node::Internal { children, .. } => {
+                                ancestors.push((next, 0));
+                                next = children[0].as_ref();
+                            }
+                        }
+                    }
+                    successor = Some(next);
+                    break;
+                }
+            }
+
+            match successor {
+                Some(next) => current = next,
+                None => break,
+            }
         }
         entries
     }
@@ -84,7 +170,7 @@ impl<K: Ord + Clone, V, const ORDER: usize> BPlusTree<K, V, ORDER> {
     /// Checks ordering, separator correctness, occupancy and equal leaf depth.
     pub(crate) fn validate(&self) -> Result<(), String> {
         let mut leaf_depth = None;
-        validate_node(&self.root, true, 0, &mut leaf_depth)?;
+        validate_node::<K, V, ORDER>(&self.root, true, 0, &mut leaf_depth)?;
         let mut count = 0;
         count_entries(&self.root, &mut count);
         if count != self.len {
@@ -120,7 +206,7 @@ fn insert_recursive<K: Ord + Clone, V, const ORDER: usize>(
         Node::Internal { keys, children } => {
             let child_index = keys.partition_point(|separator| key >= *separator);
             let (previous, child_split) =
-                insert_recursive::<K, V, ORDER>(&mut children[child_index], key, value);
+                insert_recursive::<K, V, ORDER>(children[child_index].as_mut(), key, value);
             if let Some((separator, right_child)) = child_split {
                 keys.insert(child_index, separator);
                 children.insert(child_index + 1, right_child);
@@ -139,29 +225,201 @@ fn insert_recursive<K: Ord + Clone, V, const ORDER: usize>(
     }
 }
 
-fn collect_range<K: Ord + Clone, V: Clone>(
-    node: &Node<K, V>,
-    lower: &K,
-    upper: &K,
-    out: &mut Vec<(K, V)>,
-) {
+fn remove_recursive<K: Ord + Clone, V, const ORDER: usize>(
+    node: &mut Node<K, V>,
+    key: &K,
+) -> Option<V> {
     match node {
         Node::Leaf { keys, values } => {
-            let start = keys.partition_point(|key| key < lower);
-            for index in start..keys.len() {
-                if keys[index] > *upper { break; }
-                out.push((keys[index].clone(), values[index].clone()));
-            }
+            let index = keys.binary_search(key).ok()?;
+            keys.remove(index);
+            Some(values.remove(index))
         }
         Node::Internal { keys, children } => {
-            // A separator is the first key in its right child.
-            let first_child = keys.partition_point(|separator| lower >= separator);
-            let after_last_child = (keys.partition_point(|separator| upper >= separator) + 1)
-                .min(children.len());
-            for child_index in first_child..after_last_child {
-                collect_range(&children[child_index], lower, upper, out);
+            let child_index = keys.partition_point(|separator| key >= separator);
+            let removed = remove_recursive::<K, V, ORDER>(children[child_index].as_mut(), key);
+            if removed.is_some() {
+                if is_underfull(children[child_index].as_ref(), ORDER) {
+                    rebalance_child(keys, children, child_index, ORDER);
+                }
+                refresh_separators(keys, children);
             }
+            removed
         }
+    }
+}
+
+fn minimum_keys<K, V>(node: &Node<K, V>, order: usize) -> usize {
+    match node {
+        Node::Leaf { .. } => (order + 1) / 2,
+        Node::Internal { .. } => order / 2,
+    }
+}
+
+fn is_underfull<K, V>(node: &Node<K, V>, order: usize) -> bool {
+    let key_count = match node {
+        Node::Leaf { keys, .. } | Node::Internal { keys, .. } => keys.len(),
+    };
+    key_count < minimum_keys(node, order)
+}
+
+fn can_lend<K, V>(node: &Node<K, V>, order: usize) -> bool {
+    let key_count = match node {
+        Node::Leaf { keys, .. } | Node::Internal { keys, .. } => keys.len(),
+    };
+    key_count > minimum_keys(node, order)
+}
+
+fn rebalance_child<K: Ord + Clone, V>(
+    keys: &mut Vec<K>,
+    children: &mut Vec<Box<Node<K, V>>>,
+    child_index: usize,
+    order: usize,
+) {
+    // Prefer borrowing to merging so that parent fan-out remains stable.
+    if child_index > 0 && can_lend(children[child_index - 1].as_ref(), order) {
+        let (left_siblings, current_and_right) = children.split_at_mut(child_index);
+        borrow_from_left(
+            left_siblings[child_index - 1].as_mut(),
+            current_and_right[0].as_mut(),
+            &mut keys[child_index - 1],
+        );
+        return;
+    }
+
+    if child_index + 1 < children.len()
+        && can_lend(children[child_index + 1].as_ref(), order)
+    {
+        let (current_and_left, right_siblings) = children.split_at_mut(child_index + 1);
+        borrow_from_right(
+            current_and_left[child_index].as_mut(),
+            right_siblings[0].as_mut(),
+            &mut keys[child_index],
+        );
+        return;
+    }
+
+    if child_index > 0 {
+        let separator = keys[child_index - 1].clone();
+        {
+            let (left_siblings, current_and_right) = children.split_at_mut(child_index);
+            merge_nodes(
+                left_siblings[child_index - 1].as_mut(),
+                current_and_right[0].as_mut(),
+                &separator,
+            );
+        }
+        keys.remove(child_index - 1);
+        children.remove(child_index);
+    } else if children.len() > 1 {
+        let separator = keys[0].clone();
+        {
+            let (current, right_siblings) = children.split_at_mut(1);
+            merge_nodes(current[0].as_mut(), right_siblings[0].as_mut(), &separator);
+        }
+        keys.remove(0);
+        children.remove(1);
+    }
+}
+
+fn borrow_from_left<K: Ord + Clone, V>(
+    left: &mut Node<K, V>,
+    child: &mut Node<K, V>,
+    parent_separator: &mut K,
+) {
+    match (left, child) {
+        (
+            Node::Leaf { keys: left_keys, values: left_values },
+            Node::Leaf { keys: child_keys, values: child_values },
+        ) => {
+            let donated_key = left_keys.pop().expect("lending leaf has a key");
+            let donated_value = left_values.pop().expect("leaf key has a value");
+            child_keys.insert(0, donated_key);
+            child_values.insert(0, donated_value);
+            *parent_separator = child_keys[0].clone();
+        }
+        (
+            Node::Internal { keys: left_keys, children: left_children },
+            Node::Internal { keys: child_keys, children: child_children },
+        ) => {
+            let promoted = left_keys.pop().expect("lending internal node has a key");
+            let old_parent_separator = std::mem::replace(parent_separator, promoted);
+            child_keys.insert(0, old_parent_separator);
+            child_children.insert(0, left_children.pop().expect("lending internal node has a child"));
+        }
+        _ => unreachable!("siblings must have the same node type"),
+    }
+}
+
+fn borrow_from_right<K: Ord + Clone, V>(
+    child: &mut Node<K, V>,
+    right: &mut Node<K, V>,
+    parent_separator: &mut K,
+) {
+    match (child, right) {
+        (
+            Node::Leaf { keys: child_keys, values: child_values },
+            Node::Leaf { keys: right_keys, values: right_values },
+        ) => {
+            child_keys.push(right_keys.remove(0));
+            child_values.push(right_values.remove(0));
+            *parent_separator = right_keys[0].clone();
+        }
+        (
+            Node::Internal { keys: child_keys, children: child_children },
+            Node::Internal { keys: right_keys, children: right_children },
+        ) => {
+            let new_parent_separator = right_keys.remove(0);
+            let old_parent_separator = std::mem::replace(parent_separator, new_parent_separator);
+            child_keys.push(old_parent_separator);
+            child_children.push(right_children.remove(0));
+        }
+        _ => unreachable!("siblings must have the same node type"),
+    }
+}
+
+fn merge_nodes<K: Ord + Clone, V>(
+    left: &mut Node<K, V>,
+    right: &mut Node<K, V>,
+    parent_separator: &K,
+) {
+    match (left, right) {
+        (
+            Node::Leaf { keys: left_keys, values: left_values },
+            Node::Leaf { keys: right_keys, values: right_values },
+        ) => {
+            left_keys.extend(right_keys.drain(..));
+            left_values.extend(right_values.drain(..));
+        }
+        (
+            Node::Internal { keys: left_keys, children: left_children },
+            Node::Internal { keys: right_keys, children: right_children },
+        ) => {
+            left_keys.push(parent_separator.clone());
+            left_keys.extend(right_keys.drain(..));
+            left_children.extend(right_children.drain(..));
+        }
+        _ => unreachable!("siblings must have the same node type"),
+    }
+}
+
+fn refresh_separators<K: Ord + Clone, V>(
+    keys: &mut Vec<K>,
+    children: &[Box<Node<K, V>>],
+) {
+    keys.clear();
+    for child in children.iter().skip(1) {
+        keys.push(
+            subtree_min(child.as_ref())
+                .expect("every non-root B+ tree child must contain at least one key"),
+        );
+    }
+}
+
+fn subtree_min<K: Clone, V>(node: &Node<K, V>) -> Option<K> {
+    match node {
+        Node::Leaf { keys, .. } => keys.first().cloned(),
+        Node::Internal { children, .. } => children.first().and_then(|child| subtree_min(child)),
     }
 }
 
@@ -174,7 +432,7 @@ fn count_entries<K, V>(node: &Node<K, V>, count: &mut usize) {
     }
 }
 
-fn validate_node<K: Ord + Clone, V>(
+fn validate_node<K: Ord + Clone, V, const ORDER: usize>(
     node: &Node<K, V>,
     is_root: bool,
     depth: usize,
@@ -183,6 +441,10 @@ fn validate_node<K: Ord + Clone, V>(
     match node {
         Node::Leaf { keys, values } => {
             if keys.len() != values.len() { return Err("leaf key/value length mismatch".into()); }
+            if keys.len() > ORDER { return Err("leaf exceeds maximum key count".into()); }
+            if !is_root && keys.len() < (ORDER + 1) / 2 {
+                return Err("underfull leaf node".into());
+            }
             if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err("leaf keys are not strictly ordered".into());
             }
@@ -194,16 +456,21 @@ fn validate_node<K: Ord + Clone, V>(
             Ok(keys.first().cloned().zip(keys.last().cloned()))
         }
         Node::Internal { keys, children } => {
+            if keys.len() > ORDER { return Err("internal node exceeds maximum key count".into()); }
             if children.len() != keys.len() + 1 { return Err("internal child count mismatch".into()); }
             if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err("internal separators are not strictly ordered".into());
             }
-            if !is_root && keys.is_empty() { return Err("underfull internal node".into()); }
+            if !is_root && keys.len() < ORDER / 2 { return Err("underfull internal node".into()); }
             if is_root && children.len() < 2 { return Err("internal root has fewer than two children".into()); }
 
             let mut bounds = Vec::with_capacity(children.len());
             for child in children {
-                bounds.push(validate_node(child, false, depth + 1, leaf_depth)?);
+                let child_bounds = validate_node::<K, V, ORDER>(child, false, depth + 1, leaf_depth)?;
+                if child_bounds.is_none() {
+                    return Err("non-root child subtree is empty".into());
+                }
+                bounds.push(child_bounds);
             }
             for index in 0..keys.len() {
                 let left_max = bounds[index].as_ref().map(|(_, max)| max);
@@ -223,6 +490,7 @@ fn validate_node<K: Ord + Clone, V>(
 #[cfg(test)]
 mod tests {
     use super::BPlusTree;
+    use std::collections::BTreeMap;
 
     #[test]
     fn splits_multiple_levels_and_scans_sorted_ranges() {
@@ -258,5 +526,93 @@ mod tests {
         tree.validate().unwrap();
         tree.insert(1, 10);
         tree.validate().unwrap();
+    }
+
+    #[test]
+    fn deletion_borrows_merges_and_collapses_the_root() {
+        let mut tree = BPlusTree::<i32, i32, 3>::new();
+        for key in 0..256 {
+            tree.insert(key, key * 10);
+        }
+        tree.validate().unwrap();
+
+        // Alternating low/high removals exercise both sibling directions and
+        // force internal levels to rebalance as leaves merge.
+        let mut low = 0;
+        let mut high = 255;
+        while low <= high {
+            assert_eq!(tree.remove(&low), Some(low * 10));
+            tree.validate().unwrap();
+            if low != high {
+                assert_eq!(tree.remove(&high), Some(high * 10));
+                tree.validate().unwrap();
+            }
+            low += 1;
+            if high == 0 { break; }
+            high -= 1;
+        }
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        tree.validate().unwrap();
+        assert_eq!(tree.remove(&1), None);
+    }
+
+    #[test]
+    fn deterministic_mixed_operations_match_btree_map() {
+        let mut tree = BPlusTree::<i32, i64, 4>::new();
+        let mut reference = BTreeMap::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+
+        for step in 0..5_000i64 {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let key = ((state >> 32) % 257) as i32;
+            if state & 1 == 0 {
+                let value = step * -3;
+                assert_eq!(tree.insert(key, value), reference.insert(key, value));
+            } else {
+                assert_eq!(tree.remove(&key), reference.remove(&key));
+            }
+
+            assert_eq!(tree.len(), reference.len());
+            tree.validate().unwrap();
+            for probe in [0, key, 128, 256] {
+                assert_eq!(tree.get(&probe), reference.get(&probe));
+            }
+
+            if step % 31 == 0 {
+                let lower = (state as u32 % 200) as i32;
+                let upper = (lower + 40).min(256);
+                let actual = tree.scan_range(&lower, &upper);
+                let expected: Vec<_> = reference
+                    .range(lower..=upper)
+                    .map(|(key, value)| (*key, *value))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_missing_keys_does_not_change_tree() {
+        let mut tree = BPlusTree::<i32, i32, 3>::new();
+        for key in 0..50 { tree.insert(key, key); }
+        assert_eq!(tree.remove(&500), None);
+        assert_eq!(tree.len(), 50);
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn range_scan_crosses_many_successor_leaves_after_deletions() {
+        let mut tree = BPlusTree::<i32, i32, 3>::new();
+        for key in 0..300 { tree.insert(key, key); }
+        for key in (0..300).step_by(3) { tree.remove(&key); }
+        tree.validate().unwrap();
+
+        let actual = tree.scan_range(&91, &187);
+        let expected: Vec<_> = (91..=187)
+            .filter(|key| *key % 3 != 0)
+            .map(|key| (key, key))
+            .collect();
+        assert_eq!(actual, expected);
     }
 }
