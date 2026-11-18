@@ -26,10 +26,12 @@ The addon adds io.postemberdb.ksl.* as default imports and registers the postemb
 
 Example script call:
 
-    val result = postemberDb().queryAsync(
+    postemberDb().queryAsync(
         "SELECT balance FROM player_economy WHERE uuid = ${postemberText(player.uniqueId.toString())}"
-    ).get()
-    val balance = result.long(0, 0) ?: 0L
+    ).thenAccept { result ->
+        val balance = result.long(0, 0) ?: 0L
+        runSync { player.sendMessage("Balance: $balance") }
+    }
 
 Use queryAsync / executeAsync from script callbacks. Synchronous query and execute reject Paper's main thread to prevent server stalls. postemberText safely quotes SQL text values; keep SQL identifiers static. The current wire protocol accepts one SQL statement per line and does not yet expose native prepared statements or a transaction scope in the addon.
 
