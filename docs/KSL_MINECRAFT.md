@@ -40,11 +40,13 @@ Good initial use cases include player statistics, economy ledgers, quest progres
 - For multiple Minecraft servers sharing the same live data, use a database-server deployment; do not point multiple processes at the same embedded database file.
 - Keep periodic backups and test restore procedures.
 
-## Planned KSL adapter
+## KSL addon integration (initial implementation)
 
 The next integration layer should expose the Rust engine through a supported JVM boundary and adapt it to KSL's asynchronous database API. The adapter must preserve KSL's runtime-generation cancellation, query timeouts, result-row limits, batch limits, and transaction semantics. It must not expose raw pointers, Rust-owned buffers, or live database cursors to Kotlin scripts.
 
-This adapter is not implemented yet. The current release is a Rust library and a development TCP server, not a JDBC driver and not a drop-in replacement for SQLite, MySQL, MariaDB, or PostgreSQL.
+An initial separate addon now lives in integrations/kotlin-script-loader. It registers a postemberdb service through KSL's public addon API and exposes query/queryAsync/execute/executeAsync methods. It connects to the Rust server through the versioned JSONL/1 protocol, uses one short-lived connection per statement, and refuses non-loopback destinations. The upstream KotlinScriptLoader repository has not been modified.
+
+This is not a JDBC driver and does not make PostemberDB selectable in KSL's existing database.type setting. Prepared statements, transaction-scoped client sessions, server-side row ceilings, cancellation, and end-to-end Paper/KSL tests remain pending. The current Rust TCP server remains loopback-only and is not suitable for untrusted networks.
 
 ## Scaling roadmap
 
@@ -52,7 +54,7 @@ This adapter is not implemented yet. The current release is a Rust library and a
 2. WAL and transaction recovery, so writes do not require rewriting the complete database file.
 3. Page-oriented storage and bounded-memory scans.
 4. Secondary indexes for common predicates such as player UUID.
-5. Query limits, prepared parameters, and a stable KSL/JVM adapter.
+5. Query limits, prepared parameters, transaction-aware protocol support, and JDBC compatibility.
 6. Load tests using realistic player counts, write rates, and restart/recovery scenarios.
 
 Performance claims will be made only after reproducible benchmarks against the existing KSL SQLite path and the target deployment hardware.
@@ -124,7 +126,7 @@ Parameters are encoded from typed `Value` variants and quoted by the engine; cal
 
 ## Exact KSL adapter status
 
-KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its published dialect set is SQLite, MySQL, MariaDB, and PostgreSQL; PostemberDB is not yet a selectable KSL dialect. A production adapter therefore still needs a stable server protocol, a JDBC driver, and KSL dialect/migration support. The current Rust TCP line server is only a development interface and must not be presented as the KSL adapter.
+KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its published dialect set is SQLite, MySQL, MariaDB, and PostgreSQL; PostemberDB is not yet a selectable KSL dialect. A production adapter therefore still needs a stable server protocol, a JDBC driver, and KSL dialect/migration support. The Rust TCP server now supports the versioned JSONL/1 protocol used by the separate KSL addon. It remains a loopback-only integration protocol, not JDBC and not a production remote-network protocol.
 
 
 ## Client sessions and server transactions
@@ -143,3 +145,12 @@ The Rust SQL layer also supports `COUNT(*) AS alias` for common aggregate lookup
 
 
 The SQL subset now accepts LIMIT and applies it while collecting matching row IDs, rather than materializing every result row first. This is useful for KSL's query row ceiling, although the engine still lacks streaming ResultSet pages and a server-side query timeout/cancellation contract.
+
+
+## JSONL/1 protocol
+
+The server keeps the legacy greeting and line protocol. A client opts into JSONL/1 by sending POSTEMBERDB JSONL/1 as its first command after the greeting. The server acknowledges with a single JSON line. Each following SQL statement produces exactly one JSON response line with ok, message/error, affected_rows, columns, and typed rows. Text values are JSON-escaped; integers, booleans, and NULL retain their JSON types.
+
+The protocol still accepts one SQL statement per line, has no parameter array, and has no transaction session spanning separate client connections. The current addon uses one connection per operation. Keep the database bound to loopback; TLS and authentication are not implemented.
+
+Build and installation instructions for the addon are in integrations/kotlin-script-loader/README.md.
