@@ -20,11 +20,12 @@ The project is at an early development stage. The first prototype provides:
 - integer, text, boolean, and nullable values;
 - basic column type and `NOT NULL` validation;
 - a versioned binary on-disk format with automatic persistence after successful table creation and inserts;
+- an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - temporary-file writes followed by rename when saving the database;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** the storage layer rewrites the full database file after each successful write; it has no WAL, transactions, crash-recovery protocol, checksums, or concurrent multi-process file locking. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** WAL transactions are implemented, but the engine still replays SQL records and stores table rows in memory; page-oriented storage, indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
 
 ## Build and test
 
@@ -63,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
 2. Evolve the initial file snapshot format into page-oriented storage.
-3. Add write-ahead logging, crash recovery, and transactions.
+3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
 4. Add indexes and a cost-aware query planner.
 5. Harden the server protocol with authentication, framing, and resource limits.
 6. Add a stable KSL/JVM adapter and benchmark it against the general API.
