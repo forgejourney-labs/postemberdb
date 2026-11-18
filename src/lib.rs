@@ -12,7 +12,7 @@ mod sql;
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
-    parse_value, split_and_conditions, split_csv, starts_with_kw, take_parenthesized,
+    parse_value, split_csv, starts_with_kw, take_parenthesized, value_to_sql,
     validate_value,
 };
 
