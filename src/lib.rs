@@ -185,6 +185,17 @@ impl Database {
             }
         }
 
+        if self.storage_path.is_some() {
+            let inserted = batch.len();
+            return self.transaction(|transaction| {
+                for values in batch {
+                    let encoded = values.iter().map(value_to_sql).collect::<Vec<_>>().join(", ");
+                    transaction.execute(&format!("INSERT INTO {normalized} VALUES ({encoded})"))?;
+                }
+                Ok(inserted)
+            });
+        }
+
         let table = self.tables.get_mut(&normalized).expect("table checked above");
         let previous_len = table.rows.len();
         table.rows.extend(batch.drain(..).map(|values| Row { values }));
@@ -261,6 +272,16 @@ impl Database {
             affected_rows: 0,
             message: format!("{} row(s)", table.rows.len()),
         })
+    }
+}
+
+
+fn value_to_sql(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Integer(value) => value.to_string(),
+        Value::Boolean(value) => if *value { "TRUE".into() } else { "FALSE".into() },
+        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
     }
 }
 
@@ -398,6 +419,70 @@ mod tests {
         let rows = (0..5_001).map(|n| vec![Value::Integer(n)]);
         assert!(db.insert_many("counters", rows).is_err());
         assert_eq!(db.execute("SELECT * FROM counters").unwrap().rows.len(), 0);
+    }
+
+
+    #[test]
+    fn persistent_wal_replays_committed_sql_transaction() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.transaction(|tx| {
+                tx.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)")?;
+                tx.execute("INSERT INTO players VALUES ('abc-123', 900)")?;
+                tx.execute("INSERT INTO players VALUES ('def-456', 1200)")?;
+                Ok(())
+            }).unwrap();
+            assert!(wal_path.exists());
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened.execute("SELECT * FROM players").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], Value::Text("abc-123".into()));
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
+    }
+
+    #[test]
+    fn failed_transaction_leaves_no_partial_changes() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE values_table (value INTEGER)").unwrap();
+        let result = db.transaction(|tx| {
+            tx.execute("INSERT INTO values_table VALUES (1)")?;
+            tx.execute("INSERT INTO values_table VALUES ('bad')")?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(db.execute("SELECT * FROM values_table").unwrap().rows.len(), 0);
+    }
+
+    #[test]
+    fn persistent_bulk_insert_uses_wal_and_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-bulk-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE stats (uuid TEXT, coins INTEGER)").unwrap();
+            assert_eq!(db.insert_many("stats", vec![
+                vec![Value::Text("a'bc".into()), Value::Integer(10)],
+                vec![Value::Text("def".into()), Value::Integer(20)],
+            ]).unwrap(), 2);
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.execute("SELECT * FROM stats").unwrap().rows.len(), 2);
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
     }
 
     #[test]
