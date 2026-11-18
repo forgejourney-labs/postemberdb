@@ -610,7 +610,7 @@ mod tests {
 
         let actual = tree.scan_range(&91, &187);
         let expected: Vec<_> = (91..=187)
-            .filter(|key| key % 3 != 0)
+            .filter(|key| *key % 3 != 0)
             .map(|key| (key, key))
             .collect();
         assert_eq!(actual, expected);
