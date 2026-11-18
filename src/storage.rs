@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"PDB2";
+const MAGIC: &[u8; 4] = b"PDB3";
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING: usize = 64 * 1024 * 1024;
 
@@ -161,6 +161,13 @@ impl Database {
                 out.push(match column.data_type { DataType::Integer => 1, DataType::Text => 2, DataType::Boolean => 3 });
                 out.push(u8::from(column.nullable));
             }
+            put_u32(&mut out, checked_count(table.indexes.len())?);
+            for (index_name, index) in &table.indexes {
+                put_string(&mut out, index_name)?;
+                let column = table.columns.get(index.column_index)
+                    .ok_or_else(|| DbError::Storage("index column is outside table schema".into()))?;
+                put_string(&mut out, &column.name)?;
+            }
             put_u32(&mut out, checked_count(table.rows.len())?);
             for row in &table.rows {
                 if row.values.len() != table.columns.len() {
@@ -189,10 +196,12 @@ impl Database {
         }
         let mut input = Decoder { bytes: &bytes, offset: 0 };
         let header = input.take(4)?;
-        let wal_sequence = if header == b"PDB2" {
-            u64::from_le_bytes(input.take(8)?.try_into().unwrap())
+        let (format_version, wal_sequence) = if header == b"PDB3" {
+            (3, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
+        } else if header == b"PDB2" {
+            (2, u64::from_le_bytes(input.take(8)?.try_into().unwrap()))
         } else if header == b"PDB1" {
-            0
+            (1, 0)
         } else {
             return Err(DbError::Storage("invalid database file header".into()));
         };
@@ -216,6 +225,13 @@ impl Database {
                     _ => return Err(DbError::Storage("invalid nullable flag in database file".into())),
                 };
                 columns.push(Column { name: column_name, data_type, nullable });
+            }
+            let mut index_definitions = Vec::new();
+            if format_version >= 3 {
+                let index_count = input.count()?;
+                for _ in 0..index_count {
+                    index_definitions.push((input.string()?, input.string()?));
+                }
             }
             let row_count = input.count()?;
             let mut rows = Vec::with_capacity(row_count);
@@ -243,7 +259,11 @@ impl Database {
                 }
                 rows.push(Row { values });
             }
-            if tables.insert(name.clone(), Table { columns, rows }).is_some() {
+            let mut table = Table { columns, rows, indexes: BTreeMap::new() };
+            for (index_name, column_name) in index_definitions {
+                table.add_index(index_name, &column_name)?;
+            }
+            if tables.insert(name.clone(), table).is_some() {
                 return Err(DbError::Storage(format!("duplicate table {name} in database file")));
             }
         }
