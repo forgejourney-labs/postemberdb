@@ -7,7 +7,7 @@ This directory contains a separate KSL addon. It does not modify or vendor Kotli
 - PostemberDB remains the Rust database engine and owns the data file.
 - The addon registers a postemberdb service with KSL's public addon API.
 - Scripts use the versioned POSTEMBERDB JSONL/1 loopback protocol.
-- Each operation uses a short-lived TCP connection; asynchronous methods are available.
+- Each operation uses a short-lived TCP connection; asynchronous methods run on a bounded worker pool (1–8 workers, queue capped at 256 requests) to apply backpressure.
 - The addon refuses non-loopback hosts because the current PostemberDB server has no TLS or authentication.
 
 ## Build
@@ -33,7 +33,7 @@ Example script call:
         runSync { player.sendMessage("Balance: $balance") }
     }
 
-Use queryAsync / executeAsync from script callbacks. Synchronous query and execute reject Paper's main thread to prevent server stalls. postemberText safely quotes SQL text values; keep SQL identifiers static. The current wire protocol accepts one SQL statement per line and does not yet expose native prepared statements or a transaction scope in the addon.
+Use queryAsync / executeAsync from script callbacks. Synchronous query and execute reject Paper's main thread to prevent server stalls. postemberText safely quotes SQL text values; keep SQL identifiers static. The current wire protocol accepts one SQL statement per line and does not yet expose native prepared statements or a transaction scope in the addon. Requests beyond the bounded async queue are rejected rather than accumulated without limit.
 
 ## Protocol and safety limits
 
