@@ -377,7 +377,10 @@ mod tests {
         }
         fs::remove_file(&page_path).unwrap();
 
-        let reopened = Database::open(&path).unwrap();
+        let mut reopened = Database::open(&path).unwrap();
+        let query = reopened.execute("SELECT * FROM rebuild_rows WHERE label = 'durable'").unwrap();
+        assert_eq!(query.rows.len(), 1);
+        assert_eq!(query.rows[0].values[0], Value::Integer(7));
         let mut store = extent::ExtentFile::open(&page_path).unwrap();
         let mut disk_key = Vec::new();
         put_namespace_part(&mut disk_key, b"rebuild_rows").unwrap();
