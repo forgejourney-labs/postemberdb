@@ -1,0 +1,410 @@
+//! Standalone persistent key/value storage and a typed, registry-like hierarchy.
+
+use crate::storage::{extent::ExtentFile, page_tree};
+use crate::DbError;
+use fs2::FileExt;
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+
+const MAX_KEY_BYTES: usize = 1024;
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+/// A persistent byte-oriented key/value store backed by PostemberDB's native
+/// copy-on-write B+ Tree. Each batch is one redo-WAL transaction and one root
+/// publication. Keys are 1..=1024 bytes; values must fit alongside their keys in one leaf entry.
+pub struct KeyValueStore {
+    store: ExtentFile,
+    wal_path: PathBuf,
+    _lock_file: File,
+}
+
+impl KeyValueStore {
+    /// Opens (or creates) a KV store at the supplied logical path.
+    /// The implementation uses `.pages`, `.pages.wal`, and `.lock` sidecars.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|error| DbError::Storage(error.to_string()))?;
+            }
+        }
+        let lock_path = with_suffix(path, ".lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| DbError::Storage(error.to_string()))?;
+        FileExt::try_lock_exclusive(&lock_file)
+            .map_err(|error| DbError::Storage(format!("key/value store is already open: {error}")))?;
+
+        let pages_path = with_suffix(path, ".pages");
+        let wal_path = with_suffix(path, ".pages.wal");
+        let mut store = ExtentFile::open(&pages_path)?;
+        page_tree::recover(&mut store, &wal_path)?;
+        page_tree::validate_tree(&mut store)?;
+        Ok(Self { store, wal_path, _lock_file: lock_file })
+    }
+
+    fn validate_key(key: &[u8]) -> Result<(), DbError> {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(DbError::Constraint("key must contain 1..=1024 bytes".into()));
+        }
+        Ok(())
+    }
+
+    /// Returns the value for an exact byte key.
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
+        Self::validate_key(key)?;
+        page_tree::get(&mut self.store, key)
+    }
+
+    /// Inserts or replaces one key atomically.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), DbError> {
+        self.put_many(&[(key.to_vec(), value.to_vec())])
+    }
+
+    /// Applies multiple inserts/replacements in one CoW publication.
+    /// If a key occurs more than once, the last supplied value wins.
+    pub fn put_many(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
+        for (key, _) in entries {
+            Self::validate_key(key)?;
+        }
+        page_tree::insert_many(&mut self.store, &self.wal_path, entries)
+    }
+
+    /// Removes one key. Returns false when it did not exist.
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool, DbError> {
+        Self::validate_key(key)?;
+        let (removed, _) = page_tree::apply_mutations(
+            &mut self.store,
+            &self.wal_path,
+            &[key.to_vec()],
+            &[],
+        )?;
+        Ok(removed != 0)
+    }
+
+    /// Applies removals and upserts as one atomic page-tree transaction.
+    pub fn apply_batch(
+        &mut self,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(usize, usize), DbError> {
+        for key in removals {
+            Self::validate_key(key)?;
+        }
+        for (key, _) in upserts {
+            Self::validate_key(key)?;
+        }
+        page_tree::apply_mutations(&mut self.store, &self.wal_path, removals, upserts)
+    }
+
+    /// Returns all key/value pairs whose keys begin with the supplied prefix.
+    /// Results are in bytewise key order.
+    pub fn scan_prefix(&mut self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
+        if prefix.len() > MAX_KEY_BYTES {
+            return Err(DbError::Constraint("prefix cannot exceed 1024 bytes".into()));
+        }
+        let lower = if prefix.is_empty() { vec![0] } else { prefix.to_vec() };
+        let mut upper = prefix.to_vec();
+        upper.resize(MAX_KEY_BYTES, u8::MAX);
+        page_tree::scan_range_limited(&mut self.store, &lower, &upper, limit)
+    }
+
+    /// Removes every key under a prefix in one CoW publication.
+    pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<usize, DbError> {
+        let entries = self.scan_prefix(prefix, None)?;
+        let removals = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let (removed, _) = page_tree::apply_mutations(&mut self.store, &self.wal_path, &removals, &[])?;
+        Ok(removed)
+    }
+}
+
+/// Strongly typed values supported by the registry-like configuration tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    Binary(Vec<u8>),
+    Json(String),
+}
+
+impl RegistryValue {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = vec![1];
+        match self {
+            Self::String(value) => { out.push(1); out.extend_from_slice(value.as_bytes()); }
+            Self::Integer(value) => { out.push(2); out.extend_from_slice(&value.to_le_bytes()); }
+            Self::Boolean(value) => { out.push(3); out.push(u8::from(*value)); }
+            Self::Binary(value) => { out.push(4); out.extend_from_slice(value); }
+            Self::Json(value) => { out.push(5); out.extend_from_slice(value.as_bytes()); }
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() < 2 || bytes[0] != 1 {
+            return Err(DbError::Storage("invalid registry value encoding".into()));
+        }
+        match bytes[1] {
+            1 => Ok(Self::String(String::from_utf8(bytes[2..].to_vec())
+                .map_err(|_| DbError::Storage("registry string is not valid UTF-8".into()))?)),
+            2 if bytes.len() == 10 => Ok(Self::Integer(i64::from_le_bytes(bytes[2..10].try_into().unwrap()))),
+            3 if bytes.len() == 3 && bytes[2] <= 1 => Ok(Self::Boolean(bytes[2] == 1)),
+            4 => Ok(Self::Binary(bytes[2..].to_vec())),
+            5 => Ok(Self::Json(String::from_utf8(bytes[2..].to_vec())
+                .map_err(|_| DbError::Storage("registry JSON value is not valid UTF-8".into()))?)),
+            _ => Err(DbError::Storage("invalid registry value type or payload length".into())),
+        }
+    }
+}
+
+fn normalize_path(path: &str) -> Result<String, DbError> {
+    let mut components = Vec::new();
+    for component in path.split(|character| character == '/' || character == '\\') {
+        let component = component.trim();
+        if component.is_empty() { continue; }
+        if component == "." || component == ".." || component.contains('\0') {
+            return Err(DbError::Constraint("registry paths cannot contain '.', '..', or NUL components".into()));
+        }
+        components.push(component.to_lowercase());
+    }
+    if components.is_empty() {
+        return Err(DbError::Constraint("registry path must include a hive".into()));
+    }
+    Ok(components.join("/"))
+}
+
+fn key_record(path: &str) -> Vec<u8> {
+    let mut key = vec![b'K'];
+    key.extend_from_slice(path.as_bytes());
+    key
+}
+
+fn child_key_prefix(path: &str) -> Vec<u8> {
+    let mut key = key_record(path);
+    key.push(b'/');
+    key
+}
+
+fn value_record_prefix(path: &str) -> Vec<u8> {
+    let mut key = vec![b'V'];
+    key.extend_from_slice(path.as_bytes());
+    key.push(0);
+    key
+}
+
+/// Registry-like hierarchical configuration stored in its own persistent KV
+/// tree. Paths are case-insensitive and accept either slash style.
+pub struct Registry {
+    store: KeyValueStore,
+}
+
+impl Registry {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Ok(Self { store: KeyValueStore::open(path)? })
+    }
+
+    /// Creates a top-level hive, for example `SYSTEM` or `USERS`.
+    pub fn create_hive(&mut self, name: &str) -> Result<(), DbError> {
+        let normalized = normalize_path(name)?;
+        if normalized.contains('/') {
+            return Err(DbError::Constraint("hive name must be a single path component".into()));
+        }
+        self.store.put(&key_record(&normalized), &[1])
+    }
+
+    /// Creates a key and any missing ancestors in one atomic batch.
+    pub fn create_key(&mut self, path: &str) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        let mut current = String::new();
+        let mut entries = Vec::new();
+        for component in normalized.split('/') {
+            if !current.is_empty() { current.push('/'); }
+            current.push_str(component);
+            entries.push((key_record(&current), vec![1]));
+        }
+        self.store.put_many(&entries)
+    }
+
+    pub fn key_exists(&mut self, path: &str) -> Result<bool, DbError> {
+        let normalized = normalize_path(path)?;
+        Ok(self.store.get(&key_record(&normalized))?.is_some())
+    }
+
+    /// Sets or replaces a named value under an existing key. An empty name is
+    /// permitted and represents the default value, as in the Windows registry.
+    pub fn set_value(&mut self, path: &str, name: &str, value: RegistryValue) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        if self.store.get(&key_record(&normalized))?.is_none() {
+            return Err(DbError::Constraint(format!("registry key does not exist: {path}")));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.put(&key, &value.encode())
+    }
+
+    pub fn get_value(&mut self, path: &str, name: &str) -> Result<Option<RegistryValue>, DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.get(&key)?.map(|value| RegistryValue::decode(&value)).transpose()
+    }
+
+    pub fn delete_value(&mut self, path: &str, name: &str) -> Result<bool, DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.delete(&key)
+    }
+
+    pub fn list_hives(&mut self) -> Result<Vec<String>, DbError> {
+        let entries = self.store.scan_prefix(b"K", None)?;
+        let mut names = BTreeSet::new();
+        for (key, _) in entries {
+            if key.len() > 1 {
+                let path = String::from_utf8_lossy(&key[1..]);
+                if let Some(hive) = path.split('/').next() { names.insert(hive.to_owned()); }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    pub fn list_subkeys(&mut self, path: &str) -> Result<Vec<String>, DbError> {
+        let normalized = normalize_path(path)?;
+        let prefix = child_key_prefix(&normalized);
+        let entries = self.store.scan_prefix(&prefix, None)?;
+        let mut names = BTreeSet::new();
+        for (key, _) in entries {
+            let suffix = &key[prefix.len()..];
+            if let Some(component) = suffix.split(|byte| *byte == b'/').next() {
+                if !component.is_empty() {
+                    names.insert(String::from_utf8(component.to_vec())
+                        .map_err(|_| DbError::Storage("registry key name is not valid UTF-8".into()))?);
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    pub fn list_values(&mut self, path: &str) -> Result<Vec<String>, DbError> {
+        let normalized = normalize_path(path)?;
+        let prefix = value_record_prefix(&normalized);
+        let entries = self.store.scan_prefix(&prefix, None)?;
+        entries.into_iter().map(|(key, _)| {
+            String::from_utf8(key[prefix.len()..].to_vec())
+                .map_err(|_| DbError::Storage("registry value name is not valid UTF-8".into()))
+        }).collect()
+    }
+
+    /// Deletes a key. Non-recursive deletion is rejected while it has children
+    /// or values; recursive deletion removes its entire subtree atomically.
+    pub fn delete_key(&mut self, path: &str, recursive: bool) -> Result<bool, DbError> {
+        let normalized = normalize_path(path)?;
+        let exact = key_record(&normalized);
+        if self.store.get(&exact)?.is_none() { return Ok(false); }
+        let children = self.list_subkeys(&normalized)?;
+        let values = self.list_values(&normalized)?;
+        if !recursive && (!children.is_empty() || !values.is_empty()) {
+            return Err(DbError::Constraint("registry key is not empty; use recursive deletion".into()));
+        }
+
+        let mut removals = vec![exact];
+        if recursive {
+            let child_prefix = child_key_prefix(&normalized);
+            let mut child_keys = self.store.scan_prefix(&child_prefix, None)?
+                .into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+            removals.append(&mut child_keys);
+
+            let value_prefix = value_record_prefix(&normalized);
+            let mut value_keys = self.store.scan_prefix(&value_prefix, None)?
+                .into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+            removals.append(&mut value_keys);
+
+            let mut descendant_values_prefix = child_prefix;
+            descendant_values_prefix[0] = b'V';
+            let mut descendant_values = self.store.scan_prefix(&descendant_values_prefix, None)?
+                .into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+            removals.append(&mut descendant_values);
+        }
+        self.store.apply_batch(&removals, &[])?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "postemberdb-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ))
+    }
+
+    #[test]
+    fn key_value_store_batches_prefix_scans_and_reopens() {
+        let path = temp_path("kv");
+        {
+            let mut store = KeyValueStore::open(&path).unwrap();
+            store.put_many(&[
+                (b"players/a".to_vec(), b"Ada".to_vec()),
+                (b"players/b".to_vec(), b"Grace".to_vec()),
+                (b"config/mode".to_vec(), b"survival".to_vec()),
+            ]).unwrap();
+            assert_eq!(store.get(b"players/a").unwrap(), Some(b"Ada".to_vec()));
+            let players = store.scan_prefix(b"players/", None).unwrap();
+            assert_eq!(players.len(), 2);
+            assert_eq!(store.delete_prefix(b"players/").unwrap(), 2);
+            assert_eq!(store.get(b"players/a").unwrap(), None);
+        }
+        let mut reopened = KeyValueStore::open(&path).unwrap();
+        assert_eq!(reopened.get(b"config/mode").unwrap(), Some(b"survival".to_vec()));
+        drop(reopened);
+        for suffix in [".lock", ".pages", ".pages.wal"] {
+            let _ = fs::remove_file(with_suffix(&path, suffix));
+        }
+    }
+
+    #[test]
+    fn registry_hierarchy_is_typed_case_insensitive_and_recursive() {
+        let path = temp_path("registry");
+        {
+            let mut registry = Registry::open(&path).unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            registry.create_key("SYSTEM\\Database\\Engine").unwrap();
+            registry.set_value("system/database/engine", "CacheSize", RegistryValue::Integer(512)).unwrap();
+            registry.set_value("SYSTEM\\Database\\Engine", "Mode", RegistryValue::String("EmberTree".into())).unwrap();
+            assert_eq!(registry.get_value("System/Database/Engine", "cachesize").unwrap(), Some(RegistryValue::Integer(512)));
+            assert_eq!(registry.list_subkeys("SYSTEM/Database").unwrap(), vec!["engine".to_owned()]);
+            assert_eq!(registry.list_values("SYSTEM/Database/Engine").unwrap(), vec!["cachesize".to_owned(), "mode".to_owned()]);
+            assert!(registry.delete_key("SYSTEM/Database", false).is_err());
+            assert!(registry.delete_key("SYSTEM/Database", true).unwrap());
+            assert!(!registry.key_exists("SYSTEM/Database/Engine").unwrap());
+            assert_eq!(registry.list_hives().unwrap(), vec!["system".to_owned()]);
+        }
+        let _ = fs::remove_file(with_suffix(&path, ".lock"));
+        let _ = fs::remove_file(with_suffix(&path, ".pages"));
+        let _ = fs::remove_file(with_suffix(&path, ".pages.wal"));
+    }
+}
