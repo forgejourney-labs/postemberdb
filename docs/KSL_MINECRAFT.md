@@ -78,3 +78,25 @@ db.checkpoint()?;
 ```
 
 The current WAL records SQL statements, not physical page changes. It is an initial durability layer, not yet a high-throughput storage engine. The database still loads table rows into memory at startup, and there is not yet a cross-process file lock or concurrent writer protocol. Do not open one embedded database file from multiple server processes.
+
+
+## Secondary indexes
+
+The SQL subset now supports a single-column secondary index and equality lookup:
+
+```sql
+CREATE INDEX idx_player_uuid ON player_stats (uuid);
+SELECT * FROM player_stats WHERE uuid = 'player-uuid';
+```
+
+Index definitions are stored in the snapshot and rebuilt from table rows on open. New inserts update the index. The first implementation is an in-memory B-tree map from typed key values to row positions; it accelerates equality lookups but is not yet a page-backed persistent index, composite index, or range-scan planner.
+
+## Minecraft workload benchmark
+
+Run:
+
+```bash
+cargo bench --bench minecraft_workload
+```
+
+The benchmark inserts a generated player-statistics dataset in bounded batches, builds a UUID index, and times a set of equality lookups. Results depend on hardware and must be recorded alongside the machine, Rust version, dataset size, and commit SHA. Do not compare numbers from different machines as if they were controlled results.
