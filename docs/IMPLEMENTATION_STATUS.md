@@ -39,7 +39,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums.
 - [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
-- [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata is upgraded on open, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
+- [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
