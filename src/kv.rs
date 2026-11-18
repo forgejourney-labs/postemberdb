@@ -257,7 +257,7 @@ impl Registry {
 
     pub fn get_value(&mut self, path: &str, name: &str) -> Result<Option<RegistryValue>, DbError> {
         let normalized = normalize_path(path)?;
-        if name.contains('\\0') {
+        if name.contains('\0') {
             return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
         }
         let mut key = value_record_prefix(&normalized);
@@ -267,7 +267,7 @@ impl Registry {
 
     pub fn delete_value(&mut self, path: &str, name: &str) -> Result<bool, DbError> {
         let normalized = normalize_path(path)?;
-        if name.contains('\\0') {
+        if name.contains('\0') {
             return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
         }
         let mut key = value_record_prefix(&normalized);
