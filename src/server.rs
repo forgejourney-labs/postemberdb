@@ -260,7 +260,10 @@ fn format_result(result: QueryResult) -> String {
 mod tests {
     use super::{read_bounded_line, validate_bind_address};
     use postemberdb::{QueryResult, Value};
-    use std::io::{self, BufReader, Cursor};
+    use std::io::{self, BufRead, BufReader, Cursor, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn jsonl_response_encodes_text_and_preserves_types() {
@@ -278,6 +281,49 @@ mod tests {
         assert!(encoded.contains(",42,true,null]"));
         assert!(encoded.contains("a\\n\\\"b"));
         assert!(super::json_error("bad").contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn jsonl_protocol_handshake_and_sql_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = Arc::new(Mutex::new(postemberdb::Database::new()));
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            super::handle_client(stream, database).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let reader_stream = client.try_clone().unwrap();
+        let mut reader = BufReader::new(reader_stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("PostemberDB/0.1 ready"));
+
+        writeln!(client, "POSTEMBERDB JSONL/1").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\\"protocol\\":\\"postemberdb-jsonl\\""));
+        assert!(line.contains("\\"version\\":1"));
+
+        writeln!(client, "CREATE TABLE ksl_test (id INTEGER, name TEXT)").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\\"ok\\":true"));
+
+        writeln!(client, "INSERT INTO ksl_test VALUES (7, 'Ada')").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\\"ok\\":true"));
+
+        writeln!(client, "SELECT id, name FROM ksl_test WHERE id = 7").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("[7,\\"Ada\\"]"));
+
+        writeln!(client, "QUIT").unwrap();
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]
