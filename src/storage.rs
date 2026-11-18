@@ -297,7 +297,7 @@ impl Database {
         if input.offset != bytes.len() {
             return Err(DbError::Storage("trailing bytes in database file".into()));
         }
-        Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence, ember_indexes_valid: false })
+        Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence, ember_indexes_valid: false, ember_index_journal: Vec::new(), ember_journal_supported: true })
     }
 }
 
@@ -690,6 +690,33 @@ fn page_tree_wal_file_path(path: &Path) -> PathBuf {
 /// Rebuild the durable EmberTree index mirror from the SQL-WAL-recovered state.
 /// SQL snapshots/WAL remain authoritative; this operation is idempotent and repairable.
 impl Database {
+    pub(crate) fn sync_ember_indexes_journal(
+        &self,
+        journal: &[super::EmberIndexDelta],
+        supported: bool,
+        previous_mirror_valid: bool,
+    ) -> Result<bool, DbError> {
+        if !previous_mirror_valid {
+            return self.sync_ember_indexes();
+        }
+        if !supported {
+            return Ok(false);
+        }
+        let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
+        if journal.is_empty() {
+            return Ok(true);
+        }
+        let removals = journal.iter().filter(|delta| !delta.insert)
+            .map(|delta| delta.key.clone()).collect::<Vec<_>>();
+        let upserts = journal.iter().filter(|delta| delta.insert)
+            .map(|delta| (delta.key.clone(), Vec::new())).collect::<Vec<_>>();
+        let page_path = page_tree_file_path(database_path);
+        let tree_wal_path = page_tree_wal_file_path(database_path);
+        let mut store = extent::ExtentFile::open(&page_path)?;
+        page_tree::apply_mutations(&mut store, &tree_wal_path, &removals, &upserts)?;
+        Ok(true)
+    }
+
     pub(crate) fn sync_ember_indexes(&self) -> Result<bool, DbError> {
         let Some(database_path) = self.storage_path.as_deref() else { return Ok(false); };
         let page_path = page_tree_file_path(database_path);
@@ -775,6 +802,31 @@ fn collect_ember_index_entries(
         }
     }
     Ok(Some(entries))
+}
+
+pub(crate) fn encode_ember_index_entry(
+    table_name: &str,
+    index_name: &str,
+    key: &super::IndexKey,
+    row_id: u64,
+) -> Result<Option<Vec<u8>>, DbError> {
+    if row_id == 0 {
+        return Err(DbError::Storage("cannot encode a zero stable row identifier".into()));
+    }
+    let encoded = match index_codec::encode_index_key(key) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let mut out = Vec::with_capacity(4 + table_name.len() + index_name.len() + encoded.len() + 9);
+    put_namespace_part(&mut out, table_name.as_bytes())?;
+    put_namespace_part(&mut out, index_name.as_bytes())?;
+    out.extend_from_slice(&encoded);
+    if out.len() > 1015 {
+        return Ok(None);
+    }
+    out.push(0);
+    out.extend_from_slice(&row_id.to_be_bytes());
+    Ok(Some(out))
 }
 
 fn put_namespace_part(out: &mut Vec<u8>, value: &[u8]) -> Result<(), DbError> {
