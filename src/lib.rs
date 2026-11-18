@@ -299,6 +299,12 @@ impl Table {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EmberIndexDelta {
+    key: Vec<u8>,
+    insert: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Database {
     tables: BTreeMap<String, Table>,
@@ -308,6 +314,8 @@ pub struct Database {
     wal_sequence: u64,
     revision: u64,
     ember_indexes_valid: bool,
+    ember_index_journal: Vec<EmberIndexDelta>,
+    ember_journal_supported: bool,
 }
 
 impl Database {
@@ -365,6 +373,8 @@ impl Database {
                 wal_sequence: self.wal_sequence,
                 revision: self.revision,
                 ember_indexes_valid: false,
+                ember_index_journal: Vec::new(),
+                ember_journal_supported: true,
             },
             statements: Vec::new(),
         }
@@ -381,13 +391,17 @@ impl Database {
             self.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.ember_indexes_valid;
-        let previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
+        let _previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
         // The SQL WAL is the commit authority. Apply a derived index delta only
         // after the SQL commit is durable; on failure queries use memory indexes.
         self.ember_indexes_valid = self
-            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .sync_ember_indexes_journal(
+                &session.staged.ember_index_journal,
+                session.staged.ember_journal_supported,
+                previous_mirror_valid,
+            )
             .unwrap_or(false);
         Ok(())
     }
@@ -406,6 +420,8 @@ impl Database {
             wal_sequence: self.wal_sequence,
             revision: self.revision,
             ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
         };
         let mut transaction = Transaction {
             database: self,
@@ -829,13 +845,17 @@ impl Transaction<'_> {
             self.database.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.database.ember_indexes_valid;
-        let previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
+        let _previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
         self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
         // The SQL WAL is already durable at this point. Update only changed
         // EmberTree entries; failure leaves SQL committed and enables fallback.
         self.database.ember_indexes_valid = self.database
-            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .sync_ember_indexes_journal(
+                &self.staged.ember_index_journal,
+                self.staged.ember_journal_supported,
+                previous_mirror_valid,
+            )
             .unwrap_or(false);
         Ok(())
     }
