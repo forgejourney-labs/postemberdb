@@ -1275,6 +1275,7 @@ mod tests {
             let mut db = Database::open(&path).unwrap();
             db.execute("CREATE TABLE mirror_failure (id INTEGER, tag TEXT)").unwrap();
             db.execute("CREATE INDEX idx_mirror_failure_tag ON mirror_failure (tag)").unwrap();
+            db.execute("INSERT INTO mirror_failure VALUES (5, 'seed')").unwrap();
 
             std::fs::remove_file(&page_path).unwrap();
             std::fs::create_dir(&page_path).unwrap();
