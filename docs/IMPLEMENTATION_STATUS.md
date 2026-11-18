@@ -39,7 +39,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Fixed 4 KiB PPG1 snapshot pages with per-page and whole-payload checksums.
 - [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
-- [x] Dual-slot EAM1 metadata persistence with generation checksums and fallback to the previous valid slot.
+- [x] Dual-slot EAM1 metadata persistence with generation checksums and fail-closed handling of corrupted non-empty slots.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
@@ -52,7 +52,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Stack-based successor-leaf traversal for in-memory range scans.
 - [ ] Persistent leaf sibling links (optional follow-up), page serialization, persistent index nodes, and catalog/page-file integration.
 
-The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The PPG1 snapshot format remains a physical snapshot layout, not a lazy page store. A separate experimental ExtentFile primitive now persists EPG1 data pages and a dual-slot EAM1 free-extent map; it has focused tests for reopen, reuse, coalescing, metadata fallback, and checksums. ExtentFile is not yet connected to Database commits, B+ tree roots, or WAL recovery, so it is not the active database storage backend. Startup still reconstructs the complete PPG1 snapshot and loads all rows into memory.
+The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The PPG1 snapshot format remains a physical snapshot layout, not a lazy page store. A separate experimental ExtentFile primitive now persists EPG1 data pages and a dual-slot EAM1 free-extent map; it has focused tests for reopen, reuse, coalescing, corruption rejection, and checksums. ExtentFile is not yet connected to Database commits, B+ tree roots, or WAL recovery, so it is not the active database storage backend. Startup still reconstructs the complete PPG1 snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
