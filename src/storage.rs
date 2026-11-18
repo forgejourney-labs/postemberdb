@@ -340,8 +340,17 @@ mod tests {
         disk_key.extend_from_slice(&index_codec::encode_index_key(
             &super::super::IndexKey::from(&Value::Text("player-a".into()))
         ).unwrap());
-        let encoded_rows = page_tree::get(&mut store, &disk_key).unwrap().unwrap();
-        assert_eq!(index_codec::decode_row_refs(&encoded_rows).unwrap(), vec![0, 1]);
+        let mut lower = disk_key.clone();
+        lower.push(0);
+        lower.extend_from_slice(&0u64.to_be_bytes());
+        let mut upper = disk_key.clone();
+        upper.push(0);
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        let refs = page_tree::scan_range(&mut store, &lower, &upper).unwrap()
+            .into_iter()
+            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(refs, vec![0, 1]);
         drop(store);
 
         for candidate in [&path, &page_path, &tree_wal_path, &wal_file_path(&path), &lock_file_path(&path)] {
@@ -370,8 +379,17 @@ mod tests {
         disk_key.extend_from_slice(&index_codec::encode_index_key(
             &super::super::IndexKey::from(&Value::Text("durable".into()))
         ).unwrap());
-        let encoded_rows = page_tree::get(&mut store, &disk_key).unwrap().unwrap();
-        assert_eq!(index_codec::decode_row_refs(&encoded_rows).unwrap(), vec![0]);
+        let mut lower = disk_key.clone();
+        lower.push(0);
+        lower.extend_from_slice(&0u64.to_be_bytes());
+        let mut upper = disk_key.clone();
+        upper.push(0);
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        let refs = page_tree::scan_range(&mut store, &lower, &upper).unwrap()
+            .into_iter()
+            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()) as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(refs, vec![0]);
         assert_eq!(reopened.tables["rebuild_rows"].rows.len(), 1);
         drop(store);
         drop(reopened);
@@ -618,9 +636,7 @@ impl Database {
             store.publish_root(None)?;
             return Ok(());
         }
-        let encoded = entries.into_iter().map(|(key, rows)| {
-            Ok((key, index_codec::encode_row_refs(&rows)?))
-        }).collect::<Result<Vec<_>, DbError>>()?;
+        let encoded = entries.into_iter().collect::<Vec<_>>();
         page_tree::replace_all(&mut store, &tree_wal_path, &encoded)
     }
 }
