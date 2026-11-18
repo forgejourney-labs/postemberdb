@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn validates_tree_structure_after_reopen() {
         let (path, wal) = paths("validate");
-        let entries = (0..900)
+        let entries = (0u64..900)
             .map(|n| (format!("entry-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
             .collect::<Vec<_>>();
         {
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn bounded_range_scan_stops_at_limit_and_prunes_outside_subtrees() {
         let (path, wal) = paths("bounded-scan");
-        let entries = (0..1200)
+        let entries = (0u64..1200)
             .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
             .collect::<Vec<_>>();
         let mut store = ExtentFile::open(&path).unwrap();
