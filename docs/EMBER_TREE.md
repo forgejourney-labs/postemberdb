@@ -148,15 +148,15 @@ TTL must not silently delete data based on an untrusted or backwards-moving wall
 `remove_many` performs copy-on-write deletion for an ordered batch. Missing keys are ignored. Changed search paths are staged as immutable pages, adjacent same-level siblings are coalesced when their combined contents fit in one page, and unary roots are collapsed before a single redo record and root publication. When siblings cannot be coalesced, a non-root unary internal node may remain. Redistribution of underfull siblings, a minimum-occupancy invariant, and page reclamation are still pending. SQL DELETE transactions now update the derived persistent index mirror through this API after the canonical SQL WAL commit.
 
 
-## SQL transaction delta integration
+## SQL transaction index journaling
 
-After the canonical SQL WAL commit is durable, the database now compares the previous and next in-memory index entry sets and applies only removed row-reference keys with `remove_many` and new keys with `insert_many`. Unchanged persistent subtrees are retained by copy-on-write path updates. If the mirror update fails, the SQL transaction remains committed and the engine falls back to in-memory indexes; startup can rebuild the derived mirror from the SQL snapshot/WAL. This first delta implementation still scans all in-memory index entries to calculate the set difference, so delta discovery is O(total indexed entries). Because SQL row references are positional, deleting a row can shift references for later rows and produce a larger delta. Stable row identifiers and direct mutation journaling are future optimizations. SQL rows/catalog are still not page-backed.
+SQL transaction commits no longer compare complete previous and next index-entry sets. INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX append encoded row-level index mutations while executing against the staged transaction. Each journal entry contains the complete namespaced EmberTree key, including the stable row ID, and whether it is inserted or removed.
 
+After the canonical SQL WAL commit is durable, repeated mutations are coalesced in transaction order (last mutation wins). The final removals and upserts are sent to the page tree as one mixed CoW batch, one redo record, and one root publication. This removes O(total indexed entries) delta discovery from the transaction path. Full index scans remain necessary during startup/rebuild. Unsupported key encodings disable the derived mirror and safely use in-memory indexes. SQL rows and catalog metadata remain in the canonical SQL snapshot/WAL and are still not page-backed.
 
 ## Atomic mixed mutation batches
 
-The persistent page-tree API now exposes `apply_mutations`, which accepts removals and upserts together. It evaluates removals first and upserts second (so an upsert wins for a key present in both lists), stages the combined copy-on-write changes, writes one redo record, and publishes one root. SQL transaction delta synchronization now uses this combined operation instead of publishing a delete root followed by a separate insert root. This closes the intermediate-root window between the two halves of one derived-index update. The SQL WAL remains authoritative; mirror failures still fall back to in-memory indexes. The mixed-batch API does not change the current O(N) delta discovery or positional row-reference limitations.
-
+The persistent page-tree API exposes `apply_mutations`, which accepts removals and upserts together. It evaluates removals first and upserts second, stages the combined copy-on-write changes, writes one redo record, and publishes one root. The direct SQL index journal coalesces duplicate key operations before calling this API, preserving the final transaction state even for sequences such as INSERT followed by DELETE or repeated key updates. The SQL WAL remains authoritative; mirror failures still fall back to in-memory indexes.
 
 ## Stable SQL row identifiers
 
