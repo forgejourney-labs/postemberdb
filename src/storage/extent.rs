@@ -676,10 +676,42 @@ mod tests {
         let mut reopened = ExtentFile::open(&path).unwrap();
         assert_eq!(reopened.read_page(page_id).unwrap(), b"durably-allocated");
         assert_eq!(reopened.stats().allocated_pages, 1);
+        let repaired = fs::read(&path).unwrap();
+        assert_eq!(&repaired[..PAGE_SIZE], &repaired[PAGE_SIZE..2 * PAGE_SIZE]);
         let next_page = reopened.allocate_page(b"after-recovery").unwrap();
         assert_eq!(next_page, 1);
         assert_eq!(reopened.read_page(next_page).unwrap(), b"after-recovery");
         drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn maximum_page_payload_round_trips() {
+        let path = temp_path();
+        let payload = vec![0xA5; super::PAGE_PAYLOAD_SIZE];
+        let mut store = ExtentFile::open(&path).unwrap();
+        let page_id = store.allocate_page(&payload).unwrap();
+        assert_eq!(store.read_page(page_id).unwrap(), payload);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn both_corrupt_metadata_copies_fail_closed() {
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        store.allocate_page(b"committed").unwrap();
+        drop(store);
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        for slot in 0..2u64 {
+            file.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+            file.write_all(b"bad!").unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(ExtentFile::open(&path).is_err());
         fs::remove_file(path).unwrap();
     }
 
