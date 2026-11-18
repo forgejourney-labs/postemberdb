@@ -100,7 +100,7 @@ impl ExtentFile {
                 }
             }
             (Ok(Some(valid)), Ok(None))
-            | (Ok(None), Ok(Some(valid))
+            | (Ok(None), Ok(Some(valid)))
             | (Ok(Some(valid)), Err(_))
             | (Err(_), Ok(Some(valid))) => valid,
             (Ok(None), Ok(None)) => {
