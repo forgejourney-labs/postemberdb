@@ -747,6 +747,7 @@ impl Database {
         let columns = projection_indices.iter().map(|index| table.columns[*index].name.clone()).collect();
         let rows = selected_rows.into_iter().filter_map(|row_index| {
             table.rows.get(row_index).map(|row| Row {
+                row_id: row.row_id,
                 values: projection_indices.iter().map(|column_index| row.values[*column_index].clone()).collect()
             })
         }).collect::<Vec<_>>();
