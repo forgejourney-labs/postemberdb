@@ -1,8 +1,8 @@
 //! Fixed-size page-file encoding and validation.
 
-use super::{checksum, DbError};
+use super::{checksum, DbError, MAX_SNAPSHOT_SIZE, PAGE_MAGIC, PAGE_META_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE};
 
-fn encode_pages(payload: &[u8]) -> Result<Vec<u8>, DbError> {
+pub(super) fn encode_pages(payload: &[u8]) -> Result<Vec<u8>, DbError> {
     if payload.len() > MAX_SNAPSHOT_SIZE {
         return Err(DbError::Storage("snapshot exceeds 512 MiB safety limit".into()));
     }
@@ -27,7 +27,7 @@ fn encode_pages(payload: &[u8]) -> Result<Vec<u8>, DbError> {
     Ok(out)
 }
 
-fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
+pub(super) fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
     if file.len() < 32 || &file[..4] != PAGE_MAGIC {
         return Err(DbError::Storage("invalid page-file header".into()));
     }
