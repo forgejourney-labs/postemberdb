@@ -1,6 +1,6 @@
 # EmberTree Storage Model
 
-**EmberTree** is the working name for PostemberDB's planned tree-oriented storage architecture. This is the target architecture, not a claim that the complete engine already exists. The repository now contains an engine-owned in-memory B+ tree in src/storage/btree.rs: insertion/replacement, point lookup, inclusive range scans, node splitting, and structural validation are implemented with focused tests. SQL equality indexes now use this tree. Tree nodes are not yet persisted as pages; deletion, linked-leaf navigation, page serialization, and crash-safe persistence remain future work.
+**EmberTree** is the working name for PostemberDB's planned tree-oriented storage architecture. This is the target architecture, not a claim that the complete engine already exists. The repository contains an engine-owned in-memory B+ tree in src/storage/btree.rs with insertion/replacement, point lookup, deletion and rebalancing, inclusive range scans, node splitting, strict occupancy validation, and stack-based successor-leaf traversal. Focused tests include deterministic mixed operations compared with Rust's BTreeMap. SQL equality indexes use this tree. It does not yet maintain physical sibling pointers between leaves, and tree nodes are not persisted as pages; page serialization and crash-safe page persistence remain future work.
 
 ## Goals and invariants
 
@@ -24,6 +24,18 @@ EmberTree separates logical identity from physical placement:
 - WAL: framed recovery records sufficient to recover committed changes and ignore incomplete transactions.
 
 A bounded buffer pool caches pages by logical page ID and generation. Cache misses read only requested pages. Range scans walk adjacent B+ tree leaves in bounded batches. Rows are not stored in one ever-growing in-memory Vec.
+
+## Current page-file prototype
+
+The existing PPG1 format wraps the current serialized database snapshot in fixed 4 KiB pages. It still loads the complete snapshot and is not a lazy page store.
+
+A separate experimental `ExtentFile` primitive now provides:
+- EPG1 fixed-size data pages with logical page IDs, generations, payload lengths, checksums bound to page identity/generation, and canonical zero padding.
+- EAM2 allocator metadata mirrored into two alternating slots, with monotonically increasing generations and checksums.
+- First-fit contiguous extent allocation, adjacent free-range coalescing, page-ID reuse, and persisted allocator statistics.
+- Reopen tests for pages and metadata, plus corruption tests.
+
+The `page_tree` module now builds immutable B+ tree leaf/internal pages in an `ExtentFile`, records page images in a separate redo WAL, syncs those pages, and atomically publishes the new root through EAM3 metadata. Startup recovery can replay a pending redo record before reads. This is a real page-backed CoW B+ tree snapshot primitive, but it is not yet connected to SQL index lookups, the catalog, row pages, or the SQL transaction WAL. It rebuilds the full tree per replacement and retains old pages until a reachability-aware reclamation protocol exists. The allocator is single-owner and still has no page pinning or transactional reclamation. Each successful metadata commit syncs the new generation to both slots; one damaged copy is repaired from the other, while two invalid copies fail closed. A write error poisons the current handle until reopen. Do not treat this isolated primitive as the active SQL storage backend yet.
 
 ## Update modes
 
@@ -98,7 +110,7 @@ The current PPG1/PDB4 snapshot format is a prototype, not EmberTree. The new for
 
 ## Implementation order
 
-1. Complete the in-memory B+ tree with deletion/rebalancing, linked-leaf navigation, and property tests (SQL equality index integration is now in place).
+1. Complete the in-memory B+ tree with deletion/rebalancing, efficient stack-based successor-leaf navigation, and property tests (SQL equality index integration is now in place).
 2. Specify and property-test the EmberTree on-disk format.
 3. Implement page-file abstraction, durable extent allocator, dual metadata roots, and checksummed page I/O.
 4. Implement bounded buffer pool and persist B+ tree nodes as pages.
