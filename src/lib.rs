@@ -343,7 +343,7 @@ fn build_rows_index_deltas(
     Ok(Some(all))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
@@ -356,10 +356,24 @@ pub struct Database {
     ember_journal_supported: bool,
 }
 
-impl Database {
-    pub fn new() -> Self {
-        Self { ember_journal_supported: true, ..Self::default() }
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            tables: BTreeMap::new(),
+            storage_path: None,
+            wal_path: None,
+            _lock_file: None,
+            wal_sequence: 0,
+            revision: 0,
+            ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
+        }
     }
+}
+
+impl Database {
+    pub fn new() -> Self { Self::default() }
 
     fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
         match deltas {
