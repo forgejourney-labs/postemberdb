@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 mod storage;
 mod sql;
@@ -286,6 +287,7 @@ pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
+    lock_file: Option<Arc<std::fs::File>>,
     wal_sequence: u64,
     revision: u64,
 }
@@ -1204,6 +1206,24 @@ mod tests {
         assert_eq!(db.execute("SELECT * FROM player_events LIMIT 0").unwrap().rows.len(), 0);
         assert!(db.execute("SELECT * FROM player_events LIMIT nope").is_err());
         assert_eq!(db.execute("SELECT COUNT(*) FROM player_events LIMIT 1").unwrap().rows[0].values[0], Value::Integer(3));
+    }
+
+
+    #[test]
+    fn persistent_database_uses_exclusive_process_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-lock-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let first = Database::open(&path).unwrap();
+        assert!(Database::open(&path).is_err(), "a second open must not acquire the same database");
+        drop(first);
+        let second = Database::open(&path).unwrap();
+        drop(second);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+        std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
     }
 
     #[test]
