@@ -122,6 +122,32 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn replay_truncates_an_incomplete_payload_without_applying_it() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-torn-payload-{}-{nonce}.wal",
+            std::process::id()
+        ));
+
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE incomplete (value INTEGER)".into(),
+        ]).unwrap();
+        let length = fs::metadata(&path).unwrap().len();
+        OpenOptions::new().write(true).open(&path).unwrap()
+            .set_len(length - 1).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        recovered.replay_wal().unwrap();
+        assert!(!recovered.tables.contains_key("incomplete"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn replay_is_atomic_per_wal_transaction() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!(
