@@ -9,13 +9,15 @@ PostemberDB provides a byte-oriented key/value API and a typed hierarchical regi
 ```rust
 use postemberdb::KeyValueStore;
 
-let mut kv = KeyValueStore::open("data/world.kv")?;
-kv.put(b"players/uuid-123", b"serialized-player")?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut kv = KeyValueStore::open("data/world.kv")?;
+    kv.put(b"players/uuid-123", b"serialized-player")?;
 
-let player = kv.get(b"players/uuid-123")?;
-let entries = kv.scan_prefix(b"players/", Some(100))?;
-kv.delete(b"players/uuid-123")?;
-# Ok::<(), postemberdb::DbError>(())
+    let player = kv.get(b"players/uuid-123")?;
+    let entries = kv.scan_prefix(b"players/", Some(100))?;
+    kv.delete(b"players/uuid-123")?;
+    Ok(())
+}
 ```
 
 - Keys are arbitrary bytes, 1..=1024 bytes.
@@ -36,17 +38,19 @@ The store is built on PostemberDB's native EmberTree page format. It does not us
 ```rust
 use postemberdb::{Registry, RegistryValue};
 
-let mut registry = Registry::open("data/server.registry")?;
-registry.create_hive("SYSTEM")?;
-registry.create_key("SYSTEM\\Database\\Engine")?;
-registry.set_value(
-    "SYSTEM/Database/Engine",
-    "CacheSize",
-    RegistryValue::Integer(512),
-)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = Registry::open("data/server.registry")?;
+    registry.create_hive("SYSTEM")?;
+    registry.create_key("SYSTEM\\Database\\Engine")?;
+    registry.set_value(
+        "SYSTEM/Database/Engine",
+        "CacheSize",
+        RegistryValue::Integer(512),
+    )?;
 
-let value = registry.get_value("system/database/engine", "cachesize")?;
-# Ok::<(), postemberdb::DbError>(())
+    let value = registry.get_value("system/database/engine", "cachesize")?;
+    Ok(())
+}
 ```
 
 ### Hierarchy
@@ -83,10 +87,12 @@ The empty value name is supported as the default value of a key.
 For a file-backed SQL database, open independent sidecars from the database handle:
 
 ```rust
-let db = postemberdb::Database::open("data/server.pbd")?;
-let mut kv = db.open_key_value_store()?;
-let mut registry = db.open_registry()?;
-# Ok::<(), postemberdb::DbError>(())
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = postemberdb::Database::open("data/server.pbd")?;
+    let mut kv = db.open_key_value_store()?;
+    let mut registry = db.open_registry()?;
+    Ok(())
+}
 ```
 
 The KV and registry sidecars are separate from the SQL snapshot/WAL and from the derived SQL index mirror. Each store has its own lock and recovery WAL. A database opened only in memory cannot create these persistent sidecars.
