@@ -140,7 +140,7 @@ fn handle_client(
         if command.eq_ignore_ascii_case("QUIT") { break; }
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
-            stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\\n")?;
+            stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
             stream.flush()?;
             continue;
         }
