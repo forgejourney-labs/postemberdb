@@ -19,6 +19,8 @@ const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 const METADATA_HEADER_SIZE: usize = 44;
 const EXTENT_ENTRY_SIZE: usize = 16;
 const MAX_FREE_EXTENTS: usize = (PAGE_SIZE - METADATA_HEADER_SIZE) / EXTENT_ENTRY_SIZE;
+
+pub(super) const fn page_payload_size() -> usize { PAGE_PAYLOAD_SIZE }
 const METADATA_MAGIC: &[u8; 4] = b"EAM3";
 const DATA_PAGE_MAGIC: &[u8; 4] = b"EPG1";
 const FORMAT_VERSION: u32 = 3;
