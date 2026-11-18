@@ -287,7 +287,7 @@ pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
-    lock_file: Option<Arc<std::fs::File>>,
+    _lock_file: Option<Arc<std::fs::File>>,
     wal_sequence: u64,
     revision: u64,
 }
