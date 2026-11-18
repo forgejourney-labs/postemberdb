@@ -456,9 +456,10 @@ impl Database {
             let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
             let matches = table.matching_rows(column_index, &value).into_iter().collect::<std::collections::BTreeSet<_>>();
             let before = table.rows.len();
-            table.rows = table.rows.drain(..).enumerate()
+            let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
-                .collect();
+                .collect::<Vec<_>>();
+            table.rows = retained;
             before - table.rows.len()
         } else {
             let count = table.rows.len();
@@ -663,7 +664,11 @@ impl Transaction<'_> {
     /// Execute SQL against the transaction's private view.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
-        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "CREATE INDEX") || starts_with_kw(statement, "INSERT INTO");
+        let is_write = starts_with_kw(statement, "CREATE TABLE")
+            || starts_with_kw(statement, "CREATE INDEX")
+            || starts_with_kw(statement, "INSERT INTO")
+            || starts_with_kw(statement, "UPDATE")
+            || starts_with_kw(statement, "DELETE FROM");
         let result = self.staged.execute_inner(statement)?;
         if is_write {
             self.statements.push(statement.to_owned());
