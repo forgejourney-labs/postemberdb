@@ -120,7 +120,7 @@ pub(crate) fn remove_many(
     for key in keys {
         let Some(root_id) = root else { break; };
         if !contains_staged(store, &staged, root_id, key)? { continue; }
-        root = delete_recursive(store, &mut staged, root_id, key)?;
+        root = delete_recursive(store, &mut staged, root_id, key)?.map(|node| node.page_id);
         removed += 1;
         if let Some(mut root_id) = root {
             loop {
