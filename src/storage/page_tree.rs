@@ -35,6 +35,7 @@ pub(crate) fn replace_all(
     wal_path: &Path,
     entries: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<(), DbError> {
+    recover(store, wal_path)?;
     validate_entries(entries)?;
     let mut pages: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut level = Vec::new();
@@ -83,8 +84,8 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
     let mut file = OpenOptions::new().read(true).write(true).open(wal_path)
         .map_err(storage_error)?;
     let mut bytes = Vec::new();
-    file.by_ref().take((MAX_WAL_BYTES + 1) as u64)
-        .read_to_end(&mut bytes).map_err(storage_error)?;
+    let mut limited = Read::take(&mut file, (MAX_WAL_BYTES + 1) as u64);
+    limited.read_to_end(&mut bytes).map_err(storage_error)?;
     if bytes.is_empty() {
         return Ok(());
     }
@@ -99,7 +100,7 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
 
     let (root_page_id, pages) = match decode_wal(&bytes) {
         Ok(decoded) => decoded,
-        Err(error) if is_incomplete_wal(&bytes) => {
+        Err(_error) if is_incomplete_wal(&bytes) => {
             file.set_len(0).map_err(storage_error)?;
             file.sync_all().map_err(storage_error)?;
             return Ok(());
@@ -352,6 +353,9 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
     let payload = &bytes[WAL_HEADER_SIZE..];
     if super::checksum(payload) != expected {
         return Err(DbError::Storage("B+ tree WAL checksum mismatch".into()));
+    }
+    if count > payload.len() / 12 {
+        return Err(DbError::Storage("B+ tree WAL page count exceeds payload bounds".into()));
     }
     let mut offset = 0usize;
     let mut pages = Vec::with_capacity(count);
