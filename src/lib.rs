@@ -438,7 +438,7 @@ impl Database {
             self.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.ember_indexes_valid;
-        let _previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
+        self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
         // The SQL WAL is the commit authority. Apply a derived index delta only
@@ -939,7 +939,7 @@ impl Transaction<'_> {
             self.database.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.database.ember_indexes_valid;
-        let _previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
+        self.database.tables = self.staged.tables;
         self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
         // The SQL WAL is already durable at this point. Update only changed
