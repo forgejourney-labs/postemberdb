@@ -25,7 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `put_many` applies a batch with one CoW root publication.
 - `apply_batch` combines removals and upserts into one redo-WAL transaction; upserts win when a key is present in both sets.
 - `scan_prefix` returns bytewise-sorted results and accepts an optional limit.
-- `delete_prefix` removes a prefix range in one CoW publication.
+- `delete_prefix` removes a complete prefix range in one CoW publication, but may materialize the full matching key set in memory.
+- `delete_prefix_bounded(prefix, max_items)` removes at most 5,000 keys per atomic CoW batch. Repeat calls until it returns zero to drain very large prefixes with bounded working memory; separate calls are individually atomic, not one global transaction.
 - An exclusive sidecar lock prevents two processes from opening the same KV store concurrently.
 - Data uses separate `.pages`, `.pages.wal`, and `.lock` files.
 
@@ -104,3 +105,16 @@ The KV and registry sidecars are separate from the SQL snapshot/WAL and from the
 - Registry JSON is stored as text, not parsed or schema-validated by the engine.
 - SQL transactions do not yet include KV or Registry writes in the same cross-domain atomic commit.
 - Encryption-at-rest, per-hive ACL/RBAC, and audit events are future security work.
+
+
+## Bounded prefix cleanup
+
+For large namespaces such as `players/`, `worlds/`, or `cache/`, prefer bounded cleanup:
+
+```rust
+while kv.delete_prefix_bounded(b"cache/expired/", 500).unwrap() != 0 {
+    // Each batch is independently durable and bounded to 500 keys.
+}
+```
+
+The method returns the number of keys removed in that call. It accepts a batch limit from zero through 5,000; zero is a no-op. A multi-call cleanup can be interrupted and resumed safely, but other writers are excluded by the store's single-owner lock while the handle is open.
