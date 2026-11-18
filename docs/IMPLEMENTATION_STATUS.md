@@ -41,9 +41,9 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
-- [ ] Free-space management, compaction, and crash-safe page allocation.
+- [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.\n- [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
 
-The current page format is a physical layout milestone only. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
@@ -87,7 +87,7 @@ KSL currently uses HikariCP and JDBC; PostemberDB is not yet a selectable KSL ba
 - [x] SQL parsing helpers moved to src/sql.rs.
 - [x] Development server and its tests moved to src/server.rs.
 - [x] WAL and fixed-page codec moved into src/storage/wal.rs and src/storage/pages.rs.
-- [ ] Split storage into codec and allocator modules.
+- [x] Split storage into page codec, WAL, and page allocator modules.
 - [ ] Split the engine into catalog, index, execution, transaction, and buffer-pool modules.
 
 ## 8. Storage roadmap
