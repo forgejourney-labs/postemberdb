@@ -362,6 +362,9 @@ impl Database {
             columns.push(Column { name: normalized_column, data_type, nullable });
         }
         if columns.is_empty() { return Err(DbError::Parse("a table needs at least one column".into())); }
+        for column in &mut columns {
+            if primary_key_columns.contains(&column.name) { column.nullable = false; }
+        }
         let mut table = Table { columns, rows: Vec::new(), indexes: BTreeMap::new() };
         for column_name in primary_key_columns {
             if !table.columns.iter().any(|column| column.name == column_name) {
@@ -1113,6 +1116,25 @@ mod tests {
         ).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values[0], Value::Text("bread AND apples".into()));
+    }
+
+
+    #[test]
+    fn parses_ksl_style_table_migrations_and_column_lists() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE IF NOT EXISTS ksl_persist (script_name VARCHAR(190) NOT NULL, \"key\" VARCHAR(190) NOT NULL, value TEXT, PRIMARY KEY (script_name, \"key\"))").unwrap();
+        db.execute("CREATE TABLE IF NOT EXISTS ksl_persist (script_name VARCHAR(190) NOT NULL, \"key\" VARCHAR(190) NOT NULL, value TEXT, PRIMARY KEY (script_name, \"key\"))").unwrap();
+        db.execute_params(
+            "INSERT INTO ksl_persist (script_name, \"key\", value) VALUES (?, ?, ?)",
+            &[Value::Text("economy".into()), Value::Text("balance".into()), Value::Text("150".into())],
+        ).unwrap();
+        let result = db.execute_params(
+            "SELECT value FROM ksl_persist WHERE script_name = ? AND \"key\" = ?",
+            &[Value::Text("economy".into()), Value::Text("balance".into())],
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Text("150".into()));
+        assert!(db.execute("INSERT INTO ksl_persist VALUES ('economy', 'balance', 'duplicate')").is_ok());
     }
 
     #[test]
