@@ -130,3 +130,10 @@ KSL currently initializes its SQL backend through HikariCP and JDBC drivers. Its
 ## Client sessions and server transactions
 
 The engine now exposes an owned `DatabaseSession`. A session works against a private staged view, can execute typed parameterized statements, and commits only if the database revision has not changed since the session began. This optimistic conflict check prevents silently overwriting another client's committed writes. The development TCP server exposes `BEGIN`, `COMMIT`, and `ROLLBACK` using this API. Sessions currently clone the in-memory table state; they are not yet suitable for a large number of concurrent clients or large databases. A production protocol and JDBC driver remain separate milestones.
+
+
+## KSL schema and SQL compatibility work
+
+The Rust SQL subset now accepts the core DDL patterns used by KSL's schema migrations: `CREATE TABLE IF NOT EXISTS`, `VARCHAR(n)`, `TEXT`/`LONGTEXT`, integer types, quoted identifiers, and composite primary keys. Composite primary-key uniqueness is enforced and its B-tree index can serve matching equality predicates. The insert path supports both `ON CONFLICT (...) DO UPDATE SET ... EXCLUDED.column` and `ON DUPLICATE KEY UPDATE ... VALUES(column)` upserts. Column-list inserts, projections, `UPDATE`, `DELETE`, and `AND`-joined equality predicates are also implemented.
+
+This brings the engine closer to KSL's SQL usage, but does not complete the integration. The current engine still lacks a JDBC driver, full JDBC semantics, some SQL features used by arbitrary scripts, row/result limits, and the production wire protocol. KSL itself has not yet been modified to add a PostemberDB dialect.
