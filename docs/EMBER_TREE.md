@@ -31,11 +31,11 @@ The existing PPG1 format wraps the current serialized database snapshot in fixed
 
 A separate experimental `ExtentFile` primitive now provides:
 - EPG1 fixed-size data pages with logical page IDs, generations, payload lengths, checksums bound to page identity/generation, and canonical zero padding.
-- EAM1 allocator metadata in two alternating metadata slots, with monotonically increasing generations and checksums.
+- EAM2 allocator metadata mirrored into two alternating slots, with monotonically increasing generations and checksums.
 - First-fit contiguous extent allocation, adjacent free-range coalescing, page-ID reuse, and persisted allocator statistics.
 - Reopen tests for pages and metadata, plus corruption tests.
 
-This prototype is deliberately not wired into `Database`, B+ tree node serialization, catalog roots, or the existing WAL. The allocator is single-owner and has no persisted root-set protocol, extent pinning, or transactional reclamation. A corrupted non-empty metadata slot fails closed rather than silently rolling back to an older allocation state. Recovery from a torn metadata write requires the still-pending WAL-coordinated metadata protocol and fault-injection tests. Do not use `ExtentFile` as the active database file format yet.
+This prototype is deliberately not wired into `Database`, B+ tree node serialization, catalog roots, or the existing WAL. The allocator is single-owner and has no persisted root-set protocol, extent pinning, or transactional reclamation. Each successful metadata commit syncs the new generation to both slots. If startup finds one valid copy and one damaged or stale copy, it repairs the damaged slot before allowing further allocation; if neither copy is valid, startup fails closed. A write error poisons the current handle so it cannot continue from an uncertain in-memory generation. This is a small metadata-recovery primitive, not yet coordinated with database roots, transactions, or fault-injection-tested WAL recovery. Do not use `ExtentFile` as the active database file format yet.
 
 ## Update modes
 
