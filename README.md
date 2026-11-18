@@ -13,7 +13,7 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 
 ## Storage architecture
 
-Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree already backs SQL equality indexes; an experimental persistent CoW tree uses EPG1 pages, EAM3 root metadata, and a dedicated redo WAL. `Database::open` now recovers an existing EmberTree sidecar. The persistent tree is not yet the source of truth for SQL indexes or rows. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md). Security posture and release gates are in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes, while an experimental persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported SQL equality lookups use this persistent mirror when valid and fall back to the in-memory index otherwise. SQL commits feed it through a row-level mutation journal rather than rescanning every index. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
 
 ## Current status
 
@@ -24,16 +24,16 @@ The project is at an early development stage. The first prototype provides:
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
 - a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
-- an experimental EmberTree page-backed CoW B+ tree using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; `Database::open` recovers pending sidecar redo, but the tree is not yet the SQL index backend;
+- an EmberTree page-backed CoW B+ tree using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; supported SQL equality indexes are mirrored to it and queried from it when the mirror is valid;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
-- secondary indexes backed by our in-memory B+ tree with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
+- secondary indexes backed by our in-memory B+ tree, with supported equality lookups served by the persistent EmberTree mirror and a safe in-memory fallback;\n- direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;\n- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, and atomic prefix deletion;\n- a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a loopback-only TCP server with a versioned JSONL/1 protocol for the optional KSL addon.
 
-**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), and the standalone page-backed B+ tree is not yet connected to SQL index lookups or the SQL transaction WAL, range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a secure production network protocol are not implemented. JSONL/1 is an initial loopback-only integration protocol. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
+**Current limitations:** SQL table rows and catalog metadata are still stored in memory after snapshot/WAL replay; the page cache, lazy row-page access, and page-backed SQL table storage are not implemented. The persistent SQL index mirror is derived and rebuilt on open; unsupported index-key encodings use the in-memory fallback. KV and Registry use separate page/WAL sidecars and are not part of the SQL transaction's cross-domain atomic commit. Large values need an overflow-page/blob layer. The server protocol remains loopback-only and has no TLS, authentication, or authorization. JSONL/1 is an initial loopback-only integration protocol. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
 
 ## CLI
 
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Roadmap
 
-Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). See also [Native Key-Value and Registry](docs/KEY_VALUE_AND_REGISTRY.md) and [EmberTree](docs/EMBER_TREE.md).
 
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
 2. Add a bounded page cache and lazy page reads over the fixed-size page file.
