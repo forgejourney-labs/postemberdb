@@ -13,7 +13,7 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 
 ## Storage architecture
 
-The planned tree-oriented storage model is named **EmberTree**. Its design, CoW/in-place modes, manual defragmentation contract, page budgets, compression, snapshots, and recovery invariants are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md). EmberTree is a design target; the current PPG1 snapshot implementation is not yet that engine. Security posture and release gates are in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree already backs SQL equality indexes; an experimental persistent CoW tree uses EPG1 pages, EAM3 root metadata, and a dedicated redo WAL. `Database::open` now recovers an existing EmberTree sidecar. The persistent tree is not yet the source of truth for SQL indexes or rows. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md). Security posture and release gates are in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
 ## Current status
 
@@ -24,7 +24,7 @@ The project is at an early development stage. The first prototype provides:
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
 - a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
-- an experimental page-backed CoW B+ tree snapshot API using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; it is not yet the SQL index backend;
+- an experimental EmberTree page-backed CoW B+ tree using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; `Database::open` recovers pending sidecar redo, but the tree is not yet the SQL index backend;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
 - secondary indexes backed by our in-memory B+ tree with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
