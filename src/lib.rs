@@ -146,6 +146,26 @@ impl Table {
                 .or_default().push(row_index);
         }
     }
+
+    fn rebuild_indexes(&mut self) {
+        for index in self.indexes.values_mut() {
+            index.entries.clear();
+            for (row_index, row) in self.rows.iter().enumerate() {
+                index.entries.entry(IndexKey::from(&row.values[index.column_index]))
+                    .or_default().push(row_index);
+            }
+        }
+    }
+
+    fn matching_rows(&self, column_index: usize, value: &Value) -> Vec<usize> {
+        if let Some(index) = self.indexes.values().find(|index| index.column_index == column_index) {
+            index.entries.get(&IndexKey::from(value)).cloned().unwrap_or_default()
+        } else {
+            self.rows.iter().enumerate()
+                .filter_map(|(row_index, row)| (row.values[column_index] == *value).then_some(row_index))
+                .collect()
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -163,7 +183,11 @@ impl Database {
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
-        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "CREATE INDEX") || starts_with_kw(statement, "INSERT INTO");
+        let is_write = starts_with_kw(statement, "CREATE TABLE")
+            || starts_with_kw(statement, "CREATE INDEX")
+            || starts_with_kw(statement, "INSERT INTO")
+            || starts_with_kw(statement, "UPDATE")
+            || starts_with_kw(statement, "DELETE FROM");
         if is_write {
             return self.transaction(|transaction| transaction.execute(statement));
         }
@@ -184,6 +208,10 @@ impl Database {
             self.create_index(statement)
         } else if starts_with_kw(statement, "INSERT INTO") {
             self.insert(statement)
+        } else if starts_with_kw(statement, "UPDATE") {
+            self.update(statement)
+        } else if starts_with_kw(statement, "DELETE FROM") {
+            self.delete(statement)
         } else if starts_with_kw(statement, "SELECT") {
             self.select(statement)
         } else {
@@ -339,15 +367,41 @@ impl Database {
     fn insert(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let rest = sql["INSERT INTO".len()..].trim();
         let values_pos = find_kw(rest, "VALUES").ok_or_else(|| DbError::Parse("expected VALUES".into()))?;
-        let table_name = normalize_ident(rest[..values_pos].trim().trim_end_matches(')').split('(').next().unwrap_or("").trim());
+        let target = rest[..values_pos].trim();
+        let (table_name, column_names) = if let Some(open) = target.find('(') {
+            let close = target.rfind(')').ok_or_else(|| DbError::Parse("expected ')' after insert columns".into()))?;
+            let names = split_csv(&target[open + 1..close]).into_iter().map(normalize_ident).collect::<Vec<_>>();
+            (normalize_ident(target[..open].trim()), Some(names))
+        } else {
+            (normalize_ident(target), None)
+        };
+
         let values_part = rest[values_pos + "VALUES".len()..].trim();
         let values_part = values_part.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
             .ok_or_else(|| DbError::Parse("expected VALUES (...)".into()))?;
-        let values = split_csv(values_part).into_iter().map(parse_value).collect::<Result<Vec<_>, _>>()?;
+        let supplied = split_csv(values_part).into_iter().map(parse_value).collect::<Result<Vec<_>, _>>()?;
         let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        if values.len() != table.columns.len() {
-            return Err(DbError::Constraint(format!("expected {} values, received {}", table.columns.len(), values.len())));
-        }
+        let values = if let Some(names) = column_names {
+            if names.len() != supplied.len() {
+                return Err(DbError::Constraint(format!("{} insert columns but {} values", names.len(), supplied.len())));
+            }
+            let mut row = vec![Value::Null; table.columns.len()];
+            let mut assigned = std::collections::BTreeSet::new();
+            for (name, value) in names.iter().zip(supplied.into_iter()) {
+                let index = table.columns.iter().position(|column| column.name == *name)
+                    .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
+                if !assigned.insert(index) {
+                    return Err(DbError::Constraint(format!("column listed more than once: {name}")));
+                }
+                row[index] = value;
+            }
+            row
+        } else {
+            if supplied.len() != table.columns.len() {
+                return Err(DbError::Constraint(format!("expected {} values, received {}", table.columns.len(), supplied.len())));
+            }
+            supplied
+        };
         for (column, value) in table.columns.iter().zip(values.iter()) {
             validate_value(column, value)?;
         }
@@ -357,11 +411,68 @@ impl Database {
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row inserted".into() })
     }
 
+    fn update(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let rest = sql["UPDATE".len()..].trim();
+        let set_pos = find_kw(rest, "SET").ok_or_else(|| DbError::Parse("expected SET in UPDATE".into()))?;
+        let table_name = normalize_ident(rest[..set_pos].trim());
+        let after_set = rest[set_pos + 3..].trim();
+        let where_pos = after_set.to_ascii_uppercase().find(" WHERE ");
+        let (assignment, predicate) = match where_pos {
+            Some(position) => (&after_set[..position], Some(after_set[position + 7..].trim())),
+            None => (after_set, None),
+        };
+        let equals = assignment.find('=').ok_or_else(|| DbError::Parse("expected '=' in UPDATE assignment".into()))?;
+        let target_column = normalize_ident(assignment[..equals].trim());
+        let new_value = parse_value(assignment[equals + 1..].trim())?;
+
+        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let target_index = table.columns.iter().position(|column| column.name == target_column)
+            .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
+        validate_value(&table.columns[target_index], &new_value)?;
+
+        let matching = if let Some(predicate) = predicate {
+            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
+            table.matching_rows(column_index, &value)
+        } else {
+            (0..table.rows.len()).collect()
+        };
+        for row_index in &matching {
+            table.rows[*row_index].values[target_index] = new_value.clone();
+        }
+        table.rebuild_indexes();
+        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: matching.len(), message: format!("{} row(s) updated", matching.len()) })
+    }
+
+    fn delete(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let rest = sql["DELETE FROM".len()..].trim();
+        let where_pos = rest.to_ascii_uppercase().find(" WHERE ");
+        let (table_part, predicate) = match where_pos {
+            Some(position) => (&rest[..position], Some(rest[position + 7..].trim())),
+            None => (rest, None),
+        };
+        let table_name = normalize_ident(table_part);
+        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let removed = if let Some(predicate) = predicate {
+            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
+            let matches = table.matching_rows(column_index, &value).into_iter().collect::<std::collections::BTreeSet<_>>();
+            let before = table.rows.len();
+            table.rows = table.rows.drain(..).enumerate()
+                .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
+                .collect();
+            before - table.rows.len()
+        } else {
+            let count = table.rows.len();
+            table.rows.clear();
+            count
+        };
+        table.rebuild_indexes();
+        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: removed, message: format!("{removed} row(s) deleted") })
+    }
+
     fn select(&self, sql: &str) -> Result<QueryResult, DbError> {
         let upper = sql.to_ascii_uppercase();
         let from = upper.find(" FROM ").ok_or_else(|| DbError::Parse("expected FROM".into()))?;
         let projection = sql["SELECT".len()..from].trim();
-        if projection != "*" { return Err(DbError::Unsupported("only SELECT * is supported".into())); }
         let tail = sql[from + 6..].trim();
         let upper_tail = tail.to_ascii_uppercase();
         let where_pos = upper_tail.find(" WHERE ");
@@ -371,32 +482,47 @@ impl Database {
         };
         let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
-            let equals = predicate.find('=').ok_or_else(|| DbError::Parse("expected '=' in WHERE predicate".into()))?;
-            let column_name = normalize_ident(predicate[..equals].trim());
-            let value = parse_value(predicate[equals + 1..].trim())?;
-            let column_index = table.columns.iter().position(|column| column.name == column_name)
-                .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
-            if let Some(index) = table.indexes.values().find(|index| index.column_index == column_index) {
-                index.entries.get(&IndexKey::from(&value)).cloned().unwrap_or_default()
-            } else {
-                table.rows.iter().enumerate()
-                    .filter_map(|(row_index, row)| (row.values[column_index] == value).then_some(row_index))
-                    .collect()
-            }
+            let (column_index, value) = parse_equality_predicate(&table.columns, predicate)?;
+            table.matching_rows(column_index, &value)
         } else {
             (0..table.rows.len()).collect()
         };
-        let rows = selected_rows.into_iter().filter_map(|index| table.rows.get(index).cloned()).collect::<Vec<_>>();
+
+        let projection_indices = if projection == "*" {
+            (0..table.columns.len()).collect::<Vec<_>>()
+        } else {
+            split_csv(projection).into_iter().map(|name| {
+                let normalized = normalize_ident(name);
+                table.columns.iter().position(|column| column.name == normalized)
+                    .ok_or_else(|| DbError::ColumnNotFound(normalized))
+            }).collect::<Result<Vec<_>, _>>()?
+        };
+        let columns = projection_indices.iter().map(|index| table.columns[*index].name.clone()).collect();
+        let rows = selected_rows.into_iter().filter_map(|row_index| {
+            table.rows.get(row_index).map(|row| Row {
+                values: projection_indices.iter().map(|column_index| row.values[*column_index].clone()).collect()
+            })
+        }).collect::<Vec<_>>();
         Ok(QueryResult {
-            columns: table.columns.iter().map(|column| column.name.clone()).collect(),
             message: format!("{} row(s)", rows.len()),
             rows,
+            columns,
             affected_rows: 0,
         })
     }
 }
 
+
+fn parse_equality_predicate(columns: &[Column], predicate: &str) -> Result<(usize, Value), DbError> {
+    let equals = predicate.find('=').ok_or_else(|| DbError::Parse("expected '=' in equality predicate".into()))?;
+    let column_name = normalize_ident(predicate[..equals].trim());
+    let value = parse_value(predicate[equals + 1..].trim())?;
+    let column_index = columns.iter().position(|column| column.name == column_name)
+        .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
+    Ok((column_index, value))
+}
 
 fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
     let mut output = String::with_capacity(sql.len() + parameters.len() * 8);
