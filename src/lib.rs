@@ -1009,6 +1009,31 @@ mod tests {
     }
 
     #[test]
+    fn stable_row_ids_are_not_reused_after_delete_all_and_checkpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-stable-row-id-empty-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE row_id_reuse (value TEXT)").unwrap();
+            db.execute("INSERT INTO row_id_reuse VALUES ('first')").unwrap();
+            db.execute("INSERT INTO row_id_reuse VALUES ('second')").unwrap();
+            db.execute("DELETE FROM row_id_reuse").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        reopened.execute("INSERT INTO row_id_reuse VALUES ('third')").unwrap();
+        let row = reopened.execute("SELECT * FROM row_id_reuse WHERE value = 'third'").unwrap();
+        assert_eq!(row.rows[0].row_id, 3, "checkpoint must preserve the next ID even when no rows remain");
+        drop(reopened);
+        for suffix in [".pdb", ".pdb.wal", ".pdb.lock", ".pdb.pages", ".pdb.pages.btree.wal"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
     fn persistent_ember_index_applies_incremental_sql_insert_update_delete_deltas() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-index-delta-{}-{}.pdb",
@@ -1041,12 +1066,17 @@ mod tests {
                 .unwrap().rows[0].row_id;
             assert_eq!(player_c_after_delete, player_c_id, "deleting an earlier row must not renumber later rows");
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-d'").unwrap().rows.len(), 1);
+            db.execute("INSERT INTO delta_players VALUES ('player-e', 50)").unwrap();
+            let player_e_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'")
+                .unwrap().rows[0].row_id;
+            assert_eq!(player_e_id, 5, "deleted row IDs must not be reused");
             db.checkpoint().unwrap();
         }
         let mut reopened = Database::open(&path).unwrap();
         assert!(reopened.ember_indexes_valid);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'").unwrap().rows[0].row_id, 5);
         let player_c_reopened = reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
             .unwrap().rows[0].row_id;
         assert_eq!(player_c_reopened, player_c_id, "PDB5 checkpoint must preserve stable row identifiers");
