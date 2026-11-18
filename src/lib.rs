@@ -803,6 +803,31 @@ mod tests {
         assert_eq!(db.execute("SELECT * FROM sessions").unwrap().rows.len(), 1);
     }
 
+
+    #[test]
+    fn persistent_owned_session_commits_as_one_recoverable_unit() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-session-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            let mut session = db.begin_session();
+            session.execute("CREATE TABLE session_rows (value INTEGER)").unwrap();
+            session.execute_params("INSERT INTO session_rows VALUES (?)", &[Value::Integer(11)]).unwrap();
+            assert_eq!(session.execute("SELECT * FROM session_rows").unwrap().rows.len(), 1);
+            db.commit_session(session).unwrap();
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        let rows = reopened.execute("SELECT * FROM session_rows").unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Integer(11));
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
