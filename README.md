@@ -19,7 +19,7 @@ The planned tree-oriented storage model is named **EmberTree**. Its design, CoW/
 
 The project is at an early development stage. The first prototype provides:
 
-- an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`;
+- an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`; `.pbd` is the recommended extension, while existing `.db` paths remain accepted for legacy files;
 - a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` equality predicates joined by `AND`, bounded `LIMIT`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
@@ -54,7 +54,7 @@ cargo bench --no-run
 cargo run -- server 127.0.0.1:7432
 ```
 
-The server opens the specified database file (default: `postemberdb.pdb`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. The server supports the versioned JSONL/1 protocol for the optional KSL addon; it is not JDBC and is not suitable for untrusted networks.
+The server opens the specified database file (default: `postemberdb.pbd`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. The server supports the versioned JSONL/1 protocol for the optional KSL addon; it is not JDBC and is not suitable for untrusted networks.
 
 ## Use as an embedded library
 
@@ -62,7 +62,7 @@ The server opens the specified database file (default: `postemberdb.pdb`) and pe
 use postemberdb::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = Database::open("./data/app.pdb")?;
+    let mut db = Database::open("./data/app.pbd")?;
     db.execute("CREATE TABLE users (id INTEGER NOT NULL, name TEXT)")?;
     db.execute("INSERT INTO users VALUES (1, 'Ada')")?;
 
@@ -87,7 +87,7 @@ Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STA
 
 ## Development branches
 
-- `dev` — active development.
-- `canary` — early integration builds.
-- `unstable` — experimental work.
-- `stable` — reviewed releases.
+- `dev` — newest active development changes.
+- `canary` — raw but implemented features under early testing.
+- `unstable` — implemented and polished, but not release-ready.
+- `stable` — thoroughly validated, reliable, and security-reviewed releases.
