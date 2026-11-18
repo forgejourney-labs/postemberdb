@@ -11,6 +11,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Discard and truncate an incomplete final frame.
 - [x] Sequence-aware snapshot checkpointing to avoid duplicate replay after a crash.
 - [x] In-memory transaction rollback when the callback returns an error.
+- [x] Owned client sessions with optimistic revision conflict detection.
+- [x] Development server `BEGIN`, `COMMIT`, and `ROLLBACK` commands.
 - [ ] WAL streaming recovery (the current implementation reads the WAL into memory).
 - [ ] Savepoints, explicit SQL BEGIN/COMMIT/ROLLBACK, and transaction isolation levels.
 - [ ] Multi-process file locking and concurrent-writer coordination.
@@ -42,6 +44,7 @@ The current page format is a physical layout milestone only. Startup still recon
 ## 4. KSL/JVM adapter
 
 - [x] Typed positional SQL parameters in the Rust API.
+- [x] Typed positional parameters inside transaction sessions.
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
 - [ ] Stable framed client/server protocol.
