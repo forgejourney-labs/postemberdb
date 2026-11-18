@@ -69,10 +69,23 @@ impl Database {
                         "WAL sequence gap: expected {}, found {sequence}", self.wal_sequence + 1
                     )));
                 }
+                // A WAL frame is one committed transaction. Replay it against a
+                // private copy so a malformed later statement cannot publish a
+                // partially-applied transaction during recovery.
+                let mut staged = Database {
+                    tables: self.tables.clone(),
+                    storage_path: None,
+                    wal_path: None,
+                    _lock_file: None,
+                    wal_sequence: self.wal_sequence,
+                    revision: self.revision,
+                };
                 for statement in statements {
-                    self.execute_inner(&statement)?;
+                    staged.execute_inner(&statement)?;
                 }
+                self.tables = staged.tables;
                 self.wal_sequence = sequence;
+                self.revision = sequence;
             }
             offset = end;
         }
@@ -83,6 +96,36 @@ impl Database {
         }
         self.revision = self.wal_sequence;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn replay_is_atomic_per_wal_transaction() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-atomic-{}-{nonce}.wal",
+            std::process::id()
+        ));
+
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE should_not_exist (value INTEGER)".into(),
+            "INSERT INTO missing_table VALUES (1)".into(),
+        ]).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        assert!(recovered.replay_wal().is_err());
+        assert!(!recovered.tables.contains_key("should_not_exist"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
     }
 }
 
