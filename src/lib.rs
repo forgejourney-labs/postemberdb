@@ -90,10 +90,60 @@ impl fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum IndexKey {
+    Null,
+    Integer(i64),
+    Text(String),
+    Boolean(bool),
+}
+
+impl From<&Value> for IndexKey {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(value) => Self::Integer(*value),
+            Value::Text(value) => Self::Text(value.clone()),
+            Value::Boolean(value) => Self::Boolean(*value),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Index {
+    column_index: usize,
+    entries: BTreeMap<IndexKey, Vec<usize>>,
+}
+
 #[derive(Debug, Clone)]
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Row>,
+    indexes: BTreeMap<String, Index>,
+}
+
+impl Table {
+    fn add_index(&mut self, index_name: String, column_name: &str) -> Result<(), DbError> {
+        if self.indexes.contains_key(&index_name) {
+            return Err(DbError::Constraint(format!("index already exists: {index_name}")));
+        }
+        let column_index = self.columns.iter().position(|column| column.name == normalize_ident(column_name))
+            .ok_or_else(|| DbError::ColumnNotFound(column_name.to_owned()))?;
+        let mut index = Index { column_index, entries: BTreeMap::new() };
+        for (row_index, row) in self.rows.iter().enumerate() {
+            index.entries.entry(IndexKey::from(&row.values[column_index])).or_default().push(row_index);
+        }
+        self.indexes.insert(index_name, index);
+        Ok(())
+    }
+
+    fn index_row(&mut self, row_index: usize) {
+        let row = &self.rows[row_index];
+        for index in self.indexes.values_mut() {
+            index.entries.entry(IndexKey::from(&row.values[index.column_index]))
+                .or_default().push(row_index);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -110,7 +160,7 @@ impl Database {
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
-        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "INSERT INTO");
+        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "CREATE INDEX") || starts_with_kw(statement, "INSERT INTO");
         if is_write && self.storage_path.is_some() {
             return self.transaction(|transaction| transaction.execute(statement));
         }
@@ -120,6 +170,8 @@ impl Database {
     fn execute_inner(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         let result = if starts_with_kw(statement, "CREATE TABLE") {
             self.create_table(statement)
+        } else if starts_with_kw(statement, "CREATE INDEX") {
+            self.create_index(statement)
         } else if starts_with_kw(statement, "INSERT INTO") {
             self.insert(statement)
         } else if starts_with_kw(statement, "SELECT") {
@@ -237,8 +289,26 @@ impl Database {
             columns.push(Column { name: normalize_ident(column_name), data_type, nullable });
         }
         if columns.is_empty() { return Err(DbError::Parse("a table needs at least one column".into())); }
-        self.tables.insert(name.clone(), Table { columns, rows: Vec::new() });
+        self.tables.insert(name.clone(), Table { columns, rows: Vec::new(), indexes: BTreeMap::new() });
         Ok(QueryResult::message(format!("table {name} created")))
+    }
+
+    fn create_index(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let rest = sql["CREATE INDEX".len()..].trim();
+        let on_pos = find_kw(rest, "ON").ok_or_else(|| DbError::Parse("expected ON in CREATE INDEX".into()))?;
+        let index_name = normalize_ident(rest[..on_pos].trim());
+        let target = rest[on_pos + 2..].trim();
+        let open = target.find('(').ok_or_else(|| DbError::Parse("expected '(' with indexed column".into()))?;
+        let close = target.rfind(')').ok_or_else(|| DbError::Parse("expected ')' after indexed column".into()))?;
+        let table_name = normalize_ident(target[..open].trim());
+        let column_name = normalize_ident(target[open + 1..close].trim());
+        if index_name.is_empty() || column_name.is_empty() {
+            return Err(DbError::Parse("index and column names are required".into()));
+        }
+        let table = self.tables.get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        table.add_index(index_name.clone(), &column_name)?;
+        Ok(QueryResult::message(format!("index {index_name} created on {table_name}({column_name})")))
     }
 
     fn insert(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -257,6 +327,8 @@ impl Database {
             validate_value(column, value)?;
         }
         table.rows.push(Row { values });
+        let row_index = table.rows.len() - 1;
+        table.index_row(row_index);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row inserted".into() })
     }
 
@@ -264,15 +336,38 @@ impl Database {
         let upper = sql.to_ascii_uppercase();
         let from = upper.find(" FROM ").ok_or_else(|| DbError::Parse("expected FROM".into()))?;
         let projection = sql["SELECT".len()..from].trim();
-        if projection != "*" { return Err(DbError::Unsupported("only SELECT * is supported in this initial version".into())); }
+        if projection != "*" { return Err(DbError::Unsupported("only SELECT * is supported".into())); }
         let tail = sql[from + 6..].trim();
-        let table_name = normalize_ident(tail.split_whitespace().next().unwrap_or(""));
+        let upper_tail = tail.to_ascii_uppercase();
+        let where_pos = upper_tail.find(" WHERE ");
+        let (table_part, predicate) = match where_pos {
+            Some(position) => (&tail[..position], Some(tail[position + 7..].trim())),
+            None => (tail, None),
+        };
+        let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
+            let equals = predicate.find('=').ok_or_else(|| DbError::Parse("expected '=' in WHERE predicate".into()))?;
+            let column_name = normalize_ident(predicate[..equals].trim());
+            let value = parse_value(predicate[equals + 1..].trim())?;
+            let column_index = table.columns.iter().position(|column| column.name == column_name)
+                .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
+            if let Some(index) = table.indexes.values().find(|index| index.column_index == column_index) {
+                index.entries.get(&IndexKey::from(&value)).cloned().unwrap_or_default()
+            } else {
+                table.rows.iter().enumerate()
+                    .filter_map(|(row_index, row)| (row.values[column_index] == value).then_some(row_index))
+                    .collect()
+            }
+        } else {
+            (0..table.rows.len()).collect()
+        };
+        let rows = selected_rows.into_iter().filter_map(|index| table.rows.get(index).cloned()).collect::<Vec<_>>();
         Ok(QueryResult {
-            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
-            rows: table.rows.clone(),
+            columns: table.columns.iter().map(|column| column.name.clone()).collect(),
+            message: format!("{} row(s)", rows.len()),
+            rows,
             affected_rows: 0,
-            message: format!("{} row(s)", table.rows.len()),
         })
     }
 }
@@ -352,7 +447,7 @@ impl Transaction<'_> {
     /// Execute SQL against the transaction's private view.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let statement = sql.trim().trim_end_matches(';').trim();
-        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "INSERT INTO");
+        let is_write = starts_with_kw(statement, "CREATE TABLE") || starts_with_kw(statement, "CREATE INDEX") || starts_with_kw(statement, "INSERT INTO");
         let result = self.staged.execute_inner(statement)?;
         if is_write {
             self.statements.push(statement.to_owned());
@@ -488,7 +583,29 @@ mod tests {
         std::fs::remove_file(&wal_path).unwrap();
     }
 
+
     #[test]
+    fn indexed_equality_query_returns_matching_rows() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
+        db.execute("INSERT INTO players VALUES ('uuid-a', 10)").unwrap();
+        db.execute("INSERT INTO players VALUES ('uuid-b', 20)").unwrap();
+        db.execute("CREATE INDEX idx_players_uuid ON players (uuid)").unwrap();
+        db.execute("INSERT INTO players VALUES ('uuid-a', 30)").unwrap();
+        let result = db.execute("SELECT * FROM players WHERE uuid = 'uuid-a'").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], Value::Text("uuid-a".into()));
+        assert_eq!(result.rows[1].values[1], Value::Integer(30));
+    }
+
+    #[test]
+    fn indexed_where_returns_empty_for_missing_key() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE players (uuid TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_uuid ON players (uuid)").unwrap();
+        assert!(db.execute("SELECT * FROM players WHERE uuid = 'missing'").unwrap().rows.is_empty());
+    }
+\n    #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
         db.execute("CREATE TABLE metrics (value INTEGER)").unwrap();
