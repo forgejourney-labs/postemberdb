@@ -16,7 +16,7 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 The project is at an early development stage. The first prototype provides:
 
 - an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`;
-- basic `CREATE TABLE`, `INSERT INTO ... VALUES`, `CREATE INDEX`, and `SELECT ... WHERE column = value` statements;
+- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` equality predicates joined by `AND`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
 - integer, text, boolean, and nullable values;
 - basic column type and `NOT NULL` validation;
 - a versioned, fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
@@ -27,7 +27,7 @@ The project is at an early development stage. The first prototype provides:
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a minimal line-oriented TCP server for development and experimentation.
 
-**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range/composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
+**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a production network protocol are not implemented. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks.
 
 ## Build and test
 
