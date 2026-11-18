@@ -124,6 +124,57 @@ impl Database {
         result
     }
 
+    /// Insert a bounded batch of rows in one operation.
+    ///
+    /// Every row is validated before the table is changed. Persistent databases
+    /// are written once per batch instead of once per row. The limit matches
+    /// KSL's default maximum batch size; callers should split larger imports.
+    pub fn insert_many<I>(&mut self, table_name: &str, rows: I) -> Result<usize, DbError>
+    where
+        I: IntoIterator<Item = Vec<Value>>,
+    {
+        const MAX_BATCH_ROWS: usize = 5_000;
+        let mut batch = rows.into_iter().take(MAX_BATCH_ROWS + 1).collect::<Vec<_>>();
+        if batch.len() > MAX_BATCH_ROWS {
+            return Err(DbError::Constraint(format!(
+                "batch exceeds the maximum of {MAX_BATCH_ROWS} rows"
+            )));
+        }
+        if batch.is_empty() { return Ok(0); }
+
+        let normalized = normalize_ident(table_name);
+        let table = self.tables.get(&normalized)
+            .ok_or_else(|| DbError::TableNotFound(normalized.clone()))?;
+
+        // Validate the complete batch before mutating the table: no partial inserts.
+        for (row_index, values) in batch.iter().enumerate() {
+            if values.len() != table.columns.len() {
+                return Err(DbError::Constraint(format!(
+                    "row {}: expected {} values, received {}",
+                    row_index + 1, table.columns.len(), values.len()
+                )));
+            }
+            for (column, value) in table.columns.iter().zip(values.iter()) {
+                validate_value(column, value)?;
+            }
+        }
+
+        let table = self.tables.get_mut(&normalized).expect("table checked above");
+        let previous_len = table.rows.len();
+        table.rows.extend(batch.drain(..).map(|values| Row { values }));
+        let inserted = table.rows.len() - previous_len;
+
+        if self.storage_path.is_some() {
+            if let Err(error) = self.save() {
+                if let Some(table) = self.tables.get_mut(&normalized) {
+                    table.rows.truncate(previous_len);
+                }
+                return Err(error);
+            }
+        }
+        Ok(inserted)
+    }
+
     fn create_table(&mut self, sql: &str) -> Result<QueryResult, DbError> {
         let rest = sql["CREATE TABLE".len()..].trim();
         let open = rest.find('(').ok_or_else(|| DbError::Parse("expected '(' after table name".into()))?;
@@ -252,6 +303,45 @@ mod tests {
         let result = db.execute("SELECT * FROM users").unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values, vec![Value::Integer(1), Value::Text("Ada".into())]);
+    }
+
+
+    #[test]
+    fn bulk_insert_validates_then_persists_once() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-batch-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE player_stats (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
+            let inserted = db.insert_many("player_stats", vec![
+                vec![Value::Text("player-a".into()), Value::Integer(100)],
+                vec![Value::Text("player-b".into()), Value::Integer(250)],
+            ]).unwrap();
+            assert_eq!(inserted, 2);
+
+            let error = db.insert_many("player_stats", vec![
+                vec![Value::Text("player-c".into()), Value::Integer(300)],
+                vec![Value::Text("player-d".into()), Value::Text("invalid".into())],
+            ]);
+            assert!(error.is_err());
+            assert_eq!(db.execute("SELECT * FROM player_stats").unwrap().rows.len(), 2);
+        }
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.execute("SELECT * FROM player_stats").unwrap().rows.len(), 2);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bulk_insert_rejects_oversized_batches_without_partial_write() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE counters (value INTEGER)").unwrap();
+        let rows = (0..5_001).map(|n| vec![Value::Integer(n)]);
+        assert!(db.insert_many("counters", rows).is_err());
+        assert_eq!(db.execute("SELECT * FROM counters").unwrap().rows.len(), 0);
     }
 
     #[test]
