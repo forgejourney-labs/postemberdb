@@ -658,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn decodes_legacy_eam2_metadata_without_a_tree_root() {
+        let mut page = [0u8; PAGE_SIZE];
+        page[0..4].copy_from_slice(b"EAM2");
+        page[4..8].copy_from_slice(&2u32.to_le_bytes());
+        page[8..16].copy_from_slice(&7u64.to_le_bytes());
+        page[16..24].copy_from_slice(&0u64.to_le_bytes());
+        page[24..28].copy_from_slice(&0u32.to_le_bytes());
+        let checksum = super::super::checksum(&page[..36]);
+        page[28..36].copy_from_slice(&checksum.to_le_bytes());
+
+        let decoded = decode_metadata(&page).unwrap();
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.root_page_id, None);
+        assert!(decoded.free_extents.is_empty());
+    }
+
+    #[test]
     fn reserves_contiguous_extents_and_persists_written_pages() {
         let path = temp_path();
         let mut store = ExtentFile::open(&path).unwrap();
