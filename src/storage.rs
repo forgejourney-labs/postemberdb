@@ -585,19 +585,3 @@ fn checksum(bytes: &[u8]) -> u64 {
     hash
 }
 
-
-fn wal_file_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".wal");
-    PathBuf::from(name)
-}
-
-fn checksum(bytes: &[u8]) -> u64 {
-    // FNV-1a detects accidental corruption; it is not a cryptographic MAC.
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
