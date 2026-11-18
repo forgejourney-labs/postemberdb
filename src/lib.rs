@@ -466,16 +466,15 @@ impl Database {
         let values_pos = find_kw(rest, "VALUES").ok_or_else(|| DbError::Parse("expected VALUES".into()))?;
         let target = rest[..values_pos].trim();
         let (table_name, column_names) = if let Some(open) = target.find('(') {
-            let close = target.rfind(')').ok_or_else(|| DbError::Parse("expected ')' after insert columns".into()))?;
-            let names = split_csv(&target[open + 1..close]).into_iter().map(normalize_ident).collect::<Vec<_>>();
+            let (columns_text, _) = take_parenthesized(&target[open..])?;
+            let names = split_csv(columns_text).into_iter().map(normalize_ident).collect::<Vec<_>>();
             (normalize_ident(target[..open].trim()), Some(names))
         } else {
             (normalize_ident(target), None)
         };
 
-        let values_part = rest[values_pos + "VALUES".len()..].trim();
-        let values_part = values_part.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
-            .ok_or_else(|| DbError::Parse("expected VALUES (...)".into()))?;
+        let values_text = rest[values_pos + "VALUES".len()..].trim();
+        let (values_part, upsert_clause) = take_parenthesized(values_text)?;
         let supplied = split_csv(values_part).into_iter().map(parse_value).collect::<Result<Vec<_>, _>>()?;
         let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
         let values = if let Some(names) = column_names {
@@ -501,6 +500,10 @@ impl Database {
         };
         for (column, value) in table.columns.iter().zip(values.iter()) {
             validate_value(column, value)?;
+        }
+
+        if !upsert_clause.trim().is_empty() && apply_upsert(table, &values, upsert_clause)? {
+            return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
         }
         table.validate_unique(&values)?;
         table.rows.push(Row { values });
@@ -613,6 +616,111 @@ impl Database {
     }
 }
 
+
+fn take_parenthesized(input: &str) -> Result<(&str, &str), DbError> {
+    let input = input.trim_start();
+    if !input.starts_with('(') {
+        return Err(DbError::Parse("expected '('".into()));
+    }
+    let mut depth = 0i32;
+    let mut quote = None;
+    let chars = input.char_indices().collect::<Vec<_>>();
+    let mut cursor = 0usize;
+    while cursor < chars.len() {
+        let (position, ch) = chars[cursor];
+        if let Some(active) = quote {
+            if ch == active {
+                if cursor + 1 < chars.len() && chars[cursor + 1].1 == active {
+                    cursor += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok((&input[1..position], input[position + 1..].trim()));
+            }
+        }
+        cursor += 1;
+    }
+    Err(DbError::Parse("unclosed parenthesized expression".into()))
+}
+
+fn apply_upsert(table: &mut Table, values: &[Value], clause: &str) -> Result<bool, DbError> {
+    let trimmed = clause.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let (conflict_index, assignments) = if upper.starts_with("ON CONFLICT") {
+        let rest = trimmed["ON CONFLICT".len()..].trim();
+        let (columns_text, after_columns) = take_parenthesized(rest)?;
+        let column_names = split_csv(columns_text).into_iter().map(normalize_ident).collect::<Vec<_>>();
+        let column_indices = column_names.iter().map(|name| {
+            table.columns.iter().position(|column| column.name == *name)
+                .ok_or_else(|| DbError::ColumnNotFound(name.clone()))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let after_upper = after_columns.to_ascii_uppercase();
+        let set_pos = after_upper.find("DO UPDATE SET")
+            .ok_or_else(|| DbError::Parse("expected DO UPDATE SET in ON CONFLICT".into()))?;
+        let index = table.indexes.values().find(|index| index.unique && index.column_indices == column_indices)
+            .ok_or_else(|| DbError::Constraint("ON CONFLICT target is not a unique key".into()))?;
+        (Some(index), after_columns[set_pos + "DO UPDATE SET".len()..].trim())
+    } else if upper.starts_with("ON DUPLICATE KEY UPDATE") {
+        (None, trimmed["ON DUPLICATE KEY UPDATE".len()..].trim())
+    } else {
+        return Err(DbError::Unsupported(format!("upsert clause: {trimmed}")));
+    };
+
+    let existing = if let Some(index) = conflict_index {
+        let key = IndexKey::from_columns(values, &index.column_indices);
+        index.entries.get(&key).and_then(|rows| rows.first()).copied()
+    } else {
+        table.indexes.values().filter(|index| index.unique).find_map(|index| {
+            let key = IndexKey::from_columns(values, &index.column_indices);
+            index.entries.get(&key).and_then(|rows| rows.first()).copied()
+        })
+    };
+    let Some(row_index) = existing else { return Ok(false); };
+
+    let mut updates = Vec::new();
+    for assignment in split_csv(assignments) {
+        let equals = assignment.find('=').ok_or_else(|| DbError::Parse("expected '=' in upsert assignment".into()))?;
+        let target_name = normalize_ident(assignment[..equals].trim());
+        let target_index = table.columns.iter().position(|column| column.name == target_name)
+            .ok_or_else(|| DbError::ColumnNotFound(target_name.clone()))?;
+        let rhs = assignment[equals + 1..].trim();
+        let upper_rhs = rhs.to_ascii_uppercase();
+        let source_value = if upper_rhs.starts_with("EXCLUDED.") {
+            let source_name = normalize_ident(rhs["EXCLUDED.".len()..].trim());
+            let source_index = table.columns.iter().position(|column| column.name == source_name)
+                .ok_or_else(|| DbError::ColumnNotFound(source_name.clone()))?;
+            values[source_index].clone()
+        } else if upper_rhs.starts_with("VALUES") {
+            let (source_name, _) = take_parenthesized(rhs["VALUES".len()..].trim())?;
+            let source_name = normalize_ident(source_name);
+            let source_index = table.columns.iter().position(|column| column.name == source_name)
+                .ok_or_else(|| DbError::ColumnNotFound(source_name.clone()))?;
+            values[source_index].clone()
+        } else {
+            parse_value(rhs)?
+        };
+        validate_value(&table.columns[target_index], &source_value)?;
+        updates.push((target_index, source_value));
+    }
+    for (target_index, _) in &updates {
+        if table.indexes.values().any(|index| index.unique && index.column_indices.contains(target_index)) {
+            return Err(DbError::Constraint("upsert cannot modify a primary-key column".into()));
+        }
+    }
+    for (target_index, value) in updates {
+        table.rows[row_index].values[target_index] = value;
+    }
+    table.rebuild_indexes();
+    Ok(true)
+}
 
 fn parse_equality_predicates(columns: &[Column], predicate: &str) -> Result<Vec<(usize, Value)>, DbError> {
     let conditions = split_and_conditions(predicate);
