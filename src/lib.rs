@@ -675,7 +675,7 @@ impl Database {
             if let Some((path, index_name)) = persistent_index {
                 let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
                 let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
-                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key)? {
+                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
                     if rows.windows(2).any(|pair| pair[0] >= pair[1])
                         || rows.iter().any(|row| *row >= table.rows.len())
                     {
