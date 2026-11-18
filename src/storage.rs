@@ -671,6 +671,7 @@ pub(crate) fn lookup_ember_index(
     table_name: &str,
     index_name: &str,
     key: &super::IndexKey,
+    limit: Option<usize>,
 ) -> Result<Option<Vec<usize>>, DbError> {
     let page_path = page_tree_file_path(database_path);
     if !page_path.exists() {
@@ -690,8 +691,11 @@ pub(crate) fn lookup_ember_index(
     upper.push(0);
     upper.extend_from_slice(&u64::MAX.to_be_bytes());
 
+    if limit == Some(0) {
+        return Ok(Some(Vec::new()));
+    }
     let mut store = extent::ExtentFile::open(&page_path)?;
-    let entries = page_tree::scan_range(&mut store, &lower, &upper)?;
+    let entries = page_tree::scan_range_limited(&mut store, &lower, &upper, limit)?;
     let mut rows = Vec::with_capacity(entries.len());
     for (entry_key, _) in entries {
         if entry_key.len() != lower.len() {
