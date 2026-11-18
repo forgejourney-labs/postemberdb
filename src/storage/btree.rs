@@ -574,7 +574,7 @@ mod tests {
             }
 
             assert_eq!(tree.len(), reference.len());
-            tree.validate().unwrap();
+            tree.validate().unwrap_or_else(|error| panic!("B+ tree invariant failed at step {step} (key {key}, state {state:#x}): {error}"));
             for probe in [0, key, 128, 256] {
                 assert_eq!(tree.get(&probe), reference.get(&probe));
             }
