@@ -338,6 +338,12 @@ mod tests {
         let mut reopened = Database::open(&path).unwrap();
         let query = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap();
         assert_eq!(query.rows.len(), 700);
+        let limited = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a' LIMIT 5").unwrap();
+        assert_eq!(limited.rows.len(), 5);
+        assert_eq!(limited.rows[0].values[1], Value::Integer(0));
+        assert_eq!(limited.rows[4].values[1], Value::Integer(4));
+        let empty = reopened.execute("SELECT * FROM players WHERE uuid = 'player-a' LIMIT 0").unwrap();
+        assert!(empty.rows.is_empty());
         drop(reopened);
 
         let mut store = extent::ExtentFile::open(&page_path).unwrap();
@@ -671,6 +677,7 @@ pub(crate) fn lookup_ember_index(
     table_name: &str,
     index_name: &str,
     key: &super::IndexKey,
+    limit: Option<usize>,
 ) -> Result<Option<Vec<usize>>, DbError> {
     let page_path = page_tree_file_path(database_path);
     if !page_path.exists() {
@@ -690,8 +697,11 @@ pub(crate) fn lookup_ember_index(
     upper.push(0);
     upper.extend_from_slice(&u64::MAX.to_be_bytes());
 
+    if limit == Some(0) {
+        return Ok(Some(Vec::new()));
+    }
     let mut store = extent::ExtentFile::open(&page_path)?;
-    let entries = page_tree::scan_range(&mut store, &lower, &upper)?;
+    let entries = page_tree::scan_range_limited(&mut store, &lower, &upper, limit)?;
     let mut rows = Vec::with_capacity(entries.len());
     for (entry_key, _) in entries {
         if entry_key.len() != lower.len() {
@@ -713,7 +723,8 @@ fn recover_page_tree(path: &Path) -> Result<(), DbError> {
         return Ok(());
     }
     let mut store = extent::ExtentFile::open(&page_path)?;
-    page_tree::recover(&mut store, &wal_path)
+    page_tree::recover(&mut store, &wal_path)?;
+    page_tree::validate_tree(&mut store)
 }
 
 fn lock_file_path(path: &Path) -> PathBuf {
