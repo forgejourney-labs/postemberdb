@@ -5,6 +5,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"PDB3";
+const PAGE_MAGIC: &[u8; 4] = b"PPG1";
+const PAGE_SIZE: usize = 4096;
+const PAGE_META_SIZE: usize = 16;
+const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_META_SIZE;
+const MAX_SNAPSHOT_SIZE: usize = 512 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING: usize = 64 * 1024 * 1024;
 
@@ -41,7 +46,8 @@ impl Database {
     fn write_snapshot(&self) -> Result<(), DbError> {
         let path = self.storage_path.as_ref()
             .ok_or_else(|| DbError::Storage("database has no storage path; open it with Database::open".into()))?;
-        let bytes = self.encode()?;
+        let payload = self.encode()?;
+        let bytes = encode_pages(&payload)?;
         let temp = temporary_path(path);
         let result = (|| -> io::Result<()> {
             if let Some(parent) = path.parent() {
@@ -191,9 +197,16 @@ impl Database {
         let mut bytes = Vec::new();
         let mut limited = file.take((512 * 1024 * 1024) as u64 + 1);
         limited.read_to_end(&mut bytes).map_err(storage_error)?;
-        if bytes.len() > 512 * 1024 * 1024 {
-            return Err(DbError::Storage("database file exceeds 512 MiB safety limit".into()));
+        if bytes.len() > MAX_SNAPSHOT_SIZE + 64 * 1024 * 1024 {
+            return Err(DbError::Storage("database file exceeds snapshot safety limit".into()));
         }
+        let payload = if bytes.starts_with(PAGE_MAGIC) {
+            decode_pages(&bytes)?
+        } else {
+            // Backward compatibility with pre-page PDB1/PDB2/PDB3 snapshots.
+            bytes
+        };
+        let bytes = payload;
         let mut input = Decoder { bytes: &bytes, offset: 0 };
         let header = input.take(4)?;
         let (format_version, wal_sequence) = if header == b"PDB3" {
@@ -408,6 +421,43 @@ mod tests {
         fs::remove_file(wal).unwrap();
     }
 
+
+    #[test]
+    fn page_snapshot_round_trips_across_multiple_pages() {
+        let path = test_path("pages");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE page_data (value TEXT)").unwrap();
+            let rows = (0..300).map(|n| vec![Value::Text(format!("row-{n}-{}", "x".repeat(40)))]).collect::<Vec<_>>();
+            db.insert_many("page_data", rows).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let file = fs::read(&path).unwrap();
+        assert_eq!(&file[..4], PAGE_MAGIC);
+        assert!(u32::from_le_bytes(file[12..16].try_into().unwrap()) > 1);
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.execute("SELECT * FROM page_data").unwrap().rows.len(), 300);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(test_path("unused")).ok();
+    }
+
+    #[test]
+    fn page_snapshot_detects_corrupted_page_payload() {
+        let path = test_path("page-corrupt");
+        {
+            let db = Database::open(&path).unwrap();
+            db.save().unwrap();
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[32 + PAGE_META_SIZE] ^= 0x40;
+        fs::write(&path, bytes).unwrap();
+        let error = Database::open(&path).unwrap_err();
+        assert!(error.to_string().contains("checksum"));
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal_file_path(&test_path("unused"))).ok();
+    }
+
     #[test]
     fn failed_statement_does_not_replace_persisted_state() {
         let path = test_path("failed-write");
@@ -423,6 +473,80 @@ mod tests {
     }
 }
 
+
+
+fn encode_pages(payload: &[u8]) -> Result<Vec<u8>, DbError> {
+    if payload.len() > MAX_SNAPSHOT_SIZE {
+        return Err(DbError::Storage("snapshot exceeds 512 MiB safety limit".into()));
+    }
+    let page_count = payload.len().div_ceil(PAGE_PAYLOAD_SIZE);
+    let page_count_u32 = u32::try_from(page_count)
+        .map_err(|_| DbError::Storage("snapshot requires too many pages".into()))?;
+    let mut out = Vec::with_capacity(32 + page_count * PAGE_SIZE);
+    out.extend_from_slice(PAGE_MAGIC);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    out.extend_from_slice(&page_count_u32.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&checksum(payload).to_le_bytes());
+
+    for (page_number, chunk) in payload.chunks(PAGE_PAYLOAD_SIZE).enumerate() {
+        out.extend_from_slice(&(page_number as u32).to_le_bytes());
+        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        out.extend_from_slice(&checksum(chunk).to_le_bytes());
+        out.extend_from_slice(chunk);
+        out.resize(out.len() + PAGE_PAYLOAD_SIZE - chunk.len(), 0);
+    }
+    Ok(out)
+}
+
+fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
+    if file.len() < 32 || &file[..4] != PAGE_MAGIC {
+        return Err(DbError::Storage("invalid page-file header".into()));
+    }
+    let version = u32::from_le_bytes(file[4..8].try_into().unwrap());
+    let page_size = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
+    let page_count = u32::from_le_bytes(file[12..16].try_into().unwrap()) as usize;
+    let payload_len = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
+    let expected_checksum = u64::from_le_bytes(file[24..32].try_into().unwrap());
+
+    if version != 1 || page_size != PAGE_SIZE {
+        return Err(DbError::Storage("unsupported page-file version or page size".into()));
+    }
+    if payload_len > MAX_SNAPSHOT_SIZE {
+        return Err(DbError::Storage("page-file payload exceeds 512 MiB safety limit".into()));
+    }
+    let expected_pages = payload_len.div_ceil(PAGE_PAYLOAD_SIZE);
+    if page_count != expected_pages {
+        return Err(DbError::Storage("page count does not match payload length".into()));
+    }
+    let expected_file_len = 32usize.checked_add(page_count.checked_mul(PAGE_SIZE)
+        .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?)
+        .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?;
+    if file.len() != expected_file_len {
+        return Err(DbError::Storage("page-file length mismatch".into()));
+    }
+
+    let mut payload = Vec::with_capacity(payload_len);
+    for page_number in 0..page_count {
+        let start = 32 + page_number * PAGE_SIZE;
+        let page_id = u32::from_le_bytes(file[start..start + 4].try_into().unwrap()) as usize;
+        let used = u32::from_le_bytes(file[start + 4..start + 8].try_into().unwrap()) as usize;
+        let page_checksum = u64::from_le_bytes(file[start + 8..start + 16].try_into().unwrap());
+        if page_id != page_number || used > PAGE_PAYLOAD_SIZE {
+            return Err(DbError::Storage(format!("invalid page metadata for page {page_number}")));
+        }
+        let data = &file[start + PAGE_META_SIZE..start + PAGE_META_SIZE + used];
+        if checksum(data) != page_checksum {
+            return Err(DbError::Storage(format!("page checksum mismatch for page {page_number}")));
+        }
+        payload.extend_from_slice(data);
+    }
+    if payload.len() != payload_len || checksum(&payload) != expected_checksum {
+        return Err(DbError::Storage("page-file payload checksum mismatch".into()));
+    }
+    Ok(payload)
+}
 
 fn wal_file_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
