@@ -1829,8 +1829,7 @@ mod tests {
     #[test]
     fn unique_index_rejects_bulk_update_duplicates_atomically() {
         let mut db = Database::new();
-        db.execute("CREATE TABLE unique_updates (group_name TEXT, email TEXT)").unwrap();
-        db.execute("CREATE UNIQUE INDEX idx_unique_email ON unique_updates (email)").unwrap();
+        db.execute("CREATE TABLE unique_updates (group_name TEXT, email TEXT, PRIMARY KEY (email))").unwrap();
         db.execute("INSERT INTO unique_updates VALUES ('team', 'a@example.test')").unwrap();
         db.execute("INSERT INTO unique_updates VALUES ('team', 'b@example.test')").unwrap();
 
