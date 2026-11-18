@@ -130,6 +130,12 @@ impl Database {
                 }
             }
             put_u32(&mut out, checked_count(table.rows.len())?);
+            if table.next_row_id == 0
+                || table.rows.iter().any(|row| row.row_id >= table.next_row_id)
+            {
+                return Err(DbError::Storage(format!("invalid next stable row identifier in table {name}")));
+            }
+            out.extend_from_slice(&table.next_row_id.to_le_bytes());
             for row in &table.rows {
                 if row.row_id == 0 {
                     return Err(DbError::Storage(format!("zero stable row identifier in table {name}")));
@@ -224,9 +230,17 @@ impl Database {
                 }
             }
             let row_count = input.count()?;
+            let persisted_next_row_id = if format_version >= 5 {
+                u64::from_le_bytes(input.take(8)?.try_into().unwrap())
+            } else {
+                1
+            };
+            if persisted_next_row_id == 0 {
+                return Err(DbError::Storage("zero next stable row identifier in database file".into()));
+            }
             let mut rows = Vec::with_capacity(row_count);
             let mut row_positions = BTreeMap::new();
-            let mut next_row_id = 1u64;
+            let mut next_row_id = persisted_next_row_id;
             for row_position in 0..row_count {
                 let row_id = if format_version >= 5 {
                     u64::from_le_bytes(input.take(8)?.try_into().unwrap())
@@ -237,8 +251,12 @@ impl Database {
                 if row_id == 0 || row_positions.insert(row_id, row_position).is_some() {
                     return Err(DbError::Storage("zero or duplicate stable row identifier in database file".into()));
                 }
-                next_row_id = next_row_id.max(row_id.checked_add(1)
-                    .ok_or_else(|| DbError::Storage("stable row identifier space exhausted".into()))?);
+                let minimum_next = row_id.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("stable row identifier space exhausted".into()))?;
+                if format_version >= 5 && persisted_next_row_id < minimum_next {
+                    return Err(DbError::Storage("next stable row identifier does not exceed stored row identifiers".into()));
+                }
+                next_row_id = next_row_id.max(minimum_next);
                 let mut values = Vec::with_capacity(column_count);
                 for column in &columns {
                     let value = match input.byte()? {
