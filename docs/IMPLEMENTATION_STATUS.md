@@ -21,12 +21,13 @@ This file tracks implemented behavior separately from planned work. A checked bo
 ## 2. Indexes
 
 - [x] Single-column typed B-tree equality indexes.
+- [x] Unique composite indexes generated from SQL PRIMARY KEY constraints.
 - [x] CREATE INDEX and SELECT equality predicates.
 - [x] Index maintenance during INSERT and bounded bulk insert.
 - [x] Persist index definitions and rebuild index entries after snapshot load.
 - [x] Restore index definitions through WAL replay.
 - [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
-- [ ] General composite indexes, range scans, ordering, and index selection for multi-predicate queries.
+- [ ] User-defined general composite indexes, range scans, ordering, and a cost-aware index planner.
 - [ ] Range scans, ordering, and index selection for multi-predicate queries.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
