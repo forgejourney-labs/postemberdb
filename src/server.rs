@@ -269,7 +269,7 @@ mod tests {
     fn jsonl_response_encodes_text_and_preserves_types() {
         let result = QueryResult {
             columns: vec!["name".into(), "count".into(), "enabled".into(), "missing".into()],
-            rows: vec![postemberdb::Row { values: vec![
+            rows: vec![postemberdb::Row { row_id: 0, values: vec![
                 Value::Text("a\n\"b".into()), Value::Integer(42),
                 Value::Boolean(true), Value::Null,
             ]}],
