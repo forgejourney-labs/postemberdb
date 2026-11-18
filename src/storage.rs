@@ -743,10 +743,6 @@ impl Database {
         Ok(true)
     }
 
-    /// Apply only the persistent index entries that changed between two
-    /// committed SQL states. SQL WAL remains authoritative; callers disable
-    /// the mirror and fall back to in-memory indexes if this derived update fails.
-
 }
 
 fn collect_ember_index_entries(
