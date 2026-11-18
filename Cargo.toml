@@ -12,3 +12,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "postemberdb"
 path = "src/main.rs"
+
+[[bench]]
+name = "minecraft_workload"
+harness = false
