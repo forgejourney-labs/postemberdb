@@ -24,6 +24,7 @@ The project is at an early development stage. The first prototype provides:
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
 - a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
+- an experimental page-backed CoW B+ tree snapshot API using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; it is not yet the SQL index backend;
 - an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
 - staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
 - secondary indexes backed by our in-memory B+ tree with indexed equality predicates (`CREATE INDEX` and `SELECT * ... WHERE column = value`);
@@ -32,7 +33,7 @@ The project is at an early development stage. The first prototype provides:
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
 - a loopback-only TCP server with a versioned JSONL/1 protocol for the optional KSL addon.
 
-**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a secure production network protocol are not implemented. JSONL/1 is an initial loopback-only integration protocol. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
+**Current limitations:** WAL transactions and optimistic client sessions are implemented, but the engine still replays SQL records and stores table rows in memory; page-cache and streaming row access (the page snapshot is still decoded into memory), and the standalone page-backed B+ tree is not yet connected to SQL index lookups or the SQL transaction WAL, range indexes and general composite indexes, bounded query execution, concurrent multi-process file locking, and a secure production network protocol are not implemented. JSONL/1 is an initial loopback-only integration protocol. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
 
 ## CLI
 
