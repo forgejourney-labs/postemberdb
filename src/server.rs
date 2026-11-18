@@ -1,4 +1,4 @@
-use postemberdb::{Database, DatabaseSession, QueryResult};
+use postemberdb::{Database, DatabaseSession, QueryResult, Value};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -124,6 +124,7 @@ fn handle_client(
     let mut reader = io::BufReader::new(reader_stream);
     let mut line = Vec::with_capacity(1024);
     let mut session: Option<DatabaseSession> = None;
+    let mut jsonl_mode = false;
     writeln!(stream, "PostemberDB/0.1 ready; send one SQL statement per line")?;
     loop {
         let sql = match read_bounded_line(&mut reader, &mut line, MAX_SQL_LINE_BYTES) {
@@ -137,48 +138,54 @@ fn handle_client(
         };
         let command = sql.trim();
         if command.eq_ignore_ascii_case("QUIT") { break; }
+        if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
+            jsonl_mode = true;
+            stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\\n")?;
+            stream.flush()?;
+            continue;
+        }
 
         let response = if command.eq_ignore_ascii_case("BEGIN") || command.eq_ignore_ascii_case("BEGIN TRANSACTION") {
             if session.is_some() {
-                "ERROR transaction already active\n".to_owned()
+                if jsonl_mode { json_error("transaction already active") } else { "ERROR transaction already active\n".to_owned() }
             } else {
                 match database.lock() {
                     Ok(db) => {
                         session = Some(db.begin_session());
-                        "OK transaction started\n".to_owned()
+                        if jsonl_mode { json_ok_message("transaction started") } else { "OK transaction started\n".to_owned() }
                     }
-                    Err(_) => "ERROR database lock poisoned\n".to_owned(),
+                    Err(_) => if jsonl_mode { json_error("database lock poisoned") } else { "ERROR database lock poisoned\n".to_owned() },
                 }
             }
         } else if command.eq_ignore_ascii_case("COMMIT") {
             match session.take() {
-                None => "ERROR no active transaction\n".to_owned(),
+                None => if jsonl_mode { json_error("no active transaction") } else { "ERROR no active transaction\n".to_owned() },
                 Some(transaction) => match database.lock() {
                     Ok(mut db) => match db.commit_session(transaction) {
-                        Ok(()) => "OK transaction committed\n".to_owned(),
-                        Err(error) => format!("ERROR {error}\n"),
+                        Ok(()) => if jsonl_mode { json_ok_message("transaction committed") } else { "OK transaction committed\n".to_owned() },
+                        Err(error) => if jsonl_mode { json_error(&error.to_string()) } else { format!("ERROR {error}\n") },
                     },
-                    Err(_) => "ERROR database lock poisoned\n".to_owned(),
+                    Err(_) => if jsonl_mode { json_error("database lock poisoned") } else { "ERROR database lock poisoned\n".to_owned() },
                 }
             }
         } else if command.eq_ignore_ascii_case("ROLLBACK") {
             if session.take().is_some() {
-                "OK transaction rolled back\n".to_owned()
+                if jsonl_mode { json_ok_message("transaction rolled back") } else { "OK transaction rolled back\n".to_owned() }
             } else {
-                "ERROR no active transaction\n".to_owned()
+                if jsonl_mode { json_error("no active transaction") } else { "ERROR no active transaction\n".to_owned() }
             }
         } else if let Some(transaction) = session.as_mut() {
             match transaction.execute(&sql) {
-                Ok(result) => format_result(result),
-                Err(error) => format!("ERROR {error}\n"),
+                Ok(result) => if jsonl_mode { format_result_json(result) } else { format_result(result) },
+                Err(error) => if jsonl_mode { json_error(&error.to_string()) } else { format!("ERROR {error}\n") },
             }
         } else {
             match database.lock() {
                 Ok(mut db) => match db.execute(&sql) {
-                    Ok(result) => format_result(result),
-                    Err(error) => format!("ERROR {error}\n"),
+                    Ok(result) => if jsonl_mode { format_result_json(result) } else { format_result(result) },
+                    Err(error) => if jsonl_mode { json_error(&error.to_string()) } else { format!("ERROR {error}\n") },
                 },
-                Err(_) => "ERROR database lock poisoned\n".to_owned(),
+                Err(_) => if jsonl_mode { json_error("database lock poisoned") } else { "ERROR database lock poisoned\n".to_owned() },
             }
         };
         stream.write_all(response.as_bytes())?;
@@ -186,6 +193,53 @@ fn handle_client(
     }
     // An uncommitted session is dropped and therefore rolled back on disconnect.
     Ok(())
+}
+
+fn json_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character <= '\u{1f}' => output.push_str(&format!("\\u{:04x}", character as u32)),
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn json_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Integer(number) => number.to_string(),
+        Value::Boolean(boolean) => boolean.to_string(),
+        Value::Text(text) => json_escape(text),
+    }
+}
+
+fn json_ok_message(message: &str) -> String {
+    format!("{{\"ok\":true,\"message\":{},\"affected_rows\":0,\"columns\":[],\"rows\":[]}}\n", json_escape(message))
+}
+
+fn json_error(message: &str) -> String {
+    format!("{{\"ok\":false,\"error\":{}}}\n", json_escape(message))
+}
+
+fn format_result_json(result: QueryResult) -> String {
+    let columns = result.columns.iter().map(|column| json_escape(column)).collect::<Vec<_>>().join(",");
+    let rows = result.rows.iter().map(|row| {
+        let values = row.values.iter().map(json_value).collect::<Vec<_>>().join(",");
+        format!("[{values}]")
+    }).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"ok\":true,\"message\":{},\"affected_rows\":{},\"columns\":[{}],\"rows\":[{}]}}\n",
+        json_escape(&result.message), result.affected_rows, columns, rows
+    )
 }
 
 fn format_result(result: QueryResult) -> String {
@@ -205,7 +259,26 @@ fn format_result(result: QueryResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_bounded_line, validate_bind_address};
+    use postemberdb::{QueryResult, Value};
     use std::io::{self, BufReader, Cursor};
+
+    #[test]
+    fn jsonl_response_encodes_text_and_preserves_types() {
+        let result = QueryResult {
+            columns: vec!["name".into(), "count".into(), "enabled".into(), "missing".into()],
+            rows: vec![postemberdb::Row { values: vec![
+                Value::Text("a\n\"b".into()), Value::Integer(42),
+                Value::Boolean(true), Value::Null,
+            ]}],
+            affected_rows: 0,
+            message: "selected".into(),
+        };
+        let encoded = super::format_result_json(result);
+        assert!(encoded.contains("\"count\""));
+        assert!(encoded.contains("[42,true,null]"));
+        assert!(encoded.contains("a\\n\\\"b"));
+        assert!(super::json_error("bad").contains("\"ok\":false"));
+    }
 
     #[test]
     fn server_accepts_only_loopback_bind_addresses() {
