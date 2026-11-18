@@ -28,7 +28,7 @@ fn read_bounded_line<R: io::BufRead>(reader: &mut R, output: &mut Vec<u8>, limit
             break;
         }
         received_any = true;
-        let newline = available.iter().position(|byte| *byte == b'\\n');
+        let newline = available.iter().position(|byte| *byte == 10);
         let consumed = newline.map_or(available.len(), |position| position + 1);
         let content_len = newline.unwrap_or(consumed);
         if !overflow {
@@ -44,7 +44,7 @@ fn read_bounded_line<R: io::BufRead>(reader: &mut R, output: &mut Vec<u8>, limit
     if overflow {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "SQL line exceeds configured limit"));
     }
-    if output.last() == Some(&b'\\r') { output.pop(); }
+    if output.last() == Some(&13) { output.pop(); }
     Ok(Some(output.len()))
 }
 
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn bounded_line_reader_rejects_oversize_and_recovers_at_next_line() {
-        let input = Cursor::new(b"12345\\nOK\\n".to_vec());
+        let input = Cursor::new(vec![b'1', b'2', b'3', b'4', b'5', 10, b'O', b'K', 10]);
         let mut reader = BufReader::new(input);
         let mut line = Vec::new();
         let error = read_bounded_line(&mut reader, &mut line, 4).unwrap_err();
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn bounded_line_reader_accepts_exact_limit_and_final_line_without_newline() {
-        let input = Cursor::new(b"ABCD\\nxyz".to_vec());
+        let input = Cursor::new(vec![b'A', b'B', b'C', b'D', 10, b'x', b'y', b'z']);
         let mut reader = BufReader::new(input);
         let mut line = Vec::new();
         assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), Some(4));
