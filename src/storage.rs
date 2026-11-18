@@ -54,6 +54,7 @@ impl Database {
             db.write_snapshot()?;
         }
         db.replay_wal()?;
+        recover_page_tree(&path)?;
         Ok(db)
     }
 
@@ -367,6 +368,27 @@ mod tests {
     }
 
     #[test]
+    fn database_open_recovers_an_existing_ember_tree_sidecar() {
+        let path = test_path("embertree-recovery");
+        let pages = page_tree_file_path(&path);
+        let tree_wal = page_tree_wal_file_path(&path);
+        {
+            let _store = extent::ExtentFile::open(&pages).unwrap();
+            fs::write(&tree_wal, b"PBTWpartial").unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        drop(db);
+        assert_eq!(fs::metadata(&tree_wal).unwrap().len(), 0);
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(wal_file_path(&path)).ok();
+        fs::remove_file(lock_file_path(&path)).ok();
+        fs::remove_file(pages).ok();
+        fs::remove_file(tree_wal).ok();
+    }
+
+    #[test]
     fn rejects_invalid_database_header() {
         let path = test_path("invalid");
         fs::write(&path, b"NOPE").unwrap();
@@ -479,6 +501,30 @@ fn checksum(bytes: &[u8]) -> u64 {
     hash
 }
 
+
+fn page_tree_file_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".pages");
+    PathBuf::from(name)
+}
+
+fn page_tree_wal_file_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".pages.btree.wal");
+    PathBuf::from(name)
+}
+
+/// Recover the experimental EmberTree sidecar before exposing the database.
+/// The main PPG1 snapshot and SQL WAL remain untouched and authoritative.
+fn recover_page_tree(path: &Path) -> Result<(), DbError> {
+    let page_path = page_tree_file_path(path);
+    let wal_path = page_tree_wal_file_path(path);
+    if !page_path.exists() && !wal_path.exists() {
+        return Ok(());
+    }
+    let mut store = extent::ExtentFile::open(&page_path)?;
+    page_tree::recover(&mut store, &wal_path)
+}
 
 fn lock_file_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
