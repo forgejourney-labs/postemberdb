@@ -1041,12 +1041,17 @@ mod tests {
                 .unwrap().rows[0].row_id;
             assert_eq!(player_c_after_delete, player_c_id, "deleting an earlier row must not renumber later rows");
             assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'player-d'").unwrap().rows.len(), 1);
+            db.execute("INSERT INTO delta_players VALUES ('player-e', 50)").unwrap();
+            let player_e_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'")
+                .unwrap().rows[0].row_id;
+            assert_eq!(player_e_id, 5, "deleted row IDs must not be reused");
             db.checkpoint().unwrap();
         }
         let mut reopened = Database::open(&path).unwrap();
         assert!(reopened.ember_indexes_valid);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
         assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'").unwrap().rows[0].row_id, 5);
         let player_c_reopened = reopened.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
             .unwrap().rows[0].row_id;
         assert_eq!(player_c_reopened, player_c_id, "PDB5 checkpoint must preserve stable row identifiers");
