@@ -156,3 +156,12 @@ After the canonical SQL WAL commit is durable, the database now compares the pre
 ## Atomic mixed mutation batches
 
 The persistent page-tree API now exposes `apply_mutations`, which accepts removals and upserts together. It evaluates removals first and upserts second (so an upsert wins for a key present in both lists), stages the combined copy-on-write changes, writes one redo record, and publishes one root. SQL transaction delta synchronization now uses this combined operation instead of publishing a delete root followed by a separate insert root. This closes the intermediate-root window between the two halves of one derived-index update. The SQL WAL remains authoritative; mirror failures still fall back to in-memory indexes. The mixed-batch API does not change the current O(N) delta discovery or positional row-reference limitations.
+
+
+## Stable SQL row identifiers
+
+SQL rows now carry monotonically allocated table-local `u64` identifiers. Deleting an earlier row changes its in-memory vector position but never changes the identifiers of surviving rows. The derived EmberTree mirror stores these identifiers instead of positional offsets; query execution resolves returned IDs through a table-local ID-to-position map and validates every reference. This removes the large index-delta amplification previously caused by row shifts after DELETE.
+
+The snapshot payload version is now PDB5 and stores each row identifier. PDB4 and earlier snapshots remain readable: legacy rows receive deterministic identifiers in their existing row order, and the next checkpoint writes PDB5. Zero is reserved for synthetic aggregate result rows and is rejected in persisted table rows and persistent index entries. IDs are monotonically allocated and are not reused after deletion. The SQL WAL remains authoritative, and the derived EmberTree mirror is rebuilt from canonical snapshot/WAL state during open.
+
+Delta discovery still compares complete in-memory index-entry sets (O(total indexed entries)); direct mutation journaling remains future work. Stable IDs solve positional churn, not the full-scan cost.
