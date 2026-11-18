@@ -1015,6 +1015,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+        let player_c_id;
         {
             let mut db = Database::open(&path).unwrap();
             db.execute("CREATE TABLE delta_players (uuid TEXT, coins INTEGER)").unwrap();
@@ -1026,7 +1027,7 @@ mod tests {
 
             db.execute("INSERT INTO delta_players VALUES ('player-d', 40)").unwrap();
             assert!(db.ember_indexes_valid);
-            let player_c_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
+            player_c_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-c'")
                 .unwrap().rows[0].row_id;
             db.execute("UPDATE delta_players SET uuid = 'player-a2' WHERE uuid = 'player-a'").unwrap();
             assert!(db.ember_indexes_valid);
