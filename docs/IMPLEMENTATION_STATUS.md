@@ -36,12 +36,14 @@ This file tracks implemented behavior separately from planned work. A checked bo
 ## 3. Page-oriented storage
 
 - [x] Fixed 4 KiB page-file snapshots.
-- [x] Page identifiers, per-page checksums, and whole-payload checksum.\n- [x] Strict page validation for canonical payload lengths, zero padding, and platform-safe length conversion.
+- [x] Page identifiers, per-page checksums, and whole-payload checksum.
+- [x] Strict page validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
 - [ ] Bounded page cache / buffer pool.
 - [ ] Lazy page reads and streaming table scans.
 - [ ] Page-level row updates instead of full snapshot rewrite at checkpoint.
-- [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.\n- [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
+- [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
+- [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
 
 The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
 
