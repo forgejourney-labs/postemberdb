@@ -653,6 +653,45 @@ fn put_namespace_part(out: &mut Vec<u8>, value: &[u8]) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Look up all row references for one exact SQL index key in the persistent tree.
+pub(crate) fn lookup_ember_index(
+    database_path: &Path,
+    table_name: &str,
+    index_name: &str,
+    key: &super::IndexKey,
+) -> Result<Option<Vec<usize>>, DbError> {
+    let page_path = page_tree_file_path(database_path);
+    if !page_path.exists() {
+        return Ok(None);
+    }
+    let mut prefix = Vec::new();
+    put_namespace_part(&mut prefix, table_name.as_bytes())?;
+    put_namespace_part(&mut prefix, index_name.as_bytes())?;
+    prefix.extend_from_slice(&index_codec::encode_index_key(key)?);
+    if prefix.len() > 1015 {
+        return Err(DbError::Storage("namespaced SQL index key leaves no room for its row-reference suffix".into()));
+    }
+    let mut lower = prefix.clone();
+    lower.push(0);
+    lower.extend_from_slice(&0u64.to_be_bytes());
+    let mut upper = prefix;
+    upper.push(0);
+    upper.extend_from_slice(&u64::MAX.to_be_bytes());
+
+    let mut store = extent::ExtentFile::open(&page_path)?;
+    let entries = page_tree::scan_range(&mut store, &lower, &upper)?;
+    let mut rows = Vec::with_capacity(entries.len());
+    for (entry_key, _) in entries {
+        if entry_key.len() != lower.len() {
+            return Err(DbError::Storage("malformed persistent SQL index row-reference key".into()));
+        }
+        let value = u64::from_be_bytes(entry_key[entry_key.len() - 8..].try_into().unwrap());
+        rows.push(usize::try_from(value)
+            .map_err(|_| DbError::Storage("persistent SQL row reference does not fit this platform".into()))?);
+    }
+    Ok(Some(rows))
+}
+
 /// Recover the experimental EmberTree sidecar before exposing the database.
 /// The main PPG1 snapshot and SQL WAL remain untouched and authoritative.
 fn recover_page_tree(path: &Path) -> Result<(), DbError> {
