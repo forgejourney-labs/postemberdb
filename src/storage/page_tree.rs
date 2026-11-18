@@ -6,6 +6,7 @@
 
 use super::extent::ExtentFile;
 use super::DbError;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -72,6 +73,7 @@ pub(crate) fn replace_all(
         store.write_page(*page_id, payload)?;
     }
     store.publish_root(Some(root_page_id))?;
+    validate_tree(store)?;
     truncate_wal(wal_path)?;
     Ok(())
 }
@@ -112,6 +114,7 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
         store.write_page(page_id, &payload)?;
     }
     store.publish_root(Some(root_page_id))?;
+    validate_tree(store)?;
     file.set_len(0).map_err(storage_error)?;
     file.sync_all().map_err(storage_error)?;
     Ok(())
@@ -141,36 +144,107 @@ pub(crate) fn scan_range(
     lower: &[u8],
     upper: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
+    scan_range_limited(store, lower, upper, None)
+}
+
+/// Scans an inclusive key range and stops as soon as the requested number of
+/// entries has been collected. Internal separators prune subtrees outside the
+/// upper bound, so LIMIT queries do not traverse the remainder of the tree.
+pub(crate) fn scan_range_limited(
+    store: &mut ExtentFile,
+    lower: &[u8],
+    upper: &[u8],
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
     let mut out = Vec::new();
-    if lower > upper { return Ok(out); }
+    if lower > upper || limit == Some(0) { return Ok(out); }
     let Some(root) = store.root_page_id() else { return Ok(out); };
-    scan_node(store, root, lower, upper, &mut out)?;
+    scan_node_limited(store, root, lower, upper, limit, &mut out)?;
     Ok(out)
 }
 
-fn scan_node(
+fn scan_node_limited(
     store: &mut ExtentFile,
     page_id: u64,
     lower: &[u8],
     upper: &[u8],
+    limit: Option<usize>,
     out: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<(), DbError> {
+    if limit.is_some_and(|maximum| out.len() >= maximum) { return Ok(()); }
     match decode_node(&store.read_page(page_id)?)? {
         DecodedNode::Leaf(entries) => {
             let start = entries.partition_point(|(key, _)| key.as_slice() < lower);
-            for (key, value) in entries.into_iter().skip(start) {
-                if key.as_slice() > upper { break; }
+            let end = entries.partition_point(|(key, _)| key.as_slice() <= upper);
+            for (key, value) in entries.into_iter().take(end).skip(start) {
                 out.push((key, value));
+                if limit.is_some_and(|maximum| out.len() >= maximum) { break; }
             }
         }
         DecodedNode::Internal(children) => {
             let first = children[1..].partition_point(|(separator, _)| separator.as_slice() <= lower);
-            for (_, child) in children.into_iter().skip(first) {
-                scan_node(store, child, lower, upper, out)?;
+            for (first_key, child) in children.into_iter().skip(first) {
+                if first_key.as_slice() > upper { break; }
+                scan_node_limited(store, child, lower, upper, limit, out)?;
+                if limit.is_some_and(|maximum| out.len() >= maximum) { break; }
             }
         }
     }
     Ok(())
+}
+
+/// Validates the complete reachable tree, including child ranges and separator
+/// equality. It also rejects cycles and pages referenced by multiple parents.
+pub(crate) fn validate_tree(store: &mut ExtentFile) -> Result<(), DbError> {
+    let Some(root) = store.root_page_id() else { return Ok(()); };
+    let allocation_bound = store.stats().allocated_pages;
+    let mut visited = HashSet::new();
+    validate_subtree(store, root, &mut visited, allocation_bound)?;
+    Ok(())
+}
+
+fn validate_subtree(
+    store: &mut ExtentFile,
+    page_id: u64,
+    visited: &mut HashSet<u64>,
+    allocation_bound: u64,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, DbError> {
+    if !visited.insert(page_id) {
+        return Err(DbError::Storage("B+ tree contains a cycle or multiply-referenced page".into()));
+    }
+    if visited.len() as u64 > allocation_bound {
+        return Err(DbError::Storage("B+ tree reachability exceeds allocated page count".into()));
+    }
+    match decode_node(&store.read_page(page_id)?)? {
+        DecodedNode::Leaf(entries) => {
+            Ok(entries.first().zip(entries.last()).map(|(first, last)| (first.0.clone(), last.0.clone())))
+        }
+        DecodedNode::Internal(children) => {
+            if children.len() < 2 {
+                return Err(DbError::Storage("B+ tree internal node has fewer than two children".into()));
+            }
+            let mut previous_max: Option<Vec<u8>> = None;
+            let mut overall_min: Option<Vec<u8>> = None;
+            let mut overall_max: Option<Vec<u8>> = None;
+            for (index, (separator, child_id)) in children.iter().enumerate() {
+                let range = validate_subtree(store, *child_id, visited, allocation_bound)?
+                    .ok_or_else(|| DbError::Storage("B+ tree internal node references an empty child".into()))?;
+                if index == 0 {
+                    overall_min = Some(range.0.clone());
+                } else {
+                    if separator != &range.0 {
+                        return Err(DbError::Storage("B+ tree separator does not match right-child minimum".into()));
+                    }
+                    if previous_max.as_ref().is_some_and(|maximum| maximum >= &range.0) {
+                        return Err(DbError::Storage("B+ tree child key ranges overlap or are unordered".into()));
+                    }
+                }
+                previous_max = Some(range.1.clone());
+                overall_max = Some(range.1);
+            }
+            Ok(overall_min.zip(overall_max))
+        }
+    }
 }
 
 fn validate_entries(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
@@ -360,6 +434,7 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
     }
     let mut offset = 0usize;
     let mut pages = Vec::with_capacity(count);
+    let mut page_ids = HashSet::with_capacity(count);
     for _ in 0..count {
         if offset + 12 > payload.len() { return Err(DbError::Storage("truncated B+ tree WAL page record".into())); }
         let page_id = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
@@ -367,12 +442,17 @@ fn decode_wal(bytes: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>), DbError> {
         offset += 12;
         let end = offset.checked_add(len).ok_or_else(|| DbError::Storage("B+ tree WAL page length overflow".into()))?;
         if end > payload.len() { return Err(DbError::Storage("truncated B+ tree WAL page payload".into())); }
-        pages.push((page_id, payload[offset..end].to_vec()));
+        if !page_ids.insert(page_id) {
+            return Err(DbError::Storage("B+ tree WAL contains duplicate page IDs".into()));
+        }
+        let page = payload[offset..end].to_vec();
+        decode_node(&page)?;
+        pages.push((page_id, page));
         offset = end;
     }
     if offset != payload.len() { return Err(DbError::Storage("trailing bytes in B+ tree WAL".into())); }
-    if pages.is_empty() || !pages.iter().any(|(page_id, _)| *page_id == root) {
-        return Err(DbError::Storage("B+ tree WAL root is not present in its page set".into()));
+    if pages.is_empty() || page_ids.iter().filter(|page_id| **page_id == root).count() != 1 {
+        return Err(DbError::Storage("B+ tree WAL root must appear exactly once in its page set".into()));
     }
     Ok((root, pages))
 }
@@ -434,7 +514,7 @@ mod tests {
     #[test]
     fn cow_tree_round_trips_and_publishes_new_root() {
         let (path, wal) = paths("roundtrip");
-        let entries = (0..800).map(|n| (format!("key-{n:04}").into_bytes(), format!("value-{n}").into_bytes())).collect::<Vec<_>>();
+        let entries = (0..800).map(|n: u64| (format!("key-{n:04}").into_bytes(), format!("value-{n}").into_bytes())).collect::<Vec<_>>();
         let mut store = ExtentFile::open(&path).unwrap();
         replace_all(&mut store, &wal, &entries).unwrap();
         let first_root = store.root_page_id().unwrap();
@@ -476,6 +556,59 @@ mod tests {
         recover(&mut store, &wal).unwrap();
         assert_eq!(store.root_page_id(), Some(page_id));
         assert_eq!(get(&mut store, b"durable").unwrap(), Some(b"value".to_vec()));
+        drop(store);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn redo_wal_rejects_duplicate_page_ids() {
+        let page = encode_leaf(&[(b"one".to_vec(), b"value".to_vec())]).unwrap();
+        let frame = encode_wal(7, &[(7, page.clone()), (7, page)]).unwrap();
+        assert!(decode_wal(&frame).is_err());
+    }
+
+    #[test]
+    fn redo_wal_rejects_invalid_page_images_before_replay() {
+        let frame = encode_wal(9, &[(9, b"not-a-node".to_vec())]).unwrap();
+        assert!(decode_wal(&frame).is_err());
+    }
+
+    #[test]
+    fn validates_tree_structure_after_reopen() {
+        let (path, wal) = paths("validate");
+        let entries = (0u64..900)
+            .map(|n: u64| (format!("entry-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        {
+            let mut store = ExtentFile::open(&path).unwrap();
+            replace_all(&mut store, &wal, &entries).unwrap();
+            validate_tree(&mut store).unwrap();
+        }
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        validate_tree(&mut reopened).unwrap();
+        assert_eq!(get(&mut reopened, b"entry-0899").unwrap(), Some(899u64.to_le_bytes().to_vec()));
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn bounded_range_scan_stops_at_limit_and_prunes_outside_subtrees() {
+        let (path, wal) = paths("bounded-scan");
+        let entries = (0u64..1200)
+            .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut store = ExtentFile::open(&path).unwrap();
+        replace_all(&mut store, &wal, &entries).unwrap();
+
+        let limited = scan_range_limited(&mut store, b"key-0200", b"key-0999", Some(7)).unwrap();
+        assert_eq!(limited.len(), 7);
+        assert_eq!(limited.first().unwrap().0, b"key-0200");
+        assert_eq!(limited.last().unwrap().0, b"key-0206");
+        assert!(scan_range_limited(&mut store, b"key-0200", b"key-0999", Some(0)).unwrap().is_empty());
+        assert_eq!(scan_range_limited(&mut store, b"key-0200", b"key-0202", None).unwrap().len(), 3);
+
         drop(store);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
