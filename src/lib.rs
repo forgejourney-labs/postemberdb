@@ -357,7 +357,9 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self { ember_journal_supported: true, ..Self::default() }
+    }
 
     fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
         match deltas {
@@ -720,10 +722,8 @@ impl Database {
                 table.rows[*row_index].values[target_index] = new_value.clone();
             }
             table.rebuild_indexes();
-            let new_rows = matching.iter().filter_map(|position| {
-                let row_id = old_rows.iter().find(|old| old.row_id == table.rows.get(*position).map(|row| row.row_id).unwrap_or(0))
-                    .map(|row| row.row_id)?;
-                table.row_positions.get(&row_id).and_then(|position| table.rows.get(*position)).cloned()
+            let new_rows = old_rows.iter().filter_map(|old| {
+                table.row_positions.get(&old.row_id).and_then(|position| table.rows.get(*position)).cloned()
             }).collect::<Vec<_>>();
             let old_deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
             let new_deltas = build_rows_index_deltas(&table_name, table, &new_rows, None, true)?;
