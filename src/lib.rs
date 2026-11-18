@@ -1,7 +1,7 @@
 //! PostemberDB: an independent, Rust-native SQL-like database engine.
 //!
-//! The engine supports both in-memory databases and an initial persistent file format.
-//! Transactions, indexing, and crash recovery remain future engine layers.
+//! The engine supports in-memory and persistent SQL databases, transaction WAL,
+//! a derived persistent SQL-index mirror, plus independent native KV and Registry sidecars.
 
 use std::collections::BTreeMap;
 use crate::storage::btree::BPlusTree;
@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 mod storage;
 mod sql;
+mod kv;
+
+pub use kv::{KeyValueStore, Registry, RegistryValue};
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
@@ -299,7 +302,51 @@ impl Table {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct EmberIndexDelta {
+    key: Vec<u8>,
+    insert: bool,
+}
+
+fn build_row_index_deltas(
+    table_name: &str,
+    table: &Table,
+    row: &Row,
+    only_index: Option<&str>,
+    insert: bool,
+) -> Result<Option<Vec<EmberIndexDelta>>, DbError> {
+    let mut deltas = Vec::new();
+    for (index_name, index) in &table.indexes {
+        if only_index.is_some_and(|selected| selected != index_name) {
+            continue;
+        }
+        let key = IndexKey::from_columns(&row.values, &index.column_indices);
+        let Some(key) = storage::encode_ember_index_entry(table_name, index_name, &key, row.row_id)? else {
+            return Ok(None);
+        };
+        deltas.push(EmberIndexDelta { key, insert });
+    }
+    Ok(Some(deltas))
+}
+
+fn build_rows_index_deltas(
+    table_name: &str,
+    table: &Table,
+    rows: &[Row],
+    only_index: Option<&str>,
+    insert: bool,
+) -> Result<Option<Vec<EmberIndexDelta>>, DbError> {
+    let mut all = Vec::new();
+    for row in rows {
+        let Some(mut row_deltas) = build_row_index_deltas(table_name, table, row, only_index, insert)? else {
+            return Ok(None);
+        };
+        all.append(&mut row_deltas);
+    }
+    Ok(Some(all))
+}
+
+#[derive(Debug)]
 pub struct Database {
     tables: BTreeMap<String, Table>,
     storage_path: Option<PathBuf>,
@@ -308,10 +355,53 @@ pub struct Database {
     wal_sequence: u64,
     revision: u64,
     ember_indexes_valid: bool,
+    ember_index_journal: Vec<EmberIndexDelta>,
+    ember_journal_supported: bool,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            tables: BTreeMap::new(),
+            storage_path: None,
+            wal_path: None,
+            _lock_file: None,
+            wal_sequence: 0,
+            revision: 0,
+            ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
+        }
+    }
 }
 
 impl Database {
     pub fn new() -> Self { Self::default() }
+
+    /// Opens the database's independent persistent key/value sidecar.
+    pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent key/value sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".kv");
+        KeyValueStore::open(PathBuf::from(path))
+    }
+
+    /// Opens the database's registry-like hierarchical configuration sidecar.
+    pub fn open_registry(&self) -> Result<Registry, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent registry sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".registry");
+        Registry::open(PathBuf::from(path))
+    }
+
+    fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
+        match deltas {
+            Some(mut deltas) => self.ember_index_journal.append(&mut deltas),
+            None => self.ember_journal_supported = false,
+        }
+    }
 
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -365,6 +455,8 @@ impl Database {
                 wal_sequence: self.wal_sequence,
                 revision: self.revision,
                 ember_indexes_valid: false,
+                ember_index_journal: Vec::new(),
+                ember_journal_supported: true,
             },
             statements: Vec::new(),
         }
@@ -381,13 +473,17 @@ impl Database {
             self.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.ember_indexes_valid;
-        let previous_tables = std::mem::replace(&mut self.tables, session.staged.tables);
+        self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
         // The SQL WAL is the commit authority. Apply a derived index delta only
         // after the SQL commit is durable; on failure queries use memory indexes.
         self.ember_indexes_valid = self
-            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .sync_ember_indexes_journal(
+                &session.staged.ember_index_journal,
+                session.staged.ember_journal_supported,
+                previous_mirror_valid,
+            )
             .unwrap_or(false);
         Ok(())
     }
@@ -406,6 +502,8 @@ impl Database {
             wal_sequence: self.wal_sequence,
             revision: self.revision,
             ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
         };
         let mut transaction = Transaction {
             database: self,
@@ -536,9 +634,13 @@ impl Database {
         if index_name.is_empty() || column_name.is_empty() {
             return Err(DbError::Parse("index and column names are required".into()));
         }
-        let table = self.tables.get_mut(&table_name)
-            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        table.add_index(index_name.clone(), &column_name)?;
+        let deltas = {
+            let table = self.tables.get_mut(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            table.add_index(index_name.clone(), &column_name)?;
+            build_rows_index_deltas(&table_name, table, &table.rows.clone(), Some(&index_name), true)?
+        };
+        self.append_ember_journal(deltas);
         Ok(QueryResult::message(format!("index {index_name} created on {table_name}({column_name})")))
     }
 
@@ -583,8 +685,32 @@ impl Database {
             validate_value(column, value)?;
         }
 
-        if !upsert_clause.trim().is_empty() && apply_upsert(table, &values, upsert_clause)? {
-            return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+        if !upsert_clause.trim().is_empty() {
+            let existing_row_index = table.indexes.values().filter(|index| index.unique).find_map(|index| {
+                let key = IndexKey::from_columns(&values, &index.column_indices);
+                index.entries.get(&key).and_then(|positions| positions.first()).copied()
+            });
+            let old_row = existing_row_index.and_then(|position| table.rows.get(position).cloned());
+            if apply_upsert(table, &values, upsert_clause)? {
+                let new_row = existing_row_index.and_then(|position| table.rows.get(position).cloned());
+                let mut deltas = Vec::new();
+                if let Some(row) = old_row {
+                    let Some(mut old) = build_row_index_deltas(&table_name, table, &row, None, false)? else {
+                        self.ember_journal_supported = false;
+                        return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+                    };
+                    deltas.append(&mut old);
+                }
+                if let Some(row) = new_row {
+                    let Some(mut new) = build_row_index_deltas(&table_name, table, &row, None, true)? else {
+                        self.ember_journal_supported = false;
+                        return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+                    };
+                    deltas.append(&mut new);
+                }
+                self.ember_index_journal.append(&mut deltas);
+                return Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row updated by upsert".into() });
+            }
         }
         table.validate_unique(&values)?;
         let row_id = table.next_row_id;
@@ -594,6 +720,9 @@ impl Database {
         let row_index = table.rows.len() - 1;
         table.row_positions.insert(row_id, row_index);
         table.index_row(row_index);
+        let inserted_row = table.rows[row_index].clone();
+        let deltas = build_row_index_deltas(&table_name, table, &inserted_row, None, true)?;
+        self.append_ember_journal(deltas);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: 1, message: "1 row inserted".into() })
     }
 
@@ -611,22 +740,35 @@ impl Database {
         let target_column = normalize_ident(assignment[..equals].trim());
         let new_value = parse_value(assignment[equals + 1..].trim())?;
 
-        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        let target_index = table.columns.iter().position(|column| column.name == target_column)
-            .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
-        validate_value(&table.columns[target_index], &new_value)?;
+        let (affected, deltas) = {
+            let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let target_index = table.columns.iter().position(|column| column.name == target_column)
+                .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
+            validate_value(&table.columns[target_index], &new_value)?;
 
-        let matching = if let Some(predicate) = predicate {
-            let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            table.matching_rows_for_predicates(&predicates)
-        } else {
-            (0..table.rows.len()).collect()
+            let matching = if let Some(predicate) = predicate {
+                let predicates = parse_equality_predicates(&table.columns, predicate)?;
+                table.matching_rows_for_predicates(&predicates)
+            } else {
+                (0..table.rows.len()).collect()
+            };
+            let old_rows = matching.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
+            for row_index in &matching {
+                table.rows[*row_index].values[target_index] = new_value.clone();
+            }
+            table.rebuild_indexes();
+            let new_rows = old_rows.iter().filter_map(|old| {
+                table.row_positions.get(&old.row_id).and_then(|position| table.rows.get(*position)).cloned()
+            }).collect::<Vec<_>>();
+            let old_deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
+            let new_deltas = build_rows_index_deltas(&table_name, table, &new_rows, None, true)?;
+            match (old_deltas, new_deltas) {
+                (Some(mut old), Some(mut new)) => { old.append(&mut new); (matching.len(), Some(old)) }
+                _ => (matching.len(), None),
+            }
         };
-        for row_index in &matching {
-            table.rows[*row_index].values[target_index] = new_value.clone();
-        }
-        table.rebuild_indexes();
-        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: matching.len(), message: format!("{} row(s) updated", matching.len()) })
+        self.append_ember_journal(deltas);
+        Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: affected, message: format!("{affected} row(s) updated") })
     }
 
     fn delete(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -637,24 +779,27 @@ impl Database {
             None => (rest, None),
         };
         let table_name = normalize_ident(table_part);
-        let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        let removed = if let Some(predicate) = predicate {
-            let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let matches = table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>();
+        let (removed, deltas) = {
+            let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let matches = if let Some(predicate) = predicate {
+                let predicates = parse_equality_predicates(&table.columns, predicate)?;
+                table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>()
+            } else {
+                (0..table.rows.len()).collect::<std::collections::BTreeSet<_>>()
+            };
+            let old_rows = matches.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
             let before = table.rows.len();
             let retained = table.rows.drain(..).enumerate()
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
                 .collect::<Vec<_>>();
             table.rows = retained;
             table.rebuild_row_positions();
-            before - table.rows.len()
-        } else {
-            let count = table.rows.len();
-            table.rows.clear();
-            table.row_positions.clear();
-            count
+            table.rebuild_indexes();
+            let removed = before - table.rows.len();
+            let deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
+            (removed, deltas)
         };
-        table.rebuild_indexes();
+        self.append_ember_journal(deltas);
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: removed, message: format!("{removed} row(s) deleted") })
     }
 
@@ -829,13 +974,17 @@ impl Transaction<'_> {
             self.database.wal_sequence = sequence;
         }
         let previous_mirror_valid = self.database.ember_indexes_valid;
-        let previous_tables = std::mem::replace(&mut self.database.tables, self.staged.tables);
+        self.database.tables = self.staged.tables;
         self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
         // The SQL WAL is already durable at this point. Update only changed
         // EmberTree entries; failure leaves SQL committed and enables fallback.
         self.database.ember_indexes_valid = self.database
-            .sync_ember_indexes_delta(&previous_tables, previous_mirror_valid)
+            .sync_ember_indexes_journal(
+                &self.staged.ember_index_journal,
+                self.staged.ember_journal_supported,
+                previous_mirror_valid,
+            )
             .unwrap_or(false);
         Ok(())
     }
@@ -844,6 +993,64 @@ impl Transaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_opens_independent_key_value_and_registry_sidecars() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-kv-registry-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let db = Database::open(&path).unwrap();
+            let mut kv = db.open_key_value_store().unwrap();
+            kv.put(b"world/seed", b"12345").unwrap();
+            drop(kv);
+            let mut registry = db.open_registry().unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            registry.create_key("SYSTEM/Storage").unwrap();
+            registry.set_value("SYSTEM/Storage", "Mode", RegistryValue::String("EmberTree".into())).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let mut kv = db.open_key_value_store().unwrap();
+            assert_eq!(kv.get(b"world/seed").unwrap(), Some(b"12345".to_vec()));
+            drop(kv);
+            let mut registry = db.open_registry().unwrap();
+            assert_eq!(registry.get_value("system/storage", "mode").unwrap(),
+                Some(RegistryValue::String("EmberTree".into())));
+        }
+        for suffix in [
+            ".pdb", ".pdb.wal", ".pdb.lock",
+            ".pdb.kv.lock", ".pdb.kv.pages", ".pdb.kv.pages.wal",
+            ".pdb.registry.lock", ".pdb.registry.pages", ".pdb.registry.pages.wal",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
+    fn sql_transactions_journal_only_affected_index_rows() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE journal_players (uuid TEXT, coins INTEGER)").unwrap();
+        db.execute("INSERT INTO journal_players VALUES ('player-a', 10)").unwrap();
+        db.execute("INSERT INTO journal_players VALUES ('player-b', 20)").unwrap();
+        db.execute("CREATE INDEX journal_players_uuid ON journal_players(uuid)").unwrap();
+
+        db.transaction(|tx| {
+            tx.execute("INSERT INTO journal_players VALUES ('player-c', 30)")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 1, "one inserted row should journal one index key");
+            tx.execute("UPDATE journal_players SET uuid = 'player-a2' WHERE uuid = 'player-a'")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 3, "an indexed-key update should journal one removal and one insertion");
+            tx.execute("DELETE FROM journal_players WHERE uuid = 'player-b'")?;
+            assert_eq!(tx.staged.ember_index_journal.len(), 4, "one deleted row should journal one removal");
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-a2'").unwrap().rows.len(), 1);
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-b'").unwrap().rows.len(), 0);
+        assert_eq!(db.execute("SELECT * FROM journal_players WHERE uuid = 'player-c'").unwrap().rows.len(), 1);
+    }
 
     #[test]
     fn creates_inserts_and_selects() {
@@ -1070,6 +1277,13 @@ mod tests {
             let player_e_id = db.execute("SELECT * FROM delta_players WHERE uuid = 'player-e'")
                 .unwrap().rows[0].row_id;
             assert_eq!(player_e_id, 5, "deleted row IDs must not be reused");
+            db.transaction(|tx| {
+                tx.execute("INSERT INTO delta_players VALUES ('ephemeral', 60)")?;
+                tx.execute("DELETE FROM delta_players WHERE uuid = 'ephemeral'")?;
+                Ok(())
+            }).unwrap();
+            assert!(db.ember_indexes_valid);
+            assert_eq!(db.execute("SELECT * FROM delta_players WHERE uuid = 'ephemeral'").unwrap().rows.len(), 0);
             db.checkpoint().unwrap();
         }
         let mut reopened = Database::open(&path).unwrap();
