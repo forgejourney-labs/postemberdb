@@ -343,6 +343,7 @@ impl Database {
                 tables: self.tables.clone(),
                 storage_path: None,
                 wal_path: None,
+                _lock_file: None,
                 wal_sequence: self.wal_sequence,
                 revision: self.revision,
             },
@@ -375,6 +376,7 @@ impl Database {
             tables: self.tables.clone(),
             storage_path: None,
             wal_path: None,
+            _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
         };
