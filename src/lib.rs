@@ -296,6 +296,7 @@ pub struct Database {
     _lock_file: Option<Arc<std::fs::File>>,
     wal_sequence: u64,
     revision: u64,
+    ember_indexes_valid: bool,
 }
 
 impl Database {
@@ -352,6 +353,7 @@ impl Database {
                 _lock_file: None,
                 wal_sequence: self.wal_sequence,
                 revision: self.revision,
+                ember_indexes_valid: false,
             },
             statements: Vec::new(),
         }
@@ -369,7 +371,9 @@ impl Database {
         }
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
+        self.ember_indexes_valid = false;
         self.sync_ember_indexes()?;
+        self.ember_indexes_valid = self.storage_path.is_some();
         Ok(())
     }
 
@@ -386,6 +390,7 @@ impl Database {
             _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
+            ember_indexes_valid: false,
         };
         let mut transaction = Transaction {
             database: self,
@@ -659,7 +664,31 @@ impl Database {
         let selection_limit = if is_count { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            table.matching_rows_for_predicates_limited(&predicates, selection_limit)
+            let columns = predicates.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let persistent_index = if self.ember_indexes_valid {
+                self.storage_path.as_deref().and_then(|path| {
+                    table.indexes.iter().find(|(_, index)| index.column_indices == columns)
+                        .map(|(name, index)| (path, name.as_str(), index))
+                })
+            } else {
+                None
+            };
+            if let Some((path, index_name, index)) = persistent_index {
+                let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+                let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
+                if let Some(rows) = storage::lookup_ember_index(path, &table_name, index_name, &key)? {
+                    if rows.windows(2).any(|pair| pair[0] >= pair[1])
+                        || rows.iter().any(|row| *row >= table.rows.len())
+                    {
+                        return Err(DbError::Storage("persistent SQL index contains invalid row references".into()));
+                    }
+                    rows.into_iter().take(selection_limit.unwrap_or(usize::MAX)).collect()
+                } else {
+                    table.matching_rows_for_predicates_limited(&predicates, selection_limit)
+                }
+            } else {
+                table.matching_rows_for_predicates_limited(&predicates, selection_limit)
+            }
         } else {
             (0..table.rows.len().min(selection_limit.unwrap_or(usize::MAX))).collect()
         };
@@ -768,7 +797,9 @@ impl Transaction<'_> {
             self.database.revision = self.database.revision.wrapping_add(1);
         }
         self.database.tables = self.staged.tables;
+        self.database.ember_indexes_valid = false;
         self.database.sync_ember_indexes()?;
+        self.database.ember_indexes_valid = self.database.storage_path.is_some();
         Ok(())
     }
 }
