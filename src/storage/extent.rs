@@ -144,7 +144,7 @@ impl ExtentFile {
     /// A crash after this call but before the pages are written can leak reserved
     /// space, but cannot cause the allocator to hand out the same IDs twice.
     pub(crate) fn allocate_extent(&mut self, page_count: u64) -> Result<u64, DbError> {
-        self.ensure_healthy()?
+        self.ensure_healthy()?;
         if page_count == 0 {
             return Err(DbError::Storage("cannot allocate an empty extent".into()));
         }
@@ -171,7 +171,7 @@ impl ExtentFile {
     /// metadata. This order ensures an uncommitted allocation is never returned
     /// to a caller before its bytes and allocation state are durable.
     pub(crate) fn allocate_page(&mut self, payload: &[u8]) -> Result<u64, DbError> {
-        self.ensure_healthy()?
+        self.ensure_healthy()?;
         if payload.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::Storage(format!(
                 "page payload exceeds the {PAGE_PAYLOAD_SIZE}-byte limit"
@@ -198,7 +198,7 @@ impl ExtentFile {
     /// Writes an allocated page. Until WAL-backed in-place updates exist, callers
     /// should only use this for reserved pages that are not reachable from a root.
     pub(crate) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), DbError> {
-        self.ensure_healthy()?
+        self.ensure_healthy()?;
         if payload.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::Storage(format!(
                 "page payload exceeds the {PAGE_PAYLOAD_SIZE}-byte limit"
@@ -223,7 +223,7 @@ impl ExtentFile {
 
     /// Reads and validates one allocated page.
     pub(crate) fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>, DbError> {
-        self.ensure_healthy()?
+        self.ensure_healthy()?;
         if !is_allocated(&self.metadata, page_id) {
             return Err(DbError::Storage(format!("page {page_id} is not allocated")));
         }
