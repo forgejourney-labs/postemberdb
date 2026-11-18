@@ -995,6 +995,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn database_opens_independent_key_value_and_registry_sidecars() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-kv-registry-{}-{}.pdb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let db = Database::open(&path).unwrap();
+            let mut kv = db.open_key_value_store().unwrap();
+            kv.put(b"world/seed", b"12345").unwrap();
+            drop(kv);
+            let mut registry = db.open_registry().unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            registry.create_key("SYSTEM/Storage").unwrap();
+            registry.set_value("SYSTEM/Storage", "Mode", RegistryValue::String("EmberTree".into())).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let mut kv = db.open_key_value_store().unwrap();
+            assert_eq!(kv.get(b"world/seed").unwrap(), Some(b"12345".to_vec()));
+            drop(kv);
+            let mut registry = db.open_registry().unwrap();
+            assert_eq!(registry.get_value("system/storage", "mode").unwrap(),
+                Some(RegistryValue::String("EmberTree".into())));
+        }
+        for suffix in [
+            ".pdb", ".pdb.wal", ".pdb.lock",
+            ".pdb.kv.lock", ".pdb.kv.pages", ".pdb.kv.pages.wal",
+            ".pdb.registry.lock", ".pdb.registry.pages", ".pdb.registry.pages.wal",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix.strip_prefix(".pdb").unwrap_or(suffix)));
+        }
+    }
+
+    #[test]
     fn sql_transactions_journal_only_affected_index_rows() {
         let mut db = Database::new();
         db.execute("CREATE TABLE journal_players (uuid TEXT, coins INTEGER)").unwrap();
