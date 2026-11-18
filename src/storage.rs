@@ -4,6 +4,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+mod pages;
+mod wal;
+
+use pages::{decode_pages, encode_pages};
+use wal::wal_file_path;
+
 const MAGIC: &[u8; 4] = b"PDB4";
 const PAGE_MAGIC: &[u8; 4] = b"PPG1";
 const PAGE_SIZE: usize = 4096;
@@ -68,85 +74,6 @@ impl Database {
             let _ = fs::remove_file(&temp);
             return Err(DbError::Storage(error.to_string()));
         }
-        Ok(())
-    }
-
-    pub(super) fn append_wal_transaction(&self, statements: &[String]) -> Result<u64, DbError> {
-        let path = self.wal_path.as_ref()
-            .ok_or_else(|| DbError::Storage("database has no WAL path".into()))?;
-        let mut payload = Vec::new();
-        put_u32(&mut payload, checked_count(statements.len())?);
-        for statement in statements {
-            put_string(&mut payload, statement)?;
-        }
-        if payload.len() > 64 * 1024 * 1024 {
-            return Err(DbError::Storage("WAL transaction exceeds 64 MiB".into()));
-        }
-        let sequence = self.wal_sequence.checked_add(1)
-            .ok_or_else(|| DbError::Storage("WAL sequence exhausted".into()))?;
-        let mut frame = Vec::with_capacity(24 + payload.len());
-        frame.extend_from_slice(b"PWT2");
-        frame.extend_from_slice(&sequence.to_le_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&checksum(&payload).to_le_bytes());
-        frame.extend_from_slice(&payload);
-
-        let mut file = OpenOptions::new().create(true).append(true).open(path).map_err(storage_error)?;
-        file.write_all(&frame).map_err(storage_error)?;
-        file.sync_all().map_err(storage_error)?;
-        Ok(sequence)
-    }
-
-    fn replay_wal(&mut self) -> Result<(), DbError> {
-        let Some(path) = self.wal_path.clone() else { return Ok(()); };
-        if !path.exists() { return Ok(()); }
-        let bytes = fs::read(&path).map_err(storage_error)?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let remaining = bytes.len() - offset;
-            if remaining < 24 { break; } // incomplete final frame
-            if &bytes[offset..offset + 4] != b"PWT2" {
-                return Err(DbError::Storage(format!("invalid WAL frame header at byte {offset}")));
-            }
-            let sequence = u64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
-            let expected = u64::from_le_bytes(bytes[offset + 16..offset + 24].try_into().unwrap());
-            if len > 64 * 1024 * 1024 {
-                return Err(DbError::Storage("WAL frame exceeds 64 MiB".into()));
-            }
-            let end = offset.checked_add(24).and_then(|n| n.checked_add(len))
-                .ok_or_else(|| DbError::Storage("WAL offset overflow".into()))?;
-            if end > bytes.len() { break; } // incomplete final frame
-            let payload = &bytes[offset + 24..end];
-            if checksum(payload) != expected {
-                return Err(DbError::Storage(format!("WAL checksum mismatch at byte {offset}")));
-            }
-            let mut decoder = Decoder { bytes: payload, offset: 0 };
-            let count = decoder.count()?;
-            let mut statements = Vec::with_capacity(count);
-            for _ in 0..count { statements.push(decoder.string()?); }
-            if decoder.offset != payload.len() {
-                return Err(DbError::Storage("trailing bytes in WAL transaction".into()));
-            }
-            if sequence > self.wal_sequence {
-                if sequence != self.wal_sequence + 1 {
-                    return Err(DbError::Storage(format!(
-                        "WAL sequence gap: expected {}, found {sequence}", self.wal_sequence + 1
-                    )));
-                }
-                for statement in statements {
-                    self.execute_inner(&statement)?;
-                }
-                self.wal_sequence = sequence;
-            }
-            offset = end;
-        }
-        if offset < bytes.len() {
-            let file = OpenOptions::new().write(true).open(&path).map_err(storage_error)?;
-            file.set_len(offset as u64).map_err(storage_error)?;
-            file.sync_all().map_err(storage_error)?;
-        }
-        self.revision = self.wal_sequence;
         Ok(())
     }
 
@@ -495,85 +422,6 @@ mod tests {
 }
 
 
-
-fn encode_pages(payload: &[u8]) -> Result<Vec<u8>, DbError> {
-    if payload.len() > MAX_SNAPSHOT_SIZE {
-        return Err(DbError::Storage("snapshot exceeds 512 MiB safety limit".into()));
-    }
-    let page_count = payload.len().div_ceil(PAGE_PAYLOAD_SIZE);
-    let page_count_u32 = u32::try_from(page_count)
-        .map_err(|_| DbError::Storage("snapshot requires too many pages".into()))?;
-    let mut out = Vec::with_capacity(32 + page_count * PAGE_SIZE);
-    out.extend_from_slice(PAGE_MAGIC);
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    out.extend_from_slice(&page_count_u32.to_le_bytes());
-    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(&checksum(payload).to_le_bytes());
-
-    for (page_number, chunk) in payload.chunks(PAGE_PAYLOAD_SIZE).enumerate() {
-        out.extend_from_slice(&(page_number as u32).to_le_bytes());
-        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-        out.extend_from_slice(&checksum(chunk).to_le_bytes());
-        out.extend_from_slice(chunk);
-        out.resize(out.len() + PAGE_PAYLOAD_SIZE - chunk.len(), 0);
-    }
-    Ok(out)
-}
-
-fn decode_pages(file: &[u8]) -> Result<Vec<u8>, DbError> {
-    if file.len() < 32 || &file[..4] != PAGE_MAGIC {
-        return Err(DbError::Storage("invalid page-file header".into()));
-    }
-    let version = u32::from_le_bytes(file[4..8].try_into().unwrap());
-    let page_size = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
-    let page_count = u32::from_le_bytes(file[12..16].try_into().unwrap()) as usize;
-    let payload_len = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
-    let expected_checksum = u64::from_le_bytes(file[24..32].try_into().unwrap());
-
-    if version != 1 || page_size != PAGE_SIZE {
-        return Err(DbError::Storage("unsupported page-file version or page size".into()));
-    }
-    if payload_len > MAX_SNAPSHOT_SIZE {
-        return Err(DbError::Storage("page-file payload exceeds 512 MiB safety limit".into()));
-    }
-    let expected_pages = payload_len.div_ceil(PAGE_PAYLOAD_SIZE);
-    if page_count != expected_pages {
-        return Err(DbError::Storage("page count does not match payload length".into()));
-    }
-    let expected_file_len = 32usize.checked_add(page_count.checked_mul(PAGE_SIZE)
-        .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?)
-        .ok_or_else(|| DbError::Storage("page-file size overflow".into()))?;
-    if file.len() != expected_file_len {
-        return Err(DbError::Storage("page-file length mismatch".into()));
-    }
-
-    let mut payload = Vec::with_capacity(payload_len);
-    for page_number in 0..page_count {
-        let start = 32 + page_number * PAGE_SIZE;
-        let page_id = u32::from_le_bytes(file[start..start + 4].try_into().unwrap()) as usize;
-        let used = u32::from_le_bytes(file[start + 4..start + 8].try_into().unwrap()) as usize;
-        let page_checksum = u64::from_le_bytes(file[start + 8..start + 16].try_into().unwrap());
-        if page_id != page_number || used > PAGE_PAYLOAD_SIZE {
-            return Err(DbError::Storage(format!("invalid page metadata for page {page_number}")));
-        }
-        let data = &file[start + PAGE_META_SIZE..start + PAGE_META_SIZE + used];
-        if checksum(data) != page_checksum {
-            return Err(DbError::Storage(format!("page checksum mismatch for page {page_number}")));
-        }
-        payload.extend_from_slice(data);
-    }
-    if payload.len() != payload_len || checksum(&payload) != expected_checksum {
-        return Err(DbError::Storage("page-file payload checksum mismatch".into()));
-    }
-    Ok(payload)
-}
-
-fn wal_file_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".wal");
-    PathBuf::from(name)
-}
 
 fn checksum(bytes: &[u8]) -> u64 {
     // FNV-1a detects accidental corruption; it is not a cryptographic MAC.
