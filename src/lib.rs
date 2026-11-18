@@ -233,6 +233,43 @@ impl Table {
         }).collect()
     }
 
+    fn matching_rows_for_predicates_limited(
+        &self,
+        predicates: &[(usize, Value)],
+        limit: Option<usize>,
+    ) -> Vec<usize> {
+        let take = limit.unwrap_or(usize::MAX);
+        let columns = predicates.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        if let Some(index) = self.indexes.values().find(|index| index.column_indices == columns) {
+            let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+            let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
+            return index.entries.get(&key)
+                .map(|rows| rows.iter().take(take).copied().collect())
+                .unwrap_or_default();
+        }
+
+        let (first_column, first_value) = &predicates[0];
+        if let Some(index) = self.indexes.values().find(|index| {
+            index.column_indices.len() == 1 && index.column_indices[0] == *first_column
+        }) {
+            let Some(candidates) = index.entries.get(&IndexKey::from(first_value)) else {
+                return Vec::new();
+            };
+            return candidates.iter().copied()
+                .filter(|row_index| predicates.iter().all(|(column_index, value)| {
+                    self.rows[*row_index].values[*column_index] == *value
+                }))
+                .take(take)
+                .collect();
+        }
+
+        self.rows.iter().enumerate()
+            .filter(|(_, row)| predicates.iter().all(|(column_index, value)| row.values[*column_index] == *value))
+            .take(take)
+            .map(|(row_index, _)| row_index)
+            .collect()
+    }
+
     fn matching_rows(&self, column_index: usize, value: &Value) -> Vec<usize> {
         if let Some(index) = self.indexes.values().find(|index| index.column_indices.len() == 1 && index.column_indices[0] == column_index) {
             index.entries.get(&IndexKey::from(value)).cloned().unwrap_or_default()
@@ -606,15 +643,17 @@ impl Database {
         let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
 
-        let mut selected_rows: Vec<usize> = if let Some(predicate) = predicate {
+        let projection_upper = projection.to_ascii_uppercase();
+        let is_count = projection_upper.starts_with("COUNT(*)");
+        let selection_limit = if is_count { None } else { limit };
+        let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            table.matching_rows_for_predicates(&predicates)
+            table.matching_rows_for_predicates_limited(&predicates, selection_limit)
         } else {
-            (0..table.rows.len()).collect()
+            (0..table.rows.len().min(selection_limit.unwrap_or(usize::MAX))).collect()
         };
 
-        let projection_upper = projection.to_ascii_uppercase();
-        if projection_upper.starts_with("COUNT(*)") {
+        if is_count {
             let alias = projection_upper.find(" AS ").map(|position| normalize_ident(&projection[position + 4..]))
                 .unwrap_or_else(|| "count".into());
             return Ok(QueryResult {
@@ -625,9 +664,6 @@ impl Database {
             });
         }
 
-        if let Some(limit) = limit {
-            selected_rows.truncate(limit);
-        }
         let projection_indices = if projection == "*" {
             (0..table.columns.len()).collect::<Vec<_>>()
         } else {
