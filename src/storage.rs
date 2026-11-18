@@ -717,7 +717,8 @@ fn recover_page_tree(path: &Path) -> Result<(), DbError> {
         return Ok(());
     }
     let mut store = extent::ExtentFile::open(&page_path)?;
-    page_tree::recover(&mut store, &wal_path)
+    page_tree::recover(&mut store, &wal_path)?;
+    page_tree::validate_tree(&mut store)
 }
 
 fn lock_file_path(path: &Path) -> PathBuf {
