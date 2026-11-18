@@ -2,4 +2,7 @@ name: PostemberDBKSL
 version: ${version}
 main: io.postemberdb.ksl.PostemberDbAddon
 api-version: '1.21'
+libraries:
+  - org.jetbrains.kotlin:kotlin-stdlib:2.0.21
+  - org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
 depend: [KotlinScriptLoader]
