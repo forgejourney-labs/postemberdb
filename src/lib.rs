@@ -1059,6 +1059,27 @@ mod tests {
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
     }
 
+
+    #[test]
+    fn where_and_supports_multiple_parameters_without_splitting_quoted_text() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE ksl_persist (script_name TEXT, key TEXT, value TEXT)").unwrap();
+        db.execute_params(
+            "INSERT INTO ksl_persist VALUES (?, ?, ?)",
+            &[Value::Text("economy".into()), Value::Text("message".into()), Value::Text("bread AND apples".into())],
+        ).unwrap();
+        db.execute_params(
+            "INSERT INTO ksl_persist VALUES (?, ?, ?)",
+            &[Value::Text("homes".into()), Value::Text("message".into()), Value::Text("other".into())],
+        ).unwrap();
+        let result = db.execute_params(
+            "SELECT value FROM ksl_persist WHERE script_name = ? AND key = ?",
+            &[Value::Text("economy".into()), Value::Text("message".into())],
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Text("bread AND apples".into()));
+    }
+
     #[test]
     fn rejects_wrong_types() {
         let mut db = Database::new();
