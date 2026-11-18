@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 mod storage;
 mod sql;
+mod kv;
+
+pub use kv::{KeyValueStore, Registry, RegistryValue};
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
@@ -374,6 +377,24 @@ impl Default for Database {
 
 impl Database {
     pub fn new() -> Self { Self::default() }
+
+    /// Opens the database's independent persistent key/value sidecar.
+    pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent key/value sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".kv");
+        KeyValueStore::open(PathBuf::from(path))
+    }
+
+    /// Opens the database's registry-like hierarchical configuration sidecar.
+    pub fn open_registry(&self) -> Result<Registry, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent registry sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".registry");
+        Registry::open(PathBuf::from(path))
+    }
 
     fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
         match deltas {
