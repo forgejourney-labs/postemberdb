@@ -352,7 +352,7 @@ impl Database {
         I: IntoIterator<Item = Vec<Value>>,
     {
         const MAX_BATCH_ROWS: usize = 5_000;
-        let mut batch = rows.into_iter().take(MAX_BATCH_ROWS + 1).collect::<Vec<_>>();
+        let batch = rows.into_iter().take(MAX_BATCH_ROWS + 1).collect::<Vec<_>>();
         if batch.len() > MAX_BATCH_ROWS {
             return Err(DbError::Constraint(format!(
                 "batch exceeds the maximum of {MAX_BATCH_ROWS} rows"
