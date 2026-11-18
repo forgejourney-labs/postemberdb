@@ -46,9 +46,11 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] In-memory page-ID allocator with lowest-ID reuse, high-water tracking, and double-free/unknown-ID rejection.
 - [ ] Persisted free-space metadata, compaction, and crash-safe page allocation.
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
-- [ ] B+ tree deletion/rebalancing, linked-leaf navigation, page serialization, and catalog/page-file integration.
+- [x] In-memory B+ tree deletion with leaf/internal borrowing, merging, root collapse, and strict occupancy validation; focused and deterministic reference tests added.
+- [x] Stack-based successor-leaf traversal for in-memory range scans.
+- [ ] Persistent leaf sibling links (optional follow-up), page serialization, persistent index nodes, and catalog/page-file integration.
 
-The native B+ tree now backs SQL index equality lookups and is also available as an in-memory range-scan primitive. Tree nodes and index entries are still memory-resident; index definitions are persisted and entries are rebuilt from rows on open. B+ tree deletion/rebalancing and page-backed persistence are not implemented. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
+The native B+ tree now backs SQL index equality lookups and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and in-memory range scans that advance between leaves using an ancestor stack. Focused tests include deterministic mixed operations checked against Rust's BTreeMap. The tree does not yet use persistent leaf sibling pointers: nodes and index entries are still memory-resident, index definitions are persisted, and entries are rebuilt from rows on open. The current page format is a physical layout milestone only. The page allocator is currently an isolated in-memory primitive and is not connected to snapshot writes or persisted metadata. Startup still reconstructs the complete snapshot and loads all rows into memory.
 
 ## 4. KSL/JVM adapter
 
