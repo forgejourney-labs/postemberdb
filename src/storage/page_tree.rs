@@ -156,13 +156,17 @@ fn insert_recursive(
             if encode_leaf(&entries).is_ok() {
                 return Ok(vec![stage_leaf(store, staged, &entries)?]);
             }
-            let mut split = entries.len() / 2;
-            while split > 0 && (encode_leaf(&entries[..split]).is_err() || encode_leaf(&entries[split..]).is_err()) {
-                split -= 1;
+            let mut best_split: Option<(usize, usize)> = None;
+            for split in 1..entries.len() {
+                if let (Ok(left), Ok(right)) = (encode_leaf(&entries[..split]), encode_leaf(&entries[split..])) {
+                    let imbalance = left.len().abs_diff(right.len());
+                    if best_split.is_none_or(|(_, best)| imbalance < best) {
+                        best_split = Some((split, imbalance));
+                    }
+                }
             }
-            if split == 0 {
-                return Err(DbError::Storage("B+ tree leaf entry cannot be split into valid pages".into()));
-            }
+            let split = best_split.map(|(split, _)| split)
+                .ok_or_else(|| DbError::Storage("B+ tree leaf entry cannot be split into valid pages".into()))?;
             Ok(vec![
                 stage_leaf(store, staged, &entries[..split])?,
                 stage_leaf(store, staged, &entries[split..])?,
@@ -196,14 +200,17 @@ fn insert_recursive(
                     first_key: updated[0].first_key.clone(),
                 }]);
             }
-            let mut split = updated.len() / 2;
-            while split >= 2 && (encode_internal(&updated[..split]).is_err()
-                || encode_internal(&updated[split..]).is_err()) {
-                split -= 1;
+            let mut best_split: Option<(usize, usize)> = None;
+            for split in 2..=updated.len().saturating_sub(2) {
+                if let (Ok(left), Ok(right)) = (encode_internal(&updated[..split]), encode_internal(&updated[split..])) {
+                    let imbalance = left.len().abs_diff(right.len());
+                    if best_split.is_none_or(|(_, best)| imbalance < best) {
+                        best_split = Some((split, imbalance));
+                    }
+                }
             }
-            if split < 2 || updated.len() - split < 2 {
-                return Err(DbError::Storage("B+ tree internal node cannot be split safely".into()));
-            }
+            let split = best_split.map(|(split, _)| split)
+                .ok_or_else(|| DbError::Storage("B+ tree internal node cannot be split safely".into()))?;
             let left_id = store.allocate_extent(1)?;
             let right_id = store.allocate_extent(1)?;
             staged.push((left_id, encode_internal(&updated[..split])?));
