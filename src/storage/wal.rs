@@ -1,7 +1,7 @@
 //! Write-ahead log append and recovery.
 
 use super::{checksum, checked_count, put_string, put_u32, storage_error, Database, DbError, Decoder};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
