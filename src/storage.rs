@@ -22,6 +22,8 @@ mod wal;
 
 use pages::{decode_pages, encode_pages};
 use wal::wal_file_path;
+use pdb6::{CatalogColumn, CatalogIndex, CatalogTable, DatabaseManifest};
+use pdb6_store::Pdb6Store;
 
 const MAGIC: &[u8; 4] = b"PDB5";
 const PAGE_MAGIC: &[u8; 4] = b"PPG1";
@@ -402,6 +404,66 @@ mod tests {
     }
 
     #[test]
+    fn explicit_pdb5_to_pdb6_migration_copies_catalog_rows_and_indexes_without_touching_source() {
+        let path = test_path("pdb6-explicit-migration");
+        let pages_path = PathBuf::from(format!("{}.pdb6.pages", path.display()));
+        let wal_path = PathBuf::from(format!("{}.pdb6.wal", path.display()));
+        let lock_path = PathBuf::from(format!("{}.pdb6.lock", path.display()));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("CREATE INDEX idx_players_uuid ON players (uuid)").unwrap();
+            db.insert_many("players", (1..=3).map(|id| vec![
+                Value::Text(format!("player-{id}")),
+                Value::Integer(id),
+            ])).unwrap();
+
+            let source_snapshot = fs::read(&path).unwrap();
+            let source_wal = fs::read(wal_file_path(&path)).unwrap();
+            db.migrate_to_pdb6().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), source_snapshot);
+            assert_eq!(fs::read(wal_file_path(&path)).unwrap(), source_wal);
+
+            let mut store = Pdb6Store::open(&path, 32).unwrap();
+            let manifest = store.manifest().unwrap().unwrap();
+            assert_eq!(manifest.table_count, 1);
+            assert_eq!(manifest.next_table_id, 2);
+            assert_eq!(manifest.generation, db.wal_sequence);
+
+            let catalog = pdb6::CatalogTable::decode(
+                &store.get(&pdb6::table_key(1).unwrap()).unwrap().unwrap()
+            ).unwrap();
+            assert_eq!(catalog.name, "players");
+            assert_eq!(catalog.columns.len(), 2);
+            assert_eq!(catalog.indexes.len(), 1);
+            assert_eq!(catalog.indexes[0].name, "idx_players_uuid");
+
+            let row = store.get_row_payload(1, 2).unwrap().unwrap();
+            assert_eq!(
+                sql_rows::SqlRowStore::decode_values(&row, 2).unwrap(),
+                vec![Value::Text("player-2".into()), Value::Integer(2)]
+            );
+            assert_eq!(store.scan_row_ids(1, None, 10).unwrap(), vec![1, 2, 3]);
+            let index_prefix = pdb6::index_prefix(1, 1).unwrap();
+            let index_entries = store.scan_prefix(&index_prefix, 10).unwrap();
+            assert_eq!(index_entries.len(), 3);
+            assert!(index_entries.iter().all(|(key, _)| key.len() > index_prefix.len()));
+            drop(store);
+
+            // PDB5 remains the live SQL source until a separately verified cutover.
+            let result = db.execute("SELECT * FROM players").unwrap();
+            assert_eq!(result.rows.len(), 3);
+            assert!(db.migrate_to_pdb6().is_err());
+        }
+        for candidate in [
+            &path, &pages_path, &wal_path, &lock_path,
+            &wal_file_path(&path), &lock_file_path(&path),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn committed_sql_indexes_are_mirrored_into_persistent_ember_tree() {
         let path = test_path("ember-index-mirror");
         let page_path = page_tree_file_path(&path);
@@ -692,6 +754,117 @@ fn page_tree_wal_file_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".pages.btree.wal");
     PathBuf::from(name)
+}
+
+/// Explicitly copies the currently opened PDB5 database into the PDB6
+/// catalog/row/index keyspaces. The PDB5 snapshot and WAL remain untouched and
+/// authoritative; this operation is restartable at the logical-key level and
+/// only publishes the PDB6 manifest after every table, row, and index is copied.
+///
+/// This is intentionally not an automatic migration: callers must verify the
+/// PDB6 copy before switching the database's authoritative storage format.
+impl Database {
+    pub fn migrate_to_pdb6(&self) -> Result<(), DbError> {
+        let database_path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 migration requires a persistent database opened with Database::open".into()))?;
+        let mut store = Pdb6Store::open(database_path, 128)?;
+        if store.manifest()?.is_some() {
+            return Err(DbError::Storage(
+                "PDB6 manifest already exists; refusing to overwrite an existing PDB6 database".into()
+            ));
+        }
+
+        let table_count = u32::try_from(self.tables.len())
+            .map_err(|_| DbError::Constraint("PDB6 migration table count exceeds u32".into()))?;
+        for table_id in 1..=u64::from(table_count) {
+            if store.get(&pdb6::table_key(table_id)?)?.is_some() {
+                return Err(DbError::Storage(
+                    "an incomplete or existing PDB6 catalog is present; remove its .pdb6.pages, .pdb6.wal, and .pdb6.lock sidecars before restarting migration".into()
+                ));
+            }
+        }
+        let next_table_id = u64::from(table_count).checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 table ID space exhausted".into()))?;
+
+        for (table_offset, (table_name, table)) in self.tables.iter().enumerate() {
+            let table_id = u64::try_from(table_offset + 1)
+                .map_err(|_| DbError::Storage("PDB6 table ID space exhausted".into()))?;
+            let catalog_indexes = table.indexes.iter().map(|(name, index)| {
+                let columns = index.column_indices.iter()
+                    .map(|column| u32::try_from(*column)
+                        .map_err(|_| DbError::Constraint("PDB6 index column ordinal exceeds u32".into())))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CatalogIndex { name: name.clone(), columns, unique: index.unique })
+            }).collect::<Result<Vec<_>, DbError>>()?;
+            let catalog = CatalogTable {
+                table_id,
+                name: table_name.clone(),
+                columns: table.columns.iter().map(|column| CatalogColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                }).collect(),
+                indexes: catalog_indexes,
+                next_row_id: table.next_row_id,
+            };
+            let catalog_key = pdb6::table_key(table_id)?;
+            store.apply_batch(
+                [(catalog_key, catalog.encode()?)],
+                std::iter::empty::<Vec<u8>>(),
+            )?;
+
+            for chunk in table.rows.chunks(5_000) {
+                let encoded_rows = chunk.iter().map(|row| {
+                    Ok((table_id, row.row_id, sql_rows::SqlRowStore::encode_values(&row.values, table.columns.len())?))
+                }).collect::<Result<Vec<_>, DbError>>()?;
+                if !encoded_rows.is_empty() {
+                    store.apply_row_batch(
+                        encoded_rows,
+                        std::iter::empty::<(Vec<u8>, Vec<u8>)>(),
+                        std::iter::empty::<Vec<u8>>(),
+                    )?;
+                }
+            }
+
+            // Rebuild index entries from stable row IDs, not vector positions.
+            // Flush bounded chunks so migration memory stays independent of index size.
+            for (index_offset, index) in table.indexes.values().enumerate() {
+                let index_id = u64::try_from(index_offset + 1)
+                    .map_err(|_| DbError::Storage("PDB6 index ID space exhausted".into()))?;
+                let mut pending = Vec::with_capacity(5_000);
+                for row in &table.rows {
+                    let key = IndexKey::from_columns(&row.values, &index.column_indices);
+                    let encoded_key = index_codec::encode_index_key(&key)?;
+                    let mut disk_key = pdb6::index_key(table_id, index_id, &encoded_key)?;
+                    disk_key.extend_from_slice(&row.row_id.to_be_bytes());
+                    if disk_key.len() > 1024 {
+                        return Err(DbError::Constraint(format!(
+                            "index key for table {table_name} exceeds the PDB6 key limit"
+                        )));
+                    }
+                    pending.push((disk_key, Vec::new()));
+                    if pending.len() == 5_000 {
+                        store.apply_batch(std::mem::take(&mut pending), std::iter::empty::<Vec<u8>>())?;
+                        pending = Vec::with_capacity(5_000);
+                    }
+                }
+                if !pending.is_empty() {
+                    store.apply_batch(pending, std::iter::empty::<Vec<u8>>())?;
+                }
+            }
+        }
+
+        // The manifest is the completion marker and is published last. If a
+        // process stops earlier, PDB5 is still untouched and migration can be
+        // restarted after the incomplete PDB6 sidecar is removed by the operator.
+        store.set_manifest(DatabaseManifest {
+            generation: self.wal_sequence,
+            last_tx_id: 0,
+            next_table_id,
+            table_count,
+        })?;
+        Ok(())
+    }
 }
 
 /// Rebuild the durable EmberTree index mirror from the SQL-WAL-recovered state.

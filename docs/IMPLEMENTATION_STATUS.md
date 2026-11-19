@@ -199,3 +199,12 @@ Implemented a standalone `KeyValueStore` backed by the native page-backed CoW B+
 Implemented a typed `Registry` layered on that KV engine. It provides top-level hives, nested keys, case-insensitive slash/backslash paths, named values (including the default empty-name value), enumeration, and safe non-recursive or recursive key deletion. Supported value types are String, Integer, Boolean, Binary, and JSON text. JSON text is not parsed or schema-validated by the database.
 
 File-backed `Database` instances can open their independent `open_key_value_store()` and `open_registry()` sidecars. These stores are not yet enlisted in the SQL transaction WAL, so atomic commits spanning SQL + KV + Registry are not supported. Large values requiring overflow/blob pages, per-hive ACL/RBAC, encryption-at-rest, and audit events remain future work.
+
+
+## Explicit PDB5-to-PDB6 migration foundation
+
+- [x] Added `Database::migrate_to_pdb6()`: copies catalog definitions, typed SRW1 row payloads, stable row IDs, and index entries into the PDB6 shared root.
+- [x] Publishes the PDB6 manifest only after the copy is complete; PDB5 snapshot/WAL are not modified by the migration.
+- [x] Bounded row and index batches to 5,000 mutations.
+- [ ] PDB6 is not yet the live SQL authority. Normal SQL reads/writes still use PDB5 and in-memory tables.
+- [ ] Automatic resume/cleanup of partially copied overflow pages and safe migration verification remain pending.

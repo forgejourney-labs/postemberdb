@@ -82,3 +82,18 @@ PDB5 migration must use a side-by-side target file or a new versioned sidecar, p
 - [ ] Recovery, migration, and large Minecraft workload benchmarks.
 
 Until these gates pass, PostemberDB must not describe its SQL tables as disk-native or production-ready.
+
+## Explicit PDB5-to-PDB6 copy operation
+
+`Database::migrate_to_pdb6()` performs an explicit copy of the currently
+opened PDB5 state into PDB6 catalog, typed row-payload, and index keyspaces.
+Table IDs and index IDs are assigned deterministically from sorted catalog
+names; stable row IDs are preserved. Row and index writes are bounded to 5,000
+mutations per batch. The PDB6 completion manifest is published last.
+
+The operation does not modify the PDB5 snapshot or WAL and does not switch
+normal SQL execution to PDB6. If interrupted, PDB5 remains authoritative. An
+incomplete PDB6 sidecar must currently be removed by the operator before
+restarting the copy; automatic progress tracking and orphan-page reclamation
+are not yet implemented. Do not treat the copied sidecar as production-ready
+or switch authority until the verification and recovery gates pass.

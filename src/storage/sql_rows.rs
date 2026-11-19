@@ -209,10 +209,16 @@ impl SqlRowStore {
     }
 
     fn encode_row(&self, values: &[Value]) -> Result<Vec<u8>, DbError> {
-        if values.len() != self.column_count {
+        Self::encode_values(values, self.column_count)
+    }
+
+    /// Encodes a typed SQL row independently of a RecordStore handle so it can
+    /// be reused by the explicit PDB5-to-PDB6 migration path.
+    pub(crate) fn encode_values(values: &[Value], expected_columns: usize) -> Result<Vec<u8>, DbError> {
+        if values.len() != expected_columns {
             return Err(DbError::Constraint(format!(
                 "row has {} values; table schema requires {}",
-                values.len(), self.column_count
+                values.len(), expected_columns
             )));
         }
         let mut out = Vec::new();
@@ -255,6 +261,11 @@ impl SqlRowStore {
     }
 
     fn decode_row(bytes: &[u8], expected_columns: usize) -> Result<Vec<Value>, DbError> {
+        Self::decode_values(bytes, expected_columns)
+    }
+
+    /// Decodes a typed SQL row independently of a RecordStore handle.
+    pub(crate) fn decode_values(bytes: &[u8], expected_columns: usize) -> Result<Vec<Value>, DbError> {
         let mut input = RowDecoder { bytes, offset: 0 };
         if input.take(4)? != MAGIC {
             return Err(DbError::Storage("invalid SQL row record magic".into()));
