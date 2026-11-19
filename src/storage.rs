@@ -11,6 +11,7 @@ pub(crate) mod btree;
 pub(crate) mod extent;
 pub(crate) mod index_codec;
 pub(crate) mod page_tree;
+pub(crate) mod record_store;
 mod pages;
 mod wal;
 
