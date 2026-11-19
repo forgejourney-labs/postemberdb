@@ -338,10 +338,9 @@ fn handle_binary_client(
     ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
 ) -> io::Result<()> {
     loop {
-        let frame = match Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD) {
-            Ok(frame) => frame,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
+        let frame = match Frame::read_from_or_eof(&mut reader, DEFAULT_MAX_PAYLOAD)? {
+            Some(frame) => frame,
+            None => return Ok(()),
         };
         let request_id = frame.request_id;
         let response = match frame.kind {
