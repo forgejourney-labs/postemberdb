@@ -31,7 +31,7 @@ The project is at an early development stage. The first prototype provides:
 - incremental index-key maintenance for INSERT, UPDATE, DELETE, and UPSERT; DELETE compacts table rows without rebuilding index trees;
 - direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;
 - a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, bounded per-call cleanup, and a configurable page cache with runtime statistics;
-- an independent page-backed `RecordStore` for variable-length records up to 64 MiB, indexed by stable caller-supplied IDs; it uses overflow pages and durable descriptor publication but is not yet wired as SQL's canonical row store;
+- an independent page-backed `RecordStore` for variable-length records up to 64 MiB, indexed by stable caller-supplied IDs; bounded multi-record batches use one descriptor-tree publication, but it is not yet wired as SQL's canonical row store;
 - a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
