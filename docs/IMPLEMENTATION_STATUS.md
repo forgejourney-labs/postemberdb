@@ -225,3 +225,13 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Recovery distinguishes committed transactions that still need participant application from transactions whose participants have all acknowledged.
 - [x] APPLIED records are checksummed, ordered after COMMIT, and reject duplicate or unprepared participant IDs.
 - [ ] SQL, KV, Registry, and EF7 adapters still need to implement durable prepare and idempotent commit/rollback. The journal and acknowledgement protocol do not by themselves enlist those stores or provide cross-domain atomicity.
+
+
+## Live PDB6 SQL authority
+
+- [x] A complete PDB6 manifest is now detected on open and takes precedence over the retained PDB5 snapshot/WAL.
+- [x] SQL transactions publish changed row payloads, catalog records, index deltas, and the updated manifest in one PDB6 root transaction.
+- [x] PDB6-backed SQL handles no longer append to or rewrite the PDB5 snapshot/WAL; PDB5 files remain intact as a compatibility source.
+- [x] Reopen/DML regression test covers insert, update, delete, unique index lookup, and persistence after another reopen.
+- [ ] SQL reads still materialize table rows in memory at open. Lazy point reads and bounded streaming scans remain pending.
+- [ ] PDB6 index/catalog transaction crash-point injection and automatic cleanup of unreachable overflow pages remain pending.

@@ -1131,7 +1131,16 @@ impl Transaction<'_> {
         if self.statements.is_empty() {
             return Ok(());
         }
-        if self.database.wal_path.is_some() {
+        if self.database.pdb6_mode {
+            let path = self.database.storage_path.as_deref()
+                .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+            let sequence = self.database.wal_sequence.checked_add(1)
+                .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
+            crate::storage::persist_pdb6_transition(
+                path, &self.database.tables, &self.staged.tables, sequence,
+            )?;
+            self.database.wal_sequence = sequence;
+        } else if self.database.wal_path.is_some() {
             let sequence = self.database.append_wal_transaction(&self.statements)?;
             self.database.wal_sequence = sequence;
         }
@@ -1139,15 +1148,17 @@ impl Transaction<'_> {
         self.database.tables = self.staged.tables;
         self.database.revision = self.database.revision.wrapping_add(1);
         self.database.ember_indexes_valid = false;
-        // The SQL WAL is already durable at this point. Update only changed
-        // EmberTree entries; failure leaves SQL committed and enables fallback.
-        self.database.ember_indexes_valid = self.database
-            .sync_ember_indexes_journal(
-                &self.staged.ember_index_journal,
-                self.staged.ember_journal_supported,
-                previous_mirror_valid,
-            )
-            .unwrap_or(false);
+        // PDB6 publishes SQL catalog, rows and indexes through one root. PDB5
+        // continues to use its SQL WAL and derived EmberTree index mirror.
+        if !self.database.pdb6_mode {
+            self.database.ember_indexes_valid = self.database
+                .sync_ember_indexes_journal(
+                    &self.staged.ember_index_journal,
+                    self.staged.ember_journal_supported,
+                    previous_mirror_valid,
+                )
+                .unwrap_or(false);
+        }
         Ok(())
     }
 }
@@ -1155,6 +1166,46 @@ impl Transaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdb6_manifest_becomes_live_sql_authority_after_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-pdb6-live-{}-{}.pbd",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
+            db.execute("CREATE UNIQUE INDEX players_uuid ON players(uuid)").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-a', 10)").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-b', 20)").unwrap();
+            db.migrate_to_pdb6().unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert_eq!(db.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap().rows.len(), 1);
+            db.execute("UPDATE players SET coins = 99 WHERE uuid = 'player-a'").unwrap();
+            db.execute("DELETE FROM players WHERE uuid = 'player-b'").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-c', 30)").unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            let rows = db.execute("SELECT * FROM players").unwrap().rows;
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|row| row.values == vec![Value::Text("player-a".into()), Value::Integer(99)]));
+            assert!(rows.iter().any(|row| row.values == vec![Value::Text("player-c".into()), Value::Integer(30)]));
+            assert!(db.execute("SELECT * FROM players WHERE uuid = 'player-b'").unwrap().rows.is_empty());
+        }
+        for suffix in [
+            "", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal",
+            ".pages", ".pages.wal", ".pages.lock",
+        ] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
 
     #[test]
     fn database_opens_independent_key_value_and_registry_sidecars() {

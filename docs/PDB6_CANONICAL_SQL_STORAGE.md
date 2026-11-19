@@ -97,3 +97,18 @@ incomplete PDB6 sidecar is detected and must currently be removed by the operato
 before restarting the copy; automatic progress tracking and orphan-page
 reclamation are not yet implemented. Do not treat the copied sidecar as production-ready
 or switch authority until the verification and recovery gates pass.
+
+
+## Live SQL authority transition
+
+A complete PDB6 manifest is now authoritative when Database::open() finds it.
+The old PDB5 snapshot and SQL WAL are retained and are not replayed or rewritten
+by PDB6-backed handles. SQL commits compare the in-memory before/after table
+states and publish row payload descriptors, catalog records, secondary-index
+deltas, and the new database manifest in one PDB6 page-tree transaction.
+
+The current implementation still eagerly materializes table rows into memory
+when opening PDB6. It is an authority transition, not yet the final lazy RowStore:
+point reads, bounded scans, and a shared row/page cache remain future work.
+Transactions are bounded by the current PDB6 5,000-mutation limit. Dropping
+tables is not supported by the PDB6 transition writer.
