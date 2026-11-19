@@ -1,5 +1,7 @@
 # PostemberDB
 
+**Release identity:** PostemberDB 1 — **Ember**. `1 Ember` is the codename series, not a claim that the current engine is SemVer `1.0.0`; the Cargo package version remains the compatibility/build version.
+
 **PostemberDB** is an independent SQL-like database engine written in Rust. It is designed around two ways to use the same engine:
 
 - **Embedded** — link the Rust library directly into an application.

@@ -5,7 +5,7 @@ The CLI is being built in Rust alongside the database engine. Current commands a
 ## Available commands
 
 - postemberdb help — show command usage.
-- postemberdb version — show the binary version.
+- postemberdb version — show the SemVer build version and PostemberDB release series/codename.
 - postemberdb server [127.0.0.1:7432] [data-file] — start the development server. Only explicit loopback IP addresses are accepted until TLS and authentication exist.
 - postemberdb check [data-file] — open the database, decode the snapshot, and replay/validate the WAL. Opening may truncate an incomplete final WAL frame, so this is a recovery check rather than a read-only forensic check.
 - postemberdb checkpoint [data-file] — recover the database, write a snapshot, sync it, and safely truncate the WAL.

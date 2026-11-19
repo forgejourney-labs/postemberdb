@@ -13,6 +13,7 @@ mod storage;
 mod sql;
 mod kv;
 pub mod protocol;
+pub mod version;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
 pub use storage::record_store::RecordStore;

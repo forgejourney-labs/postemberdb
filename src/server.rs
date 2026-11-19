@@ -1,5 +1,6 @@
 use postemberdb::{Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
 use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
+use postemberdb::version::version_string;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,7 +72,7 @@ fn validate_bind_address(address: &str) -> io::Result<SocketAddr> {
 pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
     let socket_address = validate_bind_address(address)?;
     let listener = TcpListener::bind(socket_address)?;
-    println!("PostemberDB development server listening on loopback {socket_address}");
+    println!("{} — development server listening on loopback {socket_address}", version_string());
     let database = Database::open(data_path)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let database = Arc::new(std::sync::Mutex::new(database));
@@ -136,7 +137,7 @@ fn handle_client(
     let mut line = Vec::with_capacity(1024);
     let mut session: Option<DatabaseSession> = None;
     let mut jsonl_mode = false;
-    writeln!(stream, "PostemberDB/0.1 ready; send one SQL statement per line")?;
+    writeln!(stream, "PostemberDB/0.1 ready; {}; send one SQL statement per line", version_string())?;
     loop {
         let sql = match read_bounded_line(&mut reader, &mut line, MAX_SQL_LINE_BYTES) {
             Ok(Some(_)) => std::str::from_utf8(&line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SQL input must be valid UTF-8"))?.to_owned(),

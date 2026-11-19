@@ -1,5 +1,6 @@
 mod server;
 
+use postemberdb::version::version_string;
 use postemberdb::Database;
 use std::path::Path;
 
@@ -21,7 +22,7 @@ fn main() {
             run_checkpoint(&path)
         }
         Some("version") | Some("--version") | Some("-V") => {
-            println!("PostemberDB {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_string());
             Ok(())
         }
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -70,7 +71,7 @@ fn run_checkpoint(path: &str) -> std::io::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("PostemberDB {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("{}", version_string());
     eprintln!("Usage:");
     eprintln!("  postemberdb server [127.0.0.1:7432] [data-file]");
     eprintln!("  postemberdb check [data-file]");
