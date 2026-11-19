@@ -26,19 +26,21 @@ The sidecar base is <code>server.pbd.rows</code>; it creates the files `.rows.pa
 ## Public API
 
 - `put(id, bytes)` inserts or atomically replaces a record.
+- `put_many(records)` writes up to 5,000 unique records (last-write-wins for duplicate IDs) and publishes all descriptors through one CoW root update.
 - `get(id)` returns the complete record or `None` when it does not exist.
 - `contains(id)` checks the record descriptor.
 - `delete(id)` removes the descriptor and returns whether it existed.
+- `delete_many(ids)` removes up to 5,000 IDs through one CoW root update; duplicate and missing IDs are ignored.
 - `page_cache_stats()` reports cache hits, misses, evictions, residency, and capacity.
 - `set_page_cache_capacity(pages)` adjusts the cache at runtime.
 
-IDs are caller-supplied non-zero `u64` values. They are not auto-assigned. An application may use stable SQL row IDs as record IDs, but RecordStore does not automatically observe SQL INSERT/UPDATE/DELETE statements.
+IDs are caller-supplied non-zero `u64` values. They are not auto-assigned. An application may use stable SQL row IDs as record IDs, but RecordStore does not automatically observe SQL INSERT/UPDATE/DELETE statements. A put batch is limited to 5,000 input records and 256 MiB of total data across the final unique IDs; every ID and individual record size is validated before any extent is reserved.
 
 ## Page and commit layout
 
 Each record has an RDX1 descriptor in the EmberTree B+ Tree. It contains the first data page ID, page count, total length, and a whole-record checksum. RPG1 page payloads contain the record ID, chunk ordinal/count, total length, the same checksum, and the chunk length. The surrounding EPG1 format validates page identity, generation, checksum, and zero padding.
 
-A write first reserves a contiguous page extent and writes/syncs all data pages. Only then does it publish the new descriptor through the page-tree redo WAL and atomic root update. If a crash occurs before publication, the prior value remains the visible one; newly reserved pages may be leaked. The new value is never made visible before its complete data pages are durable.
+A write first reserves a contiguous page extent and writes/syncs all data pages. Only then does it publish the new descriptor through the page-tree redo WAL and atomic root update. A put_many batch writes all data extents first, then publishes the complete descriptor set with one redo record and one root publication. If a crash occurs before publication, the prior value remains the visible one; newly reserved pages may be leaked. The new value is never made visible before its complete data pages are durable.
 
 ## Current limits and safety boundaries
 
