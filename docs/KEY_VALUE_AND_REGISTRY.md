@@ -32,6 +32,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The store is built on PostemberDB's native EmberTree page format. It does not use SQLite, RocksDB, or another embedded database.
 
+### Page cache
+
+The file-backed store uses a bounded per-handle LRU cache for validated EPG1 page payloads. The default is 128 pages; zero disables residency, and capacities above 65,536 pages are rejected.
+
+```rust
+use postemberdb::KeyValueStore;
+
+let mut kv = KeyValueStore::open_with_cache_capacity("data/world.kv", 256)?;
+let stats = kv.page_cache_stats();
+println!(
+    "hits={}, misses={}, evictions={}, resident={}/{} pages ({} bytes)",
+    stats.hits,
+    stats.misses,
+    stats.evictions,
+    stats.resident_pages,
+    stats.capacity_pages,
+    stats.resident_bytes,
+);
+
+// Capacity can also be changed on an open handle. Shrinking evicts LRU pages.
+kv.set_page_cache_capacity(64)?;
+```
+
+`PageCacheStats` reports capacity, resident page count/bytes, and cumulative hits, misses, and evictions. Successful writes refresh cached payloads; freed page ranges are invalidated so a reused page ID cannot return stale bytes. The cache is per handle, not shared between database handles.
+
 ## Registry
 
 `Registry` is a Windows-Registry-inspired hierarchy with hives, nested keys, and named typed values. Paths are case-insensitive and accept either slash separator.
