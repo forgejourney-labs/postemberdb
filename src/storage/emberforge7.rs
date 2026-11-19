@@ -767,10 +767,13 @@ impl EmberForge7Store {
             }
             removals.push(ttl_key.clone());
             removals.push(meta_key);
-            removals.push(record);
+            if self.pages_descriptor(&record)?.is_some() {
+                removals.push(record);
+            }
         }
+        let expected_removed = removals.len();
         let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
-        if removed != removals.len() {
+        if removed != expected_removed {
             return Err(DbError::Storage("EF7 TTL sweep did not remove every indexed key".into()));
         }
         for descriptor in reclaimed {
@@ -798,12 +801,14 @@ impl EmberForge7Store {
                 }
                 Ok(u64::from_be_bytes(value[..8].try_into().unwrap()))
             }).transpose()?;
-        let mut removals = vec![key, meta_key];
+        let mut removals = vec![key];
         if let Some(expiry) = old_expiry {
+            removals.push(meta_key);
             removals.push(record_ttl_key(expiry, namespace_id, record_id)?);
         }
+        let expected_removed = removals.len();
         let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
-        if removed != removals.len() {
+        if removed != expected_removed {
             return Err(DbError::Storage("EF7 record deletion did not remove all descriptor and TTL keys".into()));
         }
         self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
