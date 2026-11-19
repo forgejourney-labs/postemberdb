@@ -1,4 +1,5 @@
 use postemberdb::{Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
+use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +11,9 @@ const MAX_SQL_LINE_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT_SECS: u64 = 30;
 const MAX_EF7_WIRE_CUSTOM_BYTES: usize = 24 * 1024;
 const MAX_EF7_WIRE_CHUNK_BYTES: usize = 24 * 1024;
+const MAX_EF7_WIRE_RECORD_BYTES: usize = 24 * 1024;
 const MAX_EF7_NAMESPACE_LIST: usize = 64;
+const MAX_BINARY_CHUNK_BYTES: usize = DEFAULT_MAX_PAYLOAD - 16;
 
 struct ConnectionGuard(Arc<AtomicUsize>);
 
@@ -146,6 +149,12 @@ fn handle_client(
         };
         let command = sql.trim();
         if command.eq_ignore_ascii_case("QUIT") { break; }
+        if command.eq_ignore_ascii_case("POSTEMBERDB BINARY/1") {
+            let ready = Frame::new(FrameKind::Pong, 0, b"postemberdb-binary/1-ready".to_vec());
+            ready.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+            return handle_binary_client(stream, reader, database, ef7);
+        }
+
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
             stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
@@ -319,6 +328,116 @@ fn json_profile(row_id: u64, profile: &EmberForge7PlayerProfile) -> Result<Strin
     ))
 }
 
+fn binary_error(request_id: u64, message: &str) -> Frame {
+    Frame::new(FrameKind::Error, request_id, message.as_bytes().to_vec())
+}
+
+fn handle_binary_client(
+    mut stream: TcpStream,
+    mut reader: io::BufReader<TcpStream>,
+    database: Arc<std::sync::Mutex<Database>>,
+    ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
+) -> io::Result<()> {
+    loop {
+        let frame = match Frame::read_from_or_eof(&mut reader, DEFAULT_MAX_PAYLOAD)? {
+            Some(frame) => frame,
+            None => return Ok(()),
+        };
+        let request_id = frame.request_id;
+        let response = match frame.kind {
+            FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
+            FrameKind::Query => {
+                let sql = match std::str::from_utf8(&frame.payload) {
+                    Ok(sql) if !sql.trim().is_empty() => sql,
+                    _ => {
+                        binary_error(request_id, "query payload must be non-empty UTF-8 SQL")
+                            .write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+                        continue;
+                    }
+                };
+                let command = sql.trim();
+                if ["BEGIN", "COMMIT", "ROLLBACK"].iter().any(|word| command.eq_ignore_ascii_case(word)) {
+                    binary_error(request_id, "binary/1 query frames do not support transaction control yet")
+                } else {
+                    match database.lock() {
+                        Ok(mut db) => match db.execute(sql) {
+                            Ok(result) => Frame::new(FrameKind::QueryResult, request_id, format_result_json(result).into_bytes()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "database lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkPut => {
+                if frame.payload.len() < 16 {
+                    binary_error(request_id, "chunk put payload requires namespace:u64, x:i32, z:i32 and bytes")
+                } else if frame.payload.len() - 16 > MAX_BINARY_CHUNK_BYTES {
+                    binary_error(request_id, "chunk payload exceeds binary/1 single-frame limit")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.put_chunk(namespace, x, z, &frame.payload[16..]) {
+                            Ok(()) => Frame::new(FrameKind::QueryResult, request_id, b"{\"ok\":true,\"message\":\"chunk stored\"}".to_vec()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkGet => {
+                if frame.payload.len() != 16 {
+                    binary_error(request_id, "chunk get payload must contain namespace:u64, x:i32 and z:i32")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.get_chunk_limited(namespace, x, z, MAX_BINARY_CHUNK_BYTES) {
+                            Ok(Some(payload)) => {
+                                let mut response = Vec::with_capacity(16 + payload.len());
+                                response.extend_from_slice(&namespace.to_le_bytes());
+                                response.extend_from_slice(&x.to_le_bytes());
+                                response.extend_from_slice(&z.to_le_bytes());
+                                response.extend_from_slice(&payload);
+                                Frame::new(FrameKind::ChunkData, request_id, response)
+                            }
+                            Ok(None) => Frame::new(FrameKind::ChunkData, request_id, Vec::new()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkDelete => {
+                if frame.payload.len() != 16 {
+                    binary_error(request_id, "chunk delete payload must contain namespace:u64, x:i32 and z:i32")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.delete_chunk(namespace, x, z) {
+                            Ok(deleted) => Frame::new(
+                                FrameKind::QueryResult, request_id,
+                                format!("{{\"ok\":true,\"affected_rows\":{}}}", u8::from(deleted)).into_bytes()
+                            ),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::QueryResult | FrameKind::Error | FrameKind::Pong
+            | FrameKind::ChunkData | FrameKind::ChunkScan | FrameKind::ChunkScanResult => {
+                binary_error(request_id, "frame kind is response-only or not implemented by this server version")
+            }
+        };
+        response.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+    }
+}
+
 fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
     let parts = command.split_whitespace().collect::<Vec<_>>();
     if parts.len() < 2 || parts[0] != "EF7" {
@@ -423,6 +542,63 @@ fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
                     "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
                     json_escape(if deleted { "EF7 chunk deleted" } else { "EF7 chunk not found" }),
                     u8::from(deleted)
+                ))
+            }
+            "RECORD_PUT" => {
+                if parts.len() != 5 { return Err("usage: EF7 RECORD_PUT <namespace> <record_id> <payload_hex|->".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let payload = if parts[4] == "-" { Vec::new() } else { decode_hex(parts[4])? };
+                if payload.len() > MAX_EF7_WIRE_RECORD_BYTES {
+                    return Err(format!("record payload exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_RECORD_BYTES} bytes"));
+                }
+                store.put_record(namespace, record_id, &payload).map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 record stored"))
+            }
+            "RECORD_PUT_TTL" => {
+                if parts.len() != 6 { return Err("usage: EF7 RECORD_PUT_TTL <namespace> <record_id> <expires_at_ms> <payload_hex|->".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let expires_at_ms = parse_id(4, "expires_at_ms")?;
+                let payload = if parts[5] == "-" { Vec::new() } else { decode_hex(parts[5])? };
+                if payload.len() > MAX_EF7_WIRE_RECORD_BYTES {
+                    return Err(format!("record payload exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_RECORD_BYTES} bytes"));
+                }
+                store.put_record_with_expiry(namespace, record_id, expires_at_ms, &payload)
+                    .map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 TTL record stored"))
+            }
+            "RECORD_GET" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_GET <namespace> <record_id>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                match store.get_record_limited(namespace, record_id, MAX_EF7_WIRE_RECORD_BYTES)
+                    .map_err(|error| error.to_string())? {
+                    Some(payload) => Ok(format!(
+                        "{{\"ok\":true,\"message\":\"EF7 record found\",\"record\":{{\"namespace_id\":{},\"record_id\":{},\"payload_hex\":{}}}}}\n",
+                        namespace, record_id, json_escape(&encode_hex(&payload))
+                    )),
+                    None => Ok("{\"ok\":true,\"message\":\"EF7 record not found\",\"record\":null}\n".into()),
+                }
+            }
+            "RECORD_DELETE" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_DELETE <namespace> <record_id>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let deleted = store.delete_record(namespace, record_id).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
+                    json_escape(if deleted { "EF7 record deleted" } else { "EF7 record not found" }),
+                    u8::from(deleted)
+                ))
+            }
+            "RECORD_SWEEP" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_SWEEP <now_ms> <limit>".into()); }
+                let now_ms = parse_id(2, "current time in milliseconds")?;
+                let limit = parts[3].parse::<usize>().map_err(|_| "invalid TTL sweep limit".to_owned())?;
+                let removed = store.sweep_expired_records(now_ms, limit).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 TTL sweep completed\",\"affected_rows\":{removed}}}\n"
                 ))
             }
             "PROFILE_PUT" => {
@@ -601,6 +777,7 @@ fn format_result(result: QueryResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_bounded_line, validate_bind_address};
+    use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
     use postemberdb::{EmberForge7Store, QueryResult, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
@@ -701,6 +878,27 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("EF7 chunk deleted"));
 
+        writeln!(client, "EF7 RECORD_PUT_TTL 7 501 500 01020304").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 TTL record stored"));
+        writeln!(client, "EF7 RECORD_GET 7 501").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"payload_hex\":\"01020304\""));
+        writeln!(client, "EF7 RECORD_SWEEP 499 10").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"affected_rows\":0"));
+        writeln!(client, "EF7 RECORD_SWEEP 500 10").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"affected_rows\":1"));
+        writeln!(client, "EF7 RECORD_GET 7 501").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"record\":null"));
+
         let uuid = "11111111111111111111111111111111";
         writeln!(client, "EF7 PROFILE_PUT 7 41 {uuid} Steve 100 200 300 01020304").unwrap();
         line.clear();
@@ -771,6 +969,83 @@ mod tests {
         assert!(line.contains("namespace deleted"));
 
         writeln!(client, "QUIT").unwrap();
+        drop(reader);
+        drop(client);
+        worker.join().unwrap();
+        for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
+            let mut sidecar = ef7_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+    }
+
+    #[test]
+    fn binary_protocol_handshake_query_and_chunk_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = Arc::new(Mutex::new(postemberdb::Database::new()));
+        let ef7_path = std::env::temp_dir().join(format!(
+            "postemberdb-binary-ef7-{}-{}.pbd", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            super::handle_client(stream, database, ef7).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let reader_stream = client.try_clone().unwrap();
+        let mut reader = BufReader::new(reader_stream);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).unwrap();
+        assert!(greeting.contains("PostemberDB/0.1 ready"));
+        writeln!(client, "POSTEMBERDB BINARY/1").unwrap();
+        let ready = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(ready.kind, FrameKind::Pong);
+        assert_eq!(ready.payload, b"postemberdb-binary/1-ready");
+
+        Frame::new(FrameKind::Ping, 1, b"ping".to_vec())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let pong = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(pong.kind, FrameKind::Pong);
+        assert_eq!(pong.request_id, 1);
+        assert_eq!(pong.payload, b"ping");
+
+        Frame::new(FrameKind::Query, 2, b"CREATE TABLE binary_test (id INTEGER)".to_vec())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let created = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(created.kind, FrameKind::QueryResult);
+        assert!(String::from_utf8(created.payload).unwrap().contains("\"ok\":true"));
+
+        let mut put = Vec::new();
+        put.extend_from_slice(&1u64.to_le_bytes());
+        put.extend_from_slice(&(-20i32).to_le_bytes());
+        put.extend_from_slice(&35i32.to_le_bytes());
+        put.extend_from_slice(&[0, 1, 0xff, 0x7f]);
+        Frame::new(FrameKind::ChunkPut, 3, put)
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let stored = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(stored.kind, FrameKind::QueryResult);
+
+        let mut get = Vec::new();
+        get.extend_from_slice(&1u64.to_le_bytes());
+        get.extend_from_slice(&(-20i32).to_le_bytes());
+        get.extend_from_slice(&35i32.to_le_bytes());
+        Frame::new(FrameKind::ChunkGet, 4, get.clone())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let chunk = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(chunk.kind, FrameKind::ChunkData);
+        assert_eq!(&chunk.payload[..16], &get[..]);
+        assert_eq!(&chunk.payload[16..], &[0, 1, 0xff, 0x7f]);
+
+        Frame::new(FrameKind::ChunkDelete, 5, get)
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let deleted = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(deleted.kind, FrameKind::QueryResult);
+        assert!(String::from_utf8(deleted.payload).unwrap().contains("\"affected_rows\":1"));
+
+        drop(reader);
         drop(client);
         worker.join().unwrap();
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
