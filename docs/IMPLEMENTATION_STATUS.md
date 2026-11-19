@@ -207,4 +207,4 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Publishes the PDB6 manifest only after the copy is complete; PDB5 snapshot/WAL are not modified by the migration.
 - [x] Bounded row and index batches to 5,000 mutations.
 - [ ] PDB6 is not yet the live SQL authority. Normal SQL reads/writes still use PDB5 and in-memory tables.
-- [ ] Automatic resume/cleanup of partially copied overflow pages and safe migration verification remain pending.
+- [ ] Automatic resume/cleanup of partially copied overflow pages and safe migration verification remain pending; interrupted copies require operator removal of the incomplete PDB6 sidecars before retry.

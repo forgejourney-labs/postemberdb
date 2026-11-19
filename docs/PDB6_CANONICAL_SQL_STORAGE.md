@@ -93,7 +93,7 @@ mutations per batch. The PDB6 completion manifest is published last.
 
 The operation does not modify the PDB5 snapshot or WAL and does not switch
 normal SQL execution to PDB6. If interrupted, PDB5 remains authoritative. An
-incomplete PDB6 sidecar must currently be removed by the operator before
-restarting the copy; automatic progress tracking and orphan-page reclamation
-are not yet implemented. Do not treat the copied sidecar as production-ready
+incomplete PDB6 sidecar is detected and must currently be removed by the operator
+before restarting the copy; automatic progress tracking and orphan-page
+reclamation are not yet implemented. Do not treat the copied sidecar as production-ready
 or switch authority until the verification and recovery gates pass.

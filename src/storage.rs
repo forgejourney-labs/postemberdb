@@ -1,4 +1,4 @@
-use super::{Column, DataType, Database, DbError, Row, Table, Value};
+use super::{Column, DataType, Database, DbError, IndexKey, Row, Table, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
