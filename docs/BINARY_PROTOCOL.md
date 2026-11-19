@@ -48,7 +48,7 @@ Each response carries the same request ID as its request. SQL query frames execu
 - Single-frame chunk transfers are limited by the 8 MiB frame cap.
 - Native EF7 records/chunks remain limited to 64 MiB.
 - Multi-frame upload/download streams, chunk-range scans, chunk batches, flow-control windows, request cancellation, and multiplexed concurrent requests are not implemented yet.
-- The server processes requests sequentially per connection.
+- The server processes requests sequentially per connection. The optional Kotlin addon includes opt-in `queryBinary`, `putChunkBinary`, `getChunkBinary`, and `deleteChunkBinary` methods with asynchronous variants; the existing default service remains on JSONL/1 until an application opts into these methods.
 - The protocol is loopback-only and must not be exposed to untrusted networks.
 
 The next transport milestone is a bounded multi-frame stream protocol with declared total length, per-stream IDs, aggregate in-flight byte budgets, explicit commit/abort, and backpressure. The frame codec is separated from the server dispatcher so that this can be added without changing the 24-byte frame header.
