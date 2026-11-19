@@ -1180,7 +1180,7 @@ impl EmberForge7Store {
         let mut upsert_entries = Vec::with_capacity(upserts.len());
         let mut replaced_extents = Vec::with_capacity(upserts.len());
         for (x, z, payload) in upserts {
-            let key = chunk_key(1, *x, *z)?;
+            let key = chunk_key(world_namespace_id, *x, *z)?;
             let previous = page_tree::get(&mut self.pages, &key)?
                 .map(|value| RecordDescriptor::decode(&value)).transpose()?;
             let next = self.write_payload(payload)?;
