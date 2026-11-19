@@ -100,7 +100,8 @@ impl TransactionCoordinator {
                 }
                 2 => {
                     let tx = transactions.get_mut(&txid).ok_or_else(|| DbError::Storage("PREPARED record references an unknown transaction".into()))?;
-                    if tx.state != TransactionState::Preparing || participant >= tx.participant_count
+                    if tx.state != TransactionState::Preparing
+                        || tx.prepared.len() >= usize::from(tx.participant_count)
                         || !tx.prepared.insert(participant) || participant_count != tx.participant_count {
                         return Err(DbError::Storage("invalid or duplicate transaction PREPARED record".into()));
                     }
@@ -116,7 +117,6 @@ impl TransactionCoordinator {
                 5 => {
                     let tx = transactions.get_mut(&txid).ok_or_else(|| DbError::Storage("APPLIED record references an unknown transaction".into()))?;
                     if tx.state != TransactionState::Committed
-                        || participant >= tx.participant_count
                         || participant_count != tx.participant_count
                         || !tx.prepared.contains(&participant)
                         || !tx.applied.insert(participant) {
@@ -154,7 +154,9 @@ impl TransactionCoordinator {
 
     pub fn mark_prepared(&mut self, txid: u64, participant_id: u8) -> Result<(), DbError> {
         let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
-        if tx.state != TransactionState::Preparing || participant_id >= tx.participant_count || tx.prepared.contains(&participant_id) {
+        if tx.state != TransactionState::Preparing
+            || tx.prepared.len() >= usize::from(tx.participant_count)
+            || tx.prepared.contains(&participant_id) {
             return Err(DbError::Constraint("participant cannot be marked prepared in the current transaction state".into()));
         }
         let count = tx.participant_count;
@@ -183,7 +185,6 @@ impl TransactionCoordinator {
     pub fn mark_applied(&mut self, txid: u64, participant_id: u8) -> Result<(), DbError> {
         let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
         if tx.state != TransactionState::Committed
-            || participant_id >= tx.participant_count
             || !tx.prepared.contains(&participant_id)
             || tx.applied.contains(&participant_id) {
             return Err(DbError::Constraint("participant cannot be marked applied in the current transaction state".into()));
