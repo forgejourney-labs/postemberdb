@@ -22,6 +22,7 @@ const KEY_RECORD: u8 = 0x51;
 const KEY_PLAYER_UUID: u8 = 0x52;
 const KEY_PLAYER_NAME: u8 = 0x53;
 const KEY_PLAYER_ROW_META: u8 = 0x54;
+const KEY_CHUNK_DATA: u8 = 0x55;
 const KEY_NAMESPACE_NAME: u8 = 0x56;
 const FORMAT_VERSION: u8 = 1;
 
@@ -116,6 +117,32 @@ fn player_identity_key(namespace_id: u64, row_id: u64) -> Result<Vec<u8>, DbErro
     key.extend_from_slice(&namespace_id.to_be_bytes());
     key.extend_from_slice(&row_id.to_be_bytes());
     Ok(key)
+}
+
+
+fn chunk_key(namespace_id: u64, chunk_x: i32, chunk_z: i32) -> Result<Vec<u8>, DbError> {
+    if namespace_id == 0 {
+        return Err(DbError::Constraint("EF7 namespace ID must be non-zero".into()));
+    }
+    let mut key = Vec::with_capacity(17);
+    key.push(KEY_CHUNK_DATA);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&((chunk_x as u32) ^ 0x8000_0000).to_be_bytes());
+    key.extend_from_slice(&((chunk_z as u32) ^ 0x8000_0000).to_be_bytes());
+    Ok(key)
+}
+
+fn decode_chunk_coordinates(key: &[u8]) -> Result<(u64, i32, i32), DbError> {
+    if key.len() != 17 || key[0] != KEY_CHUNK_DATA {
+        return Err(DbError::Storage("invalid EF7 chunk index key".into()));
+    }
+    let namespace_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+    let x = u32::from_be_bytes(key[9..13].try_into().unwrap()) ^ 0x8000_0000;
+    let z = u32::from_be_bytes(key[13..17].try_into().unwrap()) ^ 0x8000_0000;
+    if namespace_id == 0 {
+        return Err(DbError::Storage("EF7 chunk key contains reserved namespace zero".into()));
+    }
+    Ok((namespace_id, x as i32, z as i32))
 }
 
 fn prefix_upper_key(prefix: &[u8]) -> Vec<u8> {
@@ -495,6 +522,84 @@ impl EmberForge7Store {
             return Err(DbError::Storage("EF7 namespace deletion did not remove both metadata keys".into()));
         }
         Ok(true)
+    }
+
+
+    /// Stores one Minecraft chunk payload by world namespace and signed chunk coordinates.
+    /// The chunk descriptor itself is the persistent index entry, so replacement
+    /// is a single tree publication and does not require a separate row-ID allocator.
+    pub fn put_chunk(
+        &mut self, world_namespace_id: u64, chunk_x: i32, chunk_z: i32, payload: &[u8],
+    ) -> Result<(), DbError> {
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let previous = page_tree::get(&mut self.pages, &key)?
+            .map(|value| RecordDescriptor::decode(&value)).transpose()?;
+        let next = self.write_payload(payload)?;
+        page_tree::apply_mutations(
+            &mut self.pages, &self.wal_path, &[], &[(key, next.encode()?)],
+        )?;
+        if let Some(old) = previous {
+            if old.start_page != next.start_page {
+                self.pages.release_extent(old.start_page, old.page_count as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_chunk(
+        &mut self, world_namespace_id: u64, chunk_x: i32, chunk_z: i32,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        self.read_payload(RecordDescriptor::decode(&value)?).map(Some)
+    }
+
+    pub fn delete_chunk(
+        &mut self, world_namespace_id: u64, chunk_x: i32, chunk_z: i32,
+    ) -> Result<bool, DbError> {
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(false); };
+        let descriptor = RecordDescriptor::decode(&value)?;
+        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &[key], &[])?;
+        if removed != 1 {
+            return Err(DbError::Storage("EF7 chunk deletion did not remove its index entry".into()));
+        }
+        self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
+        Ok(true)
+    }
+
+    /// Reads chunks in a bounded rectangular coordinate range, ordered by X then Z.
+    /// X spans are capped to 4,096 columns and result limits to 10,000 chunks.
+    pub fn scan_chunks(
+        &mut self,
+        world_namespace_id: u64,
+        min_x: i32,
+        min_z: i32,
+        max_x: i32,
+        max_z: i32,
+        limit: usize,
+    ) -> Result<Vec<(i32, i32, Vec<u8>)>, DbError> {
+        if world_namespace_id == 0 || min_x > max_x || min_z > max_z
+            || i64::from(max_x) - i64::from(min_x) > 4_095 || limit == 0 || limit > 10_000 {
+            return Err(DbError::Constraint("invalid EF7 chunk scan range or limit".into()));
+        }
+        let mut result = Vec::new();
+        for x in i64::from(min_x)..=i64::from(max_x) {
+            if result.len() >= limit { break; }
+            let lower = chunk_key(world_namespace_id, x as i32, min_z)?;
+            let upper = chunk_key(world_namespace_id, x as i32, max_z)?;
+            let remaining = limit - result.len();
+            let entries = page_tree::scan_range_limited(&mut self.pages, &lower, &upper, Some(remaining))?;
+            for (key, value) in entries {
+                let (namespace, chunk_x, chunk_z) = decode_chunk_coordinates(&key)?;
+                if namespace != world_namespace_id {
+                    return Err(DbError::Storage("EF7 chunk scan crossed namespace boundary".into()));
+                }
+                let payload = self.read_payload(RecordDescriptor::decode(&value)?)?;
+                result.push((chunk_x, chunk_z, payload));
+            }
+        }
+        Ok(result)
     }
 
     /// Stores or replaces a record up to 64 MiB. Data pages become durable
@@ -1181,6 +1286,34 @@ mod tests {
         {
             let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
             assert_eq!(reopened.get_player(5, new_uuid).unwrap(), Some((77, b"raw-data".to_vec())));
+        }
+        cleanup(&path);
+    }
+
+
+    #[test]
+    fn chunk_store_orders_signed_coordinates_and_scans_bounded_regions() {
+        let path = path("chunks");
+        {
+            let mut store = EmberForge7Store::open(&path, 16).unwrap();
+            for (x, z, data) in [(-1, 2, b"negative-x".as_slice()), (0, 0, b"origin".as_slice()),
+                (1, -2, b"positive-x".as_slice()), (-1, -3, b"negative-z".as_slice())] {
+                store.put_chunk(44, x, z, data).unwrap();
+            }
+            assert_eq!(store.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
+            assert_eq!(store.get_chunk(44, 99, 99).unwrap(), None);
+            let scan = store.scan_chunks(44, -1, -3, 1, 2, 10).unwrap();
+            assert_eq!(scan.iter().map(|(x, z, _)| (*x, *z)).collect::<Vec<_>>(),
+                vec![(-1, -3), (-1, 2), (0, 0), (1, -2)]);
+            assert_eq!(store.scan_chunks(44, -1, -3, 1, 2, 2).unwrap().len(), 2);
+            assert!(store.scan_chunks(44, 5, 0, 4, 1, 10).is_err());
+            assert!(store.delete_chunk(44, 0, 0).unwrap());
+            assert!(!store.delete_chunk(44, 0, 0).unwrap());
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
+            assert_eq!(reopened.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
+            assert_eq!(reopened.get_chunk(44, 0, 0).unwrap(), None);
         }
         cleanup(&path);
     }
