@@ -188,6 +188,18 @@ mod tests {
     }
 
     #[test]
+    fn clean_eof_is_distinct_from_a_truncated_header() {
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        assert!(Frame::read_from_or_eof(&mut empty, 1024).unwrap().is_none());
+
+        let mut partial = Cursor::new(b"PDB".to_vec());
+        assert_eq!(
+            Frame::read_from_or_eof(&mut partial, 1024).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
     fn crc32_matches_standard_check_vector() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
