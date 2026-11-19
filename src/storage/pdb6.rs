@@ -32,6 +32,52 @@ pub(crate) struct CatalogIndex {
     pub unique: bool,
 }
 
+/// Compact database-wide metadata stored at the reserved root key.
+/// The physical EmberTree root remains in EAM3; this manifest versions the
+/// logical SQL catalog visible through that physical root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DatabaseManifest {
+    pub generation: u64,
+    pub last_tx_id: u64,
+    pub next_table_id: u64,
+    pub table_count: u32,
+}
+
+impl DatabaseManifest {
+    pub(crate) fn encode(self) -> Result<Vec<u8>, DbError> {
+        if self.next_table_id == 0 || self.table_count > 1_000_000 {
+            return Err(DbError::Constraint("invalid PDB6 database manifest counters".into()));
+        }
+        let mut out = Vec::with_capacity(36);
+        out.extend_from_slice(b"PDM1");
+        out.push(KEYSPACE_VERSION);
+        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(&self.generation.to_le_bytes());
+        out.extend_from_slice(&self.last_tx_id.to_le_bytes());
+        out.extend_from_slice(&self.next_table_id.to_le_bytes());
+        out.extend_from_slice(&self.table_count.to_le_bytes());
+        Ok(out)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() != 36 || &bytes[..4] != b"PDM1" || bytes[4] != KEYSPACE_VERSION
+            || bytes[5..8] != [0, 0, 0]
+        {
+            return Err(DbError::Storage("invalid PDB6 database manifest header or length".into()));
+        }
+        let manifest = Self {
+            generation: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            last_tx_id: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            next_table_id: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            table_count: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+        };
+        if manifest.next_table_id == 0 || manifest.table_count > 1_000_000 {
+            return Err(DbError::Storage("invalid PDB6 database manifest counters".into()));
+        }
+        Ok(manifest)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogTable {
     pub table_id: u64,
@@ -307,6 +353,16 @@ mod tests {
             indexes: vec![CatalogIndex { name: "players_uuid_idx".into(), columns: vec![0], unique: true }],
             next_row_id: 42,
         }
+    }
+
+    #[test]
+    fn database_manifest_round_trips_and_rejects_invalid_header() {
+        let manifest = DatabaseManifest { generation: 19, last_tx_id: 23, next_table_id: 8, table_count: 7 };
+        assert_eq!(DatabaseManifest::decode(&manifest.encode().unwrap()).unwrap(), manifest);
+        let mut bad = manifest.encode().unwrap();
+        bad[5] = 1;
+        assert!(DatabaseManifest::decode(&bad).is_err());
+        assert!(DatabaseManifest { next_table_id: 0, ..manifest }.encode().is_err());
     }
 
     #[test]
