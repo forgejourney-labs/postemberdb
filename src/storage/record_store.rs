@@ -141,7 +141,7 @@ impl RecordStore {
         if page_count > MAX_RECORD_PAGES {
             return Err(DbError::Constraint("record requires too many pages".into()));
         }
-        let checksum = super::super::checksum(bytes);
+        let checksum = super::checksum(bytes);
         let first_page_id = self.store.allocate_extent(page_count as u64)?;
         for page_index in 0..page_count {
             let start = page_index * RECORD_CHUNK_BYTES;
@@ -217,7 +217,7 @@ impl RecordStore {
             output.extend_from_slice(&payload[RECORD_PAGE_HEADER_BYTES..]);
         }
 
-        if output.len() != total_len || super::super::checksum(&output) != descriptor.checksum {
+        if output.len() != total_len || super::checksum(&output) != descriptor.checksum {
             return Err(DbError::Storage("record length or whole-record checksum mismatch".into()));
         }
         Ok(Some(output))
@@ -257,7 +257,7 @@ fn storage_error(error: std::io::Error) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecordStore, MAX_RECORD_BYTES};
+    use super::{page_tree, RecordStore, MAX_RECORD_BYTES};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
