@@ -11,6 +11,9 @@ use std::path::Path;
 const MAGIC: &[u8; 4] = b"SRW1";
 const MAX_COLUMNS: usize = 1_000_000;
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BATCH_ROWS: usize = 5_000;
+const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// Page-backed storage for one SQL table's rows.
 ///
@@ -56,11 +59,22 @@ impl SqlRowStore {
         I: IntoIterator<Item = (u64, Vec<Value>)>,
     {
         let mut encoded = Vec::new();
-        for (row_id, values) in rows.into_iter().take(5_001) {
-            encoded.push((row_id, self.encode_row(&values)?));
-        }
-        if encoded.len() > 5_000 {
-            return Err(DbError::Constraint("SQL row batch exceeds 5,000 rows".into()));
+        let mut total_bytes = 0usize;
+        for (row_id, values) in rows {
+            if encoded.len() == MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds {MAX_BATCH_ROWS} rows"
+                )));
+            }
+            let bytes = self.encode_row(&values)?;
+            total_bytes = total_bytes.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("SQL row batch byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                )));
+            }
+            encoded.push((row_id, bytes));
         }
         self.records.put_many(encoded)
     }
@@ -131,6 +145,21 @@ impl SqlRowStore {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(values.len() as u32).to_le_bytes());
         for value in values {
+            let additional = match value {
+                Value::Null => 1,
+                Value::Integer(_) => 9,
+                Value::Text(value) => {
+                    if value.len() > MAX_TEXT_BYTES {
+                        return Err(DbError::Constraint("SQL text value exceeds 64 MiB".into()));
+                    }
+                    5usize.checked_add(value.len())
+                        .ok_or_else(|| DbError::Constraint("SQL text length overflow".into()))?
+                }
+                Value::Boolean(_) => 2,
+            };
+            if out.len().checked_add(additional).is_none_or(|length| length > MAX_ROW_BYTES) {
+                return Err(DbError::Constraint("encoded SQL row exceeds 64 MiB".into()));
+            }
             match value {
                 Value::Null => out.push(0),
                 Value::Integer(value) => {
@@ -138,9 +167,6 @@ impl SqlRowStore {
                     out.extend_from_slice(&value.to_le_bytes());
                 }
                 Value::Text(value) => {
-                    if value.len() > MAX_TEXT_BYTES {
-                        return Err(DbError::Constraint("SQL text value exceeds 64 MiB".into()));
-                    }
                     out.push(2);
                     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
                     out.extend_from_slice(value.as_bytes());
