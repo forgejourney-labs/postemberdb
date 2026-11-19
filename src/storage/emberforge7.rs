@@ -558,7 +558,9 @@ impl EmberForge7Store {
         identity_prefix.extend_from_slice(&id.to_be_bytes());
         let mut chunk_prefix = vec![KEY_CHUNK_DATA];
         chunk_prefix.extend_from_slice(&id.to_be_bytes());
-        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix, chunk_prefix] {
+        let mut ttl_meta_prefix = vec![KEY_RECORD_TTL_META];
+        ttl_meta_prefix.extend_from_slice(&id.to_be_bytes());
+        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix, chunk_prefix, ttl_meta_prefix] {
             if !page_tree::scan_range_limited(
                 &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(1),
             )?.is_empty() {
