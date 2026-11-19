@@ -79,6 +79,48 @@ impl SqlRowStore {
         self.records.put_many(encoded)
     }
 
+    /// Applies typed row upserts and deletions with one descriptor-tree WAL
+    /// frame and one atomic root publication. Upserts win for IDs present in
+    /// both collections. The combined mutation count is capped at 5,000.
+    pub fn apply_batch<U, D>(
+        &mut self,
+        rows: U,
+        row_ids_to_delete: D,
+    ) -> Result<(usize, usize), DbError>
+    where
+        U: IntoIterator<Item = (u64, Vec<Value>)>,
+        D: IntoIterator<Item = u64>,
+    {
+        let mut encoded = Vec::new();
+        let mut total_bytes = 0usize;
+        for (row_id, values) in rows {
+            if encoded.len() >= MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds {MAX_BATCH_ROWS} mutations"
+                )));
+            }
+            let bytes = self.encode_row(&values)?;
+            total_bytes = total_bytes.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("SQL row batch byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                )));
+            }
+            encoded.push((row_id, bytes));
+        }
+        let mut deletions = Vec::new();
+        for row_id in row_ids_to_delete {
+            if encoded.len() + deletions.len() >= MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds {MAX_BATCH_ROWS} mutations"
+                )));
+            }
+            deletions.push(row_id);
+        }
+        self.records.apply_batch(encoded, deletions)
+    }
+
     /// Reads one row by stable ID. Missing rows return None.
     pub fn get(&mut self, row_id: u64) -> Result<Option<Vec<Value>>, DbError> {
         self.records.get(row_id)?
