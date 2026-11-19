@@ -54,6 +54,20 @@ data class PostemberPlayerRemoval(
     val uuid: UUID
 )
 
+data class PostemberNamespace(
+    val id: Long,
+    val parentId: Long?,
+    val kind: String,
+    val name: String
+)
+
+data class PostemberChunk(
+    val namespaceId: Long,
+    val chunkX: Int,
+    val chunkZ: Int,
+    val payload: ByteArray
+)
+
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
 class PostemberDbClient internal constructor(
     private val host: String,
@@ -94,6 +108,129 @@ class PostemberDbClient internal constructor(
 
     fun executeAsync(sql: String): CompletableFuture<Long> =
         queryAsync(sql).thenApply { it.affectedRows }
+
+
+    fun createNamespace(
+        id: Long,
+        parentId: Long?,
+        kind: String,
+        name: String
+    ): PostemberNamespace {
+        check(!Bukkit.isPrimaryThread()) { "Use createNamespaceAsync() on Paper's main thread" }
+        require(id > 0) { "namespace ID must be positive" }
+        require(parentId == null || parentId > 0) { "parent namespace ID must be positive" }
+        val normalizedKind = kind.lowercase()
+        require(normalizedKind in setOf("server", "world", "plugin", "playerdata", "custom")) {
+            "namespace kind must be server, world, plugin, playerdata or custom"
+        }
+        require(name.matches(Regex("[A-Za-z0-9._-]{1,128}"))) {
+            "namespace name must be 1..128 ASCII letters, digits, '.', '_' or '-'"
+        }
+        val command = "EF7 NS_CREATE $id " + parentToken(parentId) + " $normalizedKind $name"
+        val response = protocolRequestLine(command)
+        return response.readNamespace()
+            ?: throw PostemberDbException("EF7 create namespace response omitted namespace")
+    }
+
+    fun createNamespaceAsync(
+        id: Long,
+        parentId: Long?,
+        kind: String,
+        name: String
+    ): CompletableFuture<PostemberNamespace> =
+        CompletableFuture.supplyAsync({ createNamespace(id, parentId, kind, name) }, executor)
+
+    fun getNamespace(id: Long): PostemberNamespace? {
+        check(!Bukkit.isPrimaryThread()) { "Use getNamespaceAsync() on Paper's main thread" }
+        require(id > 0) { "namespace ID must be positive" }
+        return protocolRequestLine("EF7 NS_GET $id").readNamespace()
+    }
+
+    fun getNamespaceAsync(id: Long): CompletableFuture<PostemberNamespace?> =
+        CompletableFuture.supplyAsync({ getNamespace(id) }, executor)
+
+    fun findNamespace(parentId: Long?, name: String): PostemberNamespace? {
+        check(!Bukkit.isPrimaryThread()) { "Use findNamespaceAsync() on Paper's main thread" }
+        require(parentId == null || parentId > 0) { "parent namespace ID must be positive" }
+        require(name.matches(Regex("[A-Za-z0-9._-]{1,128}"))) { "invalid namespace name" }
+        val command = "EF7 NS_FIND " + parentToken(parentId) + " $name"
+        return protocolRequestLine(command).readNamespace()
+    }
+
+    fun findNamespaceAsync(parentId: Long?, name: String): CompletableFuture<PostemberNamespace?> =
+        CompletableFuture.supplyAsync({ findNamespace(parentId, name) }, executor)
+
+    fun listNamespaces(parentId: Long? = null, limit: Int = 64): List<PostemberNamespace> {
+        check(!Bukkit.isPrimaryThread()) { "Use listNamespacesAsync() on Paper's main thread" }
+        require(parentId == null || parentId > 0) { "parent namespace ID must be positive" }
+        require(limit in 1..64) { "KSL namespace listing is limited to 1..64 entries per request" }
+        val command = "EF7 NS_LIST " + parentToken(parentId) + " $limit"
+        val response = protocolRequestLine(command)
+        return response["namespaces"]?.jsonArray?.map { it.jsonObject.toNamespace() } ?: emptyList()
+    }
+
+    fun listNamespacesAsync(
+        parentId: Long? = null,
+        limit: Int = 64
+    ): CompletableFuture<List<PostemberNamespace>> =
+        CompletableFuture.supplyAsync({ listNamespaces(parentId, limit) }, executor)
+
+    fun deleteNamespace(id: Long): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deleteNamespaceAsync() on Paper's main thread" }
+        require(id > 0) { "namespace ID must be positive" }
+        return protocolRequestLine("EF7 NS_DELETE $id")["affected_rows"]?.jsonPrimitive?.longOrNull == 1L
+    }
+
+    fun deleteNamespaceAsync(id: Long): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deleteNamespace(id) }, executor)
+
+    fun putChunk(namespaceId: Long, chunkX: Int, chunkZ: Int, payload: ByteArray): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putChunkAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        require(payload.size <= MAX_EF7_WIRE_CHUNK_BYTES) {
+            "EF7 JSONL/1 chunk payload limit is $MAX_EF7_WIRE_CHUNK_BYTES bytes"
+        }
+        val encoded = payload.toLowerHex().ifEmpty { "-" }
+        protocolRequestLine("EF7 CHUNK_PUT $namespaceId $chunkX $chunkZ $encoded")
+    }
+
+    fun putChunkAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync({ putChunk(namespaceId, chunkX, chunkZ, payload); Unit }, executor)
+
+    fun getChunk(namespaceId: Long, chunkX: Int, chunkZ: Int): PostemberChunk? {
+        check(!Bukkit.isPrimaryThread()) { "Use getChunkAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        return protocolRequestLine("EF7 CHUNK_GET $namespaceId $chunkX $chunkZ").readChunk()
+    }
+
+    fun getChunkAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int
+    ): CompletableFuture<PostemberChunk?> =
+        CompletableFuture.supplyAsync({ getChunk(namespaceId, chunkX, chunkZ) }, executor)
+
+    fun deleteChunk(namespaceId: Long, chunkX: Int, chunkZ: Int): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deleteChunkAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        return protocolRequestLine(
+            "EF7 CHUNK_DELETE $namespaceId $chunkX $chunkZ"
+        )["affected_rows"]?.jsonPrimitive?.longOrNull == 1L
+    }
+
+    fun deleteChunkAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int
+    ): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deleteChunk(namespaceId, chunkX, chunkZ) }, executor)
+
+    private fun parentToken(parentId: Long?): String = parentId?.toString() ?: "-"
 
 
     fun putPlayerProfile(
@@ -281,6 +418,49 @@ class PostemberDbClient internal constructor(
         }
     }
 
+
+    private fun JsonObject.readNamespace(): PostemberNamespace? {
+        val element = this["namespace"] ?: return null
+        if (element == JsonNull) return null
+        return element.jsonObject.toNamespace()
+    }
+
+    private fun JsonObject.toNamespace(): PostemberNamespace {
+        val parentElement = this["parent_id"]
+        val parentId = if (parentElement == null || parentElement == JsonNull) {
+            null
+        } else {
+            parentElement.jsonPrimitive.longOrNull
+                ?: throw PostemberDbException("EF7 namespace response contains invalid parent_id")
+        }
+        return PostemberNamespace(
+            id = this["id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 namespace response omitted id"),
+            parentId = parentId,
+            kind = this["kind"]?.jsonPrimitive?.content
+                ?: throw PostemberDbException("EF7 namespace response omitted kind"),
+            name = this["name"]?.jsonPrimitive?.content
+                ?: throw PostemberDbException("EF7 namespace response omitted name")
+        )
+    }
+
+    private fun JsonObject.readChunk(): PostemberChunk? {
+        val element = this["chunk"] ?: return null
+        if (element == JsonNull) return null
+        val chunk = element.jsonObject
+        val payloadHex = chunk["payload_hex"]?.jsonPrimitive?.content
+            ?: throw PostemberDbException("EF7 chunk response omitted payload_hex")
+        return PostemberChunk(
+            namespaceId = chunk["namespace_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 chunk response omitted namespace_id"),
+            chunkX = chunk["chunk_x"]?.jsonPrimitive?.intOrNull
+                ?: throw PostemberDbException("EF7 chunk response omitted chunk_x"),
+            chunkZ = chunk["chunk_z"]?.jsonPrimitive?.intOrNull
+                ?: throw PostemberDbException("EF7 chunk response omitted chunk_z"),
+            payload = payloadHex.decodeHex()
+        )
+    }
+
     private fun JsonObject.readStoredProfile(): PostemberStoredPlayerProfile? {
         val element = this["profile"] ?: return null
         if (element == JsonNull) return null
@@ -319,6 +499,7 @@ class PostemberDbClient internal constructor(
 
 private const val MAX_LINE_BYTES = 64 * 1024
 private const val MAX_EF7_WIRE_CUSTOM_BYTES = 24 * 1024
+private const val MAX_EF7_WIRE_CHUNK_BYTES = 24 * 1024
 
 private fun ByteArray.toLowerHex(): String {
     val alphabet = "0123456789abcdef"
