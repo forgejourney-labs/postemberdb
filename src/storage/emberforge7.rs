@@ -789,6 +789,27 @@ impl EmberForge7Store {
         self.read_payload(descriptor).map(Some)
     }
 
+    /// Reads a record only when its descriptor length fits the caller's byte budget.
+    /// The size is checked before any overflow pages are loaded.
+    pub fn get_record_limited(
+        &mut self,
+        namespace_id: u64,
+        record_id: u64,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        if max_bytes > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 record read budget cannot exceed 64 MiB".into()));
+        }
+        let key = record_key(namespace_id, record_id)?;
+        let Some(descriptor) = self.pages_descriptor(&key)? else { return Ok(None); };
+        if descriptor.total_len > max_bytes as u64 {
+            return Err(DbError::Constraint(format!(
+                "EF7 record payload exceeds the requested read budget of {max_bytes} bytes"
+            )));
+        }
+        self.read_payload(descriptor).map(Some)
+    }
+
     /// Deletes a record and its TTL indexes in one CoW publication.
     pub fn delete_record(&mut self, namespace_id: u64, record_id: u64) -> Result<bool, DbError> {
         let key = record_key(namespace_id, record_id)?;
