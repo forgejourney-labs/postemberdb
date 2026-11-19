@@ -48,6 +48,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] RecordStore provides bounded ordered ID pagination without reading payloads, plus record-page reads capped at 5,000 records and 256 MiB per call.
 - [x] Standalone `SqlRowStore` stores typed SRW1 SQL row records over RecordStore pages, with stable-ID lookup, bounded scans, schema-width checks, and corruption validation; it is not yet integrated into `Database`.
 - [x] RecordStore and SqlRowStore expose mixed upsert/delete batches committed through one descriptor-tree redo frame and one atomic root publication; this is a storage primitive, not yet the SQL transaction coordinator.
+- [x] SqlRowStore bounded multi-get by stable row ID, preserving first-seen order, deduplicating IDs, and enforcing 5,000-ID / 256 MiB read limits; this remains a row-store API, not SQL executor integration.
+- [ ] PDB6 canonical SQL storage design is documented in `docs/PDB6_CANONICAL_SQL_STORAGE.md`; implementation gates remain open and PDB5 remains authoritative.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
