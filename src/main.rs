@@ -15,12 +15,13 @@ fn main() {
         }
         Some("migrate-pdb6") => {
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
-            let mut database = Database::open(&data_path)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            database.migrate_to_pdb6()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            println!("PDB6 is now the SQL authority for {data_path}; PDB5 files were retained.");
-            Ok(())
+            match Database::open(&data_path).and_then(|mut database| database.migrate_to_pdb6()) {
+                Ok(()) => {
+                    println!("PDB6 is now the SQL authority for {data_path}; PDB5 files were retained.");
+                    Ok(())
+                }
+                Err(error) => Err(std::io::Error::other(error.to_string())),
+            }
         }
         Some("server-tls") => {
             let address = args.next().unwrap_or_else(|| "0.0.0.0:7432".into());
