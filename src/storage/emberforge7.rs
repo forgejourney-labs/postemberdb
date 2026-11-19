@@ -17,9 +17,251 @@ const CHUNK_MAGIC: &[u8; 4] = b"EF7C";
 const DESCRIPTOR_MAGIC: &[u8; 4] = b"EF7R";
 const CHUNK_HEADER: usize = 41;
 const CHUNK_CAPACITY: usize = extent::page_payload_size() - CHUNK_HEADER;
+const KEY_NAMESPACE: u8 = 0x50;
 const KEY_RECORD: u8 = 0x51;
 const KEY_PLAYER_UUID: u8 = 0x52;
+const KEY_PLAYER_NAME: u8 = 0x53;
+const KEY_PLAYER_ROW_META: u8 = 0x54;
+const KEY_NAMESPACE_NAME: u8 = 0x56;
 const FORMAT_VERSION: u8 = 1;
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EmberForge7NamespaceKind {
+    Server = 1, World = 2, Plugin = 3, PlayerData = 4, Custom = 5,
+}
+impl EmberForge7NamespaceKind {
+    fn decode(value: u8) -> Result<Self, DbError> {
+        match value { 1 => Ok(Self::Server), 2 => Ok(Self::World), 3 => Ok(Self::Plugin),
+            4 => Ok(Self::PlayerData), 5 => Ok(Self::Custom),
+            _ => Err(DbError::Storage("unknown EF7 namespace kind".into())) }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmberForge7Namespace {
+    pub id: u64,
+    pub parent_id: Option<u64>,
+    pub kind: EmberForge7NamespaceKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmberForge7PlayerProfile {
+    pub uuid: [u8; 16],
+    pub username: String,
+    pub first_joined_ms: u64,
+    pub last_seen_ms: u64,
+    pub playtime_ticks: u64,
+    pub custom_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlayerIdentity {
+    uuid: [u8; 16],
+    username: Option<String>,
+}
+
+fn normalize_namespace_name(name: &str) -> Result<String, DbError> {
+    if name.is_empty() || name.len() > 128 || !name.is_ascii() {
+        return Err(DbError::Constraint("EF7 namespace names must contain 1..=128 ASCII characters".into()));
+    }
+    let normalized = name.to_ascii_lowercase();
+    if normalized == "." || normalized == ".."
+        || !normalized.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(DbError::Constraint("EF7 namespace names may contain only letters, digits, '.', '_' and '-'".into()));
+    }
+    Ok(normalized)
+}
+
+fn normalize_player_name(name: &str) -> Result<String, DbError> {
+    if name.is_empty() || name.len() > 16 || !name.is_ascii()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(DbError::Constraint("Minecraft player names must contain 1..=16 ASCII letters, digits or '_'".into()));
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+fn namespace_key(id: u64) -> Result<Vec<u8>, DbError> {
+    if id == 0 { return Err(DbError::Constraint("EF7 namespace ID must be non-zero".into())); }
+    let mut key = vec![KEY_NAMESPACE];
+    key.extend_from_slice(&id.to_be_bytes());
+    Ok(key)
+}
+
+fn namespace_name_key(parent_id: Option<u64>, name: &str) -> Result<Vec<u8>, DbError> {
+    let normalized = normalize_namespace_name(name)?;
+    let mut key = vec![KEY_NAMESPACE_NAME];
+    key.extend_from_slice(&parent_id.unwrap_or(0).to_be_bytes());
+    key.extend_from_slice(normalized.as_bytes());
+    Ok(key)
+}
+
+fn player_name_key(namespace_id: u64, name: &str) -> Result<Vec<u8>, DbError> {
+    let normalized = normalize_player_name(name)?;
+    let mut key = vec![KEY_PLAYER_NAME];
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(normalized.as_bytes());
+    Ok(key)
+}
+
+fn player_identity_key(namespace_id: u64, row_id: u64) -> Result<Vec<u8>, DbError> {
+    if namespace_id == 0 || row_id == 0 {
+        return Err(DbError::Constraint("EF7 namespace and player row IDs must be non-zero".into()));
+    }
+    let mut key = vec![KEY_PLAYER_ROW_META];
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&row_id.to_be_bytes());
+    Ok(key)
+}
+
+fn prefix_upper_key(prefix: &[u8]) -> Vec<u8> {
+    let mut upper = prefix.to_vec();
+    upper.resize(1024, 0xff);
+    upper
+}
+
+impl EmberForge7Namespace {
+    fn encode(&self) -> Result<Vec<u8>, DbError> {
+        if self.id == 0 || self.parent_id == Some(0) || self.parent_id == Some(self.id) {
+            return Err(DbError::Constraint("invalid EF7 namespace identity or parent".into()));
+        }
+        if normalize_namespace_name(&self.name)? != self.name {
+            return Err(DbError::Constraint("EF7 namespace names must be canonical lowercase".into()));
+        }
+        let mut out = Vec::with_capacity(34 + self.name.len());
+        out.extend_from_slice(b"EF7N");
+        out.extend_from_slice(&[FORMAT_VERSION, self.kind as u8, u8::from(self.parent_id.is_some()), 0]);
+        out.extend_from_slice(&self.id.to_le_bytes());
+        out.extend_from_slice(&self.parent_id.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&(self.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(self.name.as_bytes());
+        let sum = checksum(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() < 34 || &bytes[..4] != b"EF7N" || bytes[4] != FORMAT_VERSION
+            || bytes[6] > 1 || bytes[7] != 0 {
+            return Err(DbError::Storage("invalid EF7 namespace record header".into()));
+        }
+        let name_len = u16::from_le_bytes(bytes[24..26].try_into().unwrap()) as usize;
+        if bytes.len() != 34 + name_len {
+            return Err(DbError::Storage("invalid EF7 namespace record length".into()));
+        }
+        let expected = u64::from_le_bytes(bytes[26 + name_len..34 + name_len].try_into().unwrap());
+        if checksum(&bytes[..26 + name_len]) != expected {
+            return Err(DbError::Storage("EF7 namespace record checksum mismatch".into()));
+        }
+        let id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let parent = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let name = std::str::from_utf8(&bytes[26..26 + name_len])
+            .map_err(|_| DbError::Storage("EF7 namespace name is not UTF-8".into()))?.to_owned();
+        if id == 0 || normalize_namespace_name(&name).map_err(|_| DbError::Storage("invalid EF7 namespace name".into()))? != name
+            || (bytes[6] == 0 && parent != 0) || (bytes[6] == 1 && (parent == 0 || parent == id)) {
+            return Err(DbError::Storage("invalid EF7 namespace fields".into()));
+        }
+        Ok(Self { id, parent_id: if bytes[6] == 1 { Some(parent) } else { None },
+            kind: EmberForge7NamespaceKind::decode(bytes[5])?, name })
+    }
+}
+
+impl PlayerIdentity {
+    fn encode(&self) -> Result<Vec<u8>, DbError> {
+        let username = match &self.username { Some(n) => normalize_player_name(n)?, None => String::new() };
+        let mut out = Vec::with_capacity(30 + username.len());
+        out.extend_from_slice(b"EF7I");
+        out.push(FORMAT_VERSION);
+        out.extend_from_slice(&self.uuid);
+        out.push(username.len() as u8);
+        out.extend_from_slice(username.as_bytes());
+        let sum = checksum(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() < 30 || &bytes[..4] != b"EF7I" || bytes[4] != FORMAT_VERSION {
+            return Err(DbError::Storage("invalid EF7 player identity header".into()));
+        }
+        let name_len = bytes[21] as usize;
+        if name_len > 16 || bytes.len() != 30 + name_len {
+            return Err(DbError::Storage("invalid EF7 player identity length".into()));
+        }
+        let expected = u64::from_le_bytes(bytes[22 + name_len..30 + name_len].try_into().unwrap());
+        if checksum(&bytes[..22 + name_len]) != expected {
+            return Err(DbError::Storage("EF7 player identity checksum mismatch".into()));
+        }
+        let username = if name_len == 0 { None } else {
+            let name = std::str::from_utf8(&bytes[22..22 + name_len])
+                .map_err(|_| DbError::Storage("EF7 player name is not UTF-8".into()))?;
+            let normalized = normalize_player_name(name)
+                .map_err(|_| DbError::Storage("invalid EF7 player identity name".into()))?;
+            if normalized != name { return Err(DbError::Storage("EF7 player identity name is not canonical".into())); }
+            Some(normalized)
+        };
+        Ok(Self { uuid: bytes[5..21].try_into().unwrap(), username })
+    }
+}
+
+impl EmberForge7PlayerProfile {
+    fn encode(&self) -> Result<Vec<u8>, DbError> {
+        normalize_player_name(&self.username)?;
+        if self.last_seen_ms < self.first_joined_ms {
+            return Err(DbError::Constraint("player last_seen_ms cannot be earlier than first_joined_ms".into()));
+        }
+        const HEADER: usize = 58;
+        if self.custom_data.len().saturating_add(HEADER + self.username.len()) > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 player profile exceeds the 64 MiB record limit".into()));
+        }
+        let mut out = Vec::with_capacity(HEADER + self.username.len() + self.custom_data.len());
+        out.extend_from_slice(b"EF7P");
+        out.push(FORMAT_VERSION);
+        out.extend_from_slice(&self.uuid);
+        out.push(self.username.len() as u8);
+        out.extend_from_slice(self.username.as_bytes());
+        out.extend_from_slice(&self.first_joined_ms.to_le_bytes());
+        out.extend_from_slice(&self.last_seen_ms.to_le_bytes());
+        out.extend_from_slice(&self.playtime_ticks.to_le_bytes());
+        out.extend_from_slice(&(self.custom_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.custom_data);
+        let sum = checksum(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() < 59 || &bytes[..4] != b"EF7P" || bytes[4] != FORMAT_VERSION {
+            return Err(DbError::Storage("invalid EF7 player profile header".into()));
+        }
+        let name_len = bytes[21] as usize;
+        if name_len == 0 || name_len > 16 || bytes.len() < 58 + name_len {
+            return Err(DbError::Storage("invalid EF7 player profile username length".into()));
+        }
+        let fixed = 22 + name_len;
+        let first_joined_ms = u64::from_le_bytes(bytes[fixed..fixed + 8].try_into().unwrap());
+        let last_seen_ms = u64::from_le_bytes(bytes[fixed + 8..fixed + 16].try_into().unwrap());
+        let playtime_ticks = u64::from_le_bytes(bytes[fixed + 16..fixed + 24].try_into().unwrap());
+        let data_len = u32::from_le_bytes(bytes[fixed + 24..fixed + 28].try_into().unwrap()) as usize;
+        if bytes.len() != fixed + 28 + data_len + 8 {
+            return Err(DbError::Storage("EF7 player profile length mismatch".into()));
+        }
+        let expected = u64::from_le_bytes(bytes[fixed + 28 + data_len..].try_into().unwrap());
+        if checksum(&bytes[..fixed + 28 + data_len]) != expected || last_seen_ms < first_joined_ms {
+            return Err(DbError::Storage("EF7 player profile checksum or timestamp validation failed".into()));
+        }
+        let username = std::str::from_utf8(&bytes[22..fixed])
+            .map_err(|_| DbError::Storage("EF7 player profile name is not UTF-8".into()))?.to_owned();
+        normalize_player_name(&username).map_err(|_| DbError::Storage("invalid EF7 player profile name".into()))?;
+        Ok(Self { uuid: bytes[5..21].try_into().unwrap(), username, first_joined_ms, last_seen_ms,
+            playtime_ticks, custom_data: bytes[fixed + 28..fixed + 28 + data_len].to_vec() })
+    }
+}
+
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
