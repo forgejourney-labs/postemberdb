@@ -87,6 +87,7 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Hierarchical namespace metadata, parent-scoped unique names, bounded listing, and non-cascading empty-only deletion.
 - [x] Raw player records with persistent UUID and row-identity indexes; stale UUID mappings are removed when a row changes UUID.
 - [x] Typed Minecraft player profiles with username, first/last-seen timestamps, playtime ticks, and plugin-owned custom bytes.
+- [x] Atomic typed profile batches with UUID + username index maintenance in one CoW root publication.
 - [x] Namespace-scoped, case-insensitive player-name index; bounded UUID pagination and name-prefix search.
 - [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding, bounded rectangular scans, and atomic region chunk batches.
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
