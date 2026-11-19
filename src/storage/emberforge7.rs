@@ -1132,6 +1132,76 @@ impl EmberForge7Store {
         Ok(counts)
     }
 
+
+    /// Atomically upserts/removes a bounded set of world chunks through one
+    /// CoW redo/root publication. Payload extents are reclaimed after commit.
+    pub fn apply_chunk_batch(
+        &mut self,
+        upserts: &[(i32, i32, Vec<u8>)],
+        removals: &[(i32, i32)],
+    ) -> Result<(usize, usize), DbError> {
+        const MAX_CHUNK_OPS: usize = 2_500;
+        const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
+        if upserts.is_empty() && removals.is_empty() { return Ok((0, 0)); }
+        if upserts.len().saturating_add(removals.len()) > MAX_CHUNK_OPS {
+            return Err(DbError::Constraint(format!("EF7 chunk batch exceeds {MAX_CHUNK_OPS} operations")));
+        }
+        let mut upsert_keys = BTreeSet::new();
+        let mut total_bytes = 0usize;
+        for (x, z, payload) in upserts {
+            let key = chunk_key(1, *x, *z)?;
+            if !upsert_keys.insert(key) {
+                return Err(DbError::Constraint("EF7 chunk batch contains duplicate coordinates".into()));
+            }
+            if payload.len() > MAX_RECORD_BYTES {
+                return Err(DbError::Constraint("EF7 chunk payload exceeds 64 MiB".into()));
+            }
+            total_bytes = total_bytes.checked_add(payload.len())
+                .ok_or_else(|| DbError::Constraint("EF7 chunk batch byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint("EF7 chunk batch exceeds 256 MiB of payload data".into()));
+            }
+        }
+        let mut removal_keys = Vec::with_capacity(removals.len());
+        let mut removal_set = BTreeSet::new();
+        let mut removed_extents = Vec::with_capacity(removals.len());
+        for (x, z) in removals {
+            let key = chunk_key(1, *x, *z)?;
+            if !removal_set.insert(key.clone()) || upsert_keys.contains(&key) {
+                return Err(DbError::Constraint("EF7 chunk batch contains duplicate or overlapping coordinates".into()));
+            }
+            if let Some(value) = page_tree::get(&mut self.pages, &key)? {
+                removed_extents.push(RecordDescriptor::decode(&value)?);
+                removal_keys.push(key);
+            }
+        }
+
+        let mut upsert_entries = Vec::with_capacity(upserts.len());
+        let mut replaced_extents = Vec::with_capacity(upserts.len());
+        for (x, z, payload) in upserts {
+            let key = chunk_key(1, *x, *z)?;
+            let previous = page_tree::get(&mut self.pages, &key)?
+                .map(|value| RecordDescriptor::decode(&value)).transpose()?;
+            let next = self.write_payload(payload)?;
+            upsert_entries.push((key, next.encode()?));
+            replaced_extents.push((previous, next));
+        }
+        let counts = page_tree::apply_mutations(
+            &mut self.pages, &self.wal_path, &removal_keys, &upsert_entries,
+        )?;
+        for descriptor in removed_extents {
+            self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
+        }
+        for (previous, next) in replaced_extents {
+            if let Some(previous) = previous {
+                if previous.start_page != next.start_page {
+                    self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     pub fn stats(&self) -> EmberForge7Stats {
         let stats = self.pages.stats();
         EmberForge7Stats {
@@ -1473,6 +1543,37 @@ mod tests {
             vec!["AlexOne", "AlexThree", "AlexTwo"]);
         assert!(store.search_player_profiles_by_name(12, "", 0).is_err());
         drop(store);
+        cleanup(&path);
+    }
+
+
+    #[test]
+    fn chunk_batches_commit_together_and_reject_duplicate_coordinates() {
+        let path = path("chunk-batch");
+        {
+            let mut store = EmberForge7Store::open(&path, 16).unwrap();
+            store.apply_chunk_batch(&[
+                (-1, 2, b"one".to_vec()),
+                (0, 0, vec![0x44; 70_000]),
+                (1, -2, b"three".to_vec()),
+            ], &[]).unwrap();
+            assert_eq!(store.get_chunk(1, -1, 2).unwrap(), Some(b"one".to_vec()));
+            assert_eq!(store.get_chunk(1, 0, 0).unwrap(), Some(vec![0x44; 70_000]));
+            let before = store.stats();
+            assert!(store.apply_chunk_batch(&[
+                (4, 5, b"a".to_vec()), (4, 5, b"b".to_vec()),
+            ], &[]).is_err());
+            assert_eq!(store.stats(), before);
+            store.apply_chunk_batch(&[(0, 0, b"replacement".to_vec())], &[(-1, 2)]).unwrap();
+            assert_eq!(store.get_chunk(1, -1, 2).unwrap(), None);
+            assert_eq!(store.get_chunk(1, 0, 0).unwrap(), Some(b"replacement".to_vec()));
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
+            assert_eq!(reopened.get_chunk(1, -1, 2).unwrap(), None);
+            assert_eq!(reopened.get_chunk(1, 0, 0).unwrap(), Some(b"replacement".to_vec()));
+            assert_eq!(reopened.get_chunk(1, 1, -2).unwrap(), Some(b"three".to_vec()));
+        }
         cleanup(&path);
     }
 
