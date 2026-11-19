@@ -293,6 +293,49 @@ impl RecordStore {
         Ok(page_tree::get(&mut self.store, &Self::record_key(record_id))?.is_some())
     }
 
+    /// Returns record IDs in ascending order without loading record payloads.
+    ///
+    /// The scan is inclusive of the first ID after `after`, and returns at
+    /// most 5,000 IDs. Callers can pass the last returned ID to the next call
+    /// to paginate through a large store while keeping memory bounded.
+    pub fn scan_ids(&mut self, after: Option<u64>, limit: usize) -> Result<Vec<u64>, DbError> {
+        if limit > MAX_BATCH_RECORDS {
+            return Err(DbError::Constraint(format!(
+                "record scan limit cannot exceed {MAX_BATCH_RECORDS} IDs"
+            )));
+        }
+        if limit == 0 || after == Some(u64::MAX) {
+            return Ok(Vec::new());
+        }
+
+        let first_id = match after {
+            Some(previous) => previous.checked_add(1)
+                .ok_or_else(|| DbError::Constraint("record scan cursor overflow".into()))?,
+            None => 1,
+        };
+        let lower = first_id.to_be_bytes();
+        let upper = u64::MAX.to_be_bytes();
+        let entries = page_tree::scan_range_limited(
+            &mut self.store,
+            &lower,
+            &upper,
+            Some(limit),
+        )?;
+
+        let mut ids = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            if key.len() != 8 {
+                return Err(DbError::Storage("record index contains an invalid ID key".into()));
+            }
+            let record_id = u64::from_be_bytes(key.as_slice().try_into().unwrap());
+            if record_id == 0 || ids.last().is_some_and(|previous| *previous >= record_id) {
+                return Err(DbError::Storage("record index IDs are zero or not strictly ordered".into()));
+            }
+            ids.push(record_id);
+        }
+        Ok(ids)
+    }
+
     /// Returns the underlying extent-page cache metrics.
     pub fn page_cache_stats(&self) -> PageCacheStats {
         self.store.page_cache_stats()
