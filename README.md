@@ -13,7 +13,7 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 
 ## Storage architecture
 
-Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
+Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. The file-backed extent layer now has a bounded per-handle LRU cache for validated EPG1 page payloads; KeyValueStore can configure its cache capacity and inspect hit/miss/eviction counters. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
 
 ## Current status
 
@@ -30,7 +30,7 @@ The project is at an early development stage. The first prototype provides:
 - secondary indexes backed by the native in-memory B+ tree and stable table-local row IDs;
 - incremental index-key maintenance for INSERT, UPDATE, DELETE, and UPSERT; DELETE compacts table rows without rebuilding index trees;
 - direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;
-- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, and bounded per-call prefix cleanup;
+- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, bounded per-call cleanup, and a configurable page cache with runtime statistics;
 - a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
