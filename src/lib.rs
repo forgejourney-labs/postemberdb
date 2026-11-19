@@ -1177,7 +1177,7 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
             db.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
-            db.execute("CREATE UNIQUE INDEX players_uuid ON players(uuid)").unwrap();
+            db.execute("CREATE INDEX players_uuid ON players (uuid)").unwrap();
             db.execute("INSERT INTO players VALUES ('player-a', 10)").unwrap();
             db.execute("INSERT INTO players VALUES ('player-b', 20)").unwrap();
             db.migrate_to_pdb6().unwrap();

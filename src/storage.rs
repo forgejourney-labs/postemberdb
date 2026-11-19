@@ -1022,7 +1022,7 @@ fn page_tree_wal_file_path(path: &Path) -> PathBuf {
 /// This is intentionally not an automatic migration: callers must verify the
 /// PDB6 copy before switching the database's authoritative storage format.
 impl Database {
-    pub fn migrate_to_pdb6(&self) -> Result<(), DbError> {
+    pub fn migrate_to_pdb6(&mut self) -> Result<(), DbError> {
         let database_path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 migration requires a persistent database opened with Database::open".into()))?;
         let mut store = Pdb6Store::open(database_path, 128)?;
@@ -1161,6 +1161,10 @@ impl Database {
             next_table_id,
             table_count,
         })?;
+        // The just-published manifest makes PDB6 authoritative immediately for
+        // this handle too; subsequent writes must not continue into the PDB5 WAL.
+        self.pdb6_mode = true;
+        self.ember_indexes_valid = false;
         Ok(())
     }
 }
