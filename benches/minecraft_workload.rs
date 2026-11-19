@@ -1,4 +1,6 @@
-use postemberdb::{Database, Value};
+use postemberdb::{Database, SqlRowStore, Value};
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
@@ -42,4 +44,60 @@ fn main() {
     println!("index_build_elapsed_ms={}", index_elapsed.as_millis());
     println!("indexed_lookups={}", ROWS / 10);
     println!("indexed_lookup_elapsed_ms={}", lookup_elapsed.as_millis());
+
+    // Exercise the real page-backed record path separately from the in-memory
+    // SQL executor so the benchmark does not imply SQL is already disk-backed.
+    const DISK_ROWS: usize = 10_000;
+    const DISK_BATCH: usize = 500;
+    let disk_path = std::env::temp_dir().join(format!(
+        "postemberdb-minecraft-row-bench-{}.pbd",
+        std::process::id()
+    ));
+    let disk_insert_start = Instant::now();
+    {
+        let mut rows = SqlRowStore::open(&disk_path, 3).expect("open page-backed SQL row store");
+        for start in (0..DISK_ROWS).step_by(DISK_BATCH) {
+            let end = (start + DISK_BATCH).min(DISK_ROWS);
+            let batch = (start..end).map(|id| (
+                id as u64 + 1,
+                vec![
+                    Value::Text(format!("player-{id:08}")),
+                    Value::Integer((id % 50_000) as i64),
+                    Value::Integer((id * 17) as i64),
+                ],
+            ));
+            rows.put_many(batch).expect("write page-backed SQL rows");
+        }
+        let disk_insert_elapsed = disk_insert_start.elapsed();
+
+        let disk_lookup_start = Instant::now();
+        for id in (0..DISK_ROWS).step_by(10) {
+            let row = rows.get(id as u64 + 1).expect("read page-backed SQL row");
+            assert!(row.is_some());
+        }
+        let disk_lookup_elapsed = disk_lookup_start.elapsed();
+
+        let scan_start = Instant::now();
+        let mut cursor = None;
+        let mut scanned = 0usize;
+        loop {
+            let page = rows.scan_ids(cursor, 1_000).expect("scan page-backed row IDs");
+            if page.is_empty() { break; }
+            scanned += page.len();
+            cursor = page.last().copied();
+        }
+        assert_eq!(scanned, DISK_ROWS);
+        println!("disk_rows={DISK_ROWS}");
+        println!("disk_insert_batch_size={DISK_BATCH}");
+        println!("disk_row_insert_elapsed_ms={}", disk_insert_elapsed.as_millis());
+        println!("disk_point_lookups={}", DISK_ROWS / 10);
+        println!("disk_row_lookup_elapsed_ms={}", disk_lookup_elapsed.as_millis());
+        println!("disk_id_scan_elapsed_ms={}", scan_start.elapsed().as_millis());
+        println!("disk_page_cache={:?}", rows.page_cache_stats());
+    }
+    for suffix in [".lock", ".pages", ".pages.wal"] {
+        let mut path = PathBuf::from(disk_path.as_os_str());
+        path.as_mut_os_string().push(suffix);
+        let _ = fs::remove_file(path);
+    }
 }
