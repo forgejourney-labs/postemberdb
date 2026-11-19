@@ -2,6 +2,12 @@ package io.postemberdb.ksl
 
 import kotlinx.serialization.json.*
 import org.bukkit.Bukkit
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.zip.CRC32
+import java.util.concurrent.atomic.AtomicLong
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.Closeable
@@ -68,6 +74,12 @@ data class PostemberChunk(
     val payload: ByteArray
 )
 
+data class PostemberStoredRecord(
+    val namespaceId: Long,
+    val recordId: Long,
+    val payload: ByteArray
+)
+
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
 class PostemberDbClient internal constructor(
     private val host: String,
@@ -77,6 +89,7 @@ class PostemberDbClient internal constructor(
     workerThreads: Int
 ) : Closeable {
     private val closed = AtomicBoolean(false)
+    private val nextBinaryRequestId = AtomicLong(1)
     private val workerCount = workerThreads.coerceIn(1, 8)
     private val executor: ExecutorService = ThreadPoolExecutor(
         workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
@@ -105,6 +118,167 @@ class PostemberDbClient internal constructor(
 
     fun queryAsync(sql: String): CompletableFuture<PostemberQueryResult> =
         CompletableFuture.supplyAsync({ request(sql) }, executor)
+
+
+    fun queryBinary(sql: String): PostemberQueryResult {
+        check(!Bukkit.isPrimaryThread()) { "Use queryBinaryAsync() on Paper's main thread" }
+        require(sql.isNotBlank()) { "SQL statement cannot be blank" }
+        val response = binaryRequest(BINARY_QUERY, sql.toByteArray(StandardCharsets.UTF_8))
+        if (response.kind != BINARY_QUERY_RESULT) throw PostemberDbException("unexpected binary query response kind")
+        val jsonResponse = json.parseToJsonElement(response.payload.toString(StandardCharsets.UTF_8)).jsonObject
+        return jsonResponse.toQueryResult()
+    }
+
+    fun queryBinaryAsync(sql: String): CompletableFuture<PostemberQueryResult> =
+        CompletableFuture.supplyAsync({ queryBinary(sql) }, executor)
+
+    fun putChunkBinary(namespaceId: Long, chunkX: Int, chunkZ: Int, payload: ByteArray): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putChunkBinaryAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        require(payload.size <= MAX_BINARY_FRAME_PAYLOAD - 16) {
+            "Binary/1 single-frame chunk payload limit is 8 MiB minus 16 bytes"
+        }
+        val request = ByteBuffer.allocate(16 + payload.size).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(namespaceId).putInt(chunkX).putInt(chunkZ).put(payload).array()
+        val response = binaryRequest(BINARY_CHUNK_PUT, request)
+        if (response.kind != BINARY_QUERY_RESULT) throw PostemberDbException("unexpected binary chunk-put response")
+    }
+
+    fun putChunkBinaryAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync({ putChunkBinary(namespaceId, chunkX, chunkZ, payload); Unit }, executor)
+
+    fun getChunkBinary(namespaceId: Long, chunkX: Int, chunkZ: Int): PostemberChunk? {
+        check(!Bukkit.isPrimaryThread()) { "Use getChunkBinaryAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        val request = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(namespaceId).putInt(chunkX).putInt(chunkZ).array()
+        val response = binaryRequest(BINARY_CHUNK_GET, request)
+        if (response.kind != BINARY_CHUNK_DATA) throw PostemberDbException("unexpected binary chunk-get response")
+        if (response.payload.isEmpty()) return null
+        if (response.payload.size < 16) throw PostemberDbException("truncated binary chunk response")
+        val metadata = ByteBuffer.wrap(response.payload, 0, 16).order(ByteOrder.LITTLE_ENDIAN)
+        val returnedNamespace = metadata.long
+        val returnedX = metadata.int
+        val returnedZ = metadata.int
+        if (returnedNamespace != namespaceId || returnedX != chunkX || returnedZ != chunkZ) {
+            throw PostemberDbException("binary chunk response identity does not match request")
+        }
+        return PostemberChunk(returnedNamespace, returnedX, returnedZ, response.payload.copyOfRange(16, response.payload.size))
+    }
+
+    fun getChunkBinaryAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int
+    ): CompletableFuture<PostemberChunk?> =
+        CompletableFuture.supplyAsync({ getChunkBinary(namespaceId, chunkX, chunkZ) }, executor)
+
+    fun deleteChunkBinary(namespaceId: Long, chunkX: Int, chunkZ: Int): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deleteChunkBinaryAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "world namespace ID must be positive" }
+        val request = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(namespaceId).putInt(chunkX).putInt(chunkZ).array()
+        val response = binaryRequest(BINARY_CHUNK_DELETE, request)
+        if (response.kind != BINARY_QUERY_RESULT) throw PostemberDbException("unexpected binary chunk-delete response")
+        val body = json.parseToJsonElement(response.payload.toString(StandardCharsets.UTF_8)).jsonObject
+        return body["affected_rows"]?.jsonPrimitive?.longOrNull == 1L
+    }
+
+    fun deleteChunkBinaryAsync(
+        namespaceId: Long,
+        chunkX: Int,
+        chunkZ: Int
+    ): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deleteChunkBinary(namespaceId, chunkX, chunkZ) }, executor)
+
+
+    fun putRecord(namespaceId: Long, recordId: Long, payload: ByteArray): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        require(payload.size <= MAX_EF7_WIRE_RECORD_BYTES) {
+            "EF7 JSONL/1 record payload limit is $MAX_EF7_WIRE_RECORD_BYTES bytes"
+        }
+        val encoded = payload.toLowerHex().ifEmpty { "-" }
+        protocolRequestLine("EF7 RECORD_PUT $namespaceId $recordId $encoded")
+    }
+
+    fun putRecordAsync(
+        namespaceId: Long,
+        recordId: Long,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync({ putRecord(namespaceId, recordId, payload); Unit }, executor)
+
+    fun putRecordWithExpiry(
+        namespaceId: Long,
+        recordId: Long,
+        expiresAtMs: Long,
+        payload: ByteArray
+    ): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putRecordWithExpiryAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0 && expiresAtMs >= 0) {
+            "namespaceId, recordId and expiresAtMs must be non-negative (IDs must be positive)"
+        }
+        require(payload.size <= MAX_EF7_WIRE_RECORD_BYTES) {
+            "EF7 JSONL/1 record payload limit is $MAX_EF7_WIRE_RECORD_BYTES bytes"
+        }
+        val encoded = payload.toLowerHex().ifEmpty { "-" }
+        protocolRequestLine("EF7 RECORD_PUT_TTL $namespaceId $recordId $expiresAtMs $encoded")
+    }
+
+    fun putRecordWithExpiryAsync(
+        namespaceId: Long,
+        recordId: Long,
+        expiresAtMs: Long,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync(
+            { putRecordWithExpiry(namespaceId, recordId, expiresAtMs, payload); Unit }, executor
+        )
+
+    fun getRecord(namespaceId: Long, recordId: Long): PostemberStoredRecord? {
+        check(!Bukkit.isPrimaryThread()) { "Use getRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        return protocolRequestLine("EF7 RECORD_GET $namespaceId $recordId").readRecord()
+    }
+
+    fun getRecordAsync(
+        namespaceId: Long,
+        recordId: Long
+    ): CompletableFuture<PostemberStoredRecord?> =
+        CompletableFuture.supplyAsync({ getRecord(namespaceId, recordId) }, executor)
+
+    fun deleteRecord(namespaceId: Long, recordId: Long): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deleteRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        return protocolRequestLine("EF7 RECORD_DELETE $namespaceId $recordId")["affected_rows"]
+            ?.jsonPrimitive?.longOrNull == 1L
+    }
+
+    fun deleteRecordAsync(
+        namespaceId: Long,
+        recordId: Long
+    ): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deleteRecord(namespaceId, recordId) }, executor)
+
+    fun sweepExpiredRecords(nowMs: Long, limit: Int = 256): Long {
+        check(!Bukkit.isPrimaryThread()) { "Use sweepExpiredRecordsAsync() on Paper's main thread" }
+        require(nowMs >= 0) { "nowMs must be non-negative" }
+        require(limit in 1..10_000) { "TTL sweep limit must be 1..10000" }
+        return protocolRequestLine("EF7 RECORD_SWEEP $nowMs $limit")["affected_rows"]
+            ?.jsonPrimitive?.longOrNull ?: 0L
+    }
+
+    fun sweepExpiredRecordsAsync(
+        nowMs: Long,
+        limit: Int = 256
+    ): CompletableFuture<Long> =
+        CompletableFuture.supplyAsync({ sweepExpiredRecords(nowMs, limit) }, executor)
 
     fun executeAsync(sql: String): CompletableFuture<Long> =
         queryAsync(sql).thenApply { it.affectedRows }
@@ -367,6 +541,96 @@ class PostemberDbClient internal constructor(
     ): CompletableFuture<Boolean> =
         CompletableFuture.supplyAsync({ deletePlayer(namespaceId, rowId, uuid) }, executor)
 
+
+    private data class BinaryResponse(val kind: Int, val requestId: Long, val payload: ByteArray)
+
+    private fun binaryRequest(kind: Int, payload: ByteArray): BinaryResponse {
+        check(!closed.get()) { "PostemberDB KSL client is closed" }
+        require(payload.size <= MAX_BINARY_FRAME_PAYLOAD) { "Binary/1 payload exceeds the 8 MiB frame limit" }
+        val address = InetAddress.getByName(host)
+        require(address.isLoopbackAddress) { "PostemberDB connection must use loopback" }
+        val requestId = nextBinaryRequestId.getAndIncrement()
+        Socket().use { socket ->
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress(address, port), connectTimeoutMs)
+            socket.soTimeout = readTimeoutMs
+            val greeting = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+            check(!greeting.readLine().isNullOrBlank()) { "PostemberDB closed before greeting" }
+            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))
+            writer.write("POSTEMBERDB BINARY/1\\n")
+            writer.flush()
+            val input = DataInputStream(socket.getInputStream())
+            val output = DataOutputStream(socket.getOutputStream())
+            val ready = readBinaryFrame(input)
+            check(ready.kind == BINARY_PONG && ready.requestId == 0L &&
+                ready.payload.toString(StandardCharsets.UTF_8) == "postemberdb-binary/1-ready") {
+                "PostemberDB server did not acknowledge Binary/1"
+            }
+            writeBinaryFrame(output, kind, requestId, payload)
+            val response = readBinaryFrame(input)
+            if (response.requestId != requestId) throw PostemberDbException("binary response request ID mismatch")
+            if (response.kind == BINARY_ERROR) {
+                throw PostemberDbException(response.payload.toString(StandardCharsets.UTF_8))
+            }
+            return response
+        }
+    }
+
+    private fun writeBinaryFrame(output: DataOutputStream, kind: Int, requestId: Long, payload: ByteArray) {
+        val crc = CRC32().apply { update(payload) }.value.toInt()
+        val header = ByteBuffer.allocate(BINARY_HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+            .put(byteArrayOf(0x50.toByte(), 0x44.toByte(), 0x42.toByte(), 0x46.toByte()))
+            .put(BINARY_PROTOCOL_VERSION.toByte())
+            .put(kind.toByte())
+            .putShort(0)
+            .putLong(requestId)
+            .putInt(payload.size)
+            .putInt(crc)
+            .array()
+        output.write(header)
+        output.write(payload)
+        output.flush()
+    }
+
+    private fun readBinaryFrame(input: DataInputStream): BinaryResponse {
+        val header = ByteArray(BINARY_HEADER_BYTES)
+        input.readFully(header)
+        val decoded = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = ByteArray(4)
+        decoded.get(magic)
+        if (!magic.contentEquals(byteArrayOf(0x50.toByte(), 0x44.toByte(), 0x42.toByte(), 0x46.toByte()))) {
+            throw PostemberDbException("invalid Binary/1 frame magic")
+        }
+        if ((decoded.get().toInt() and 0xff) != BINARY_PROTOCOL_VERSION) {
+            throw PostemberDbException("unsupported Binary/1 version")
+        }
+        val kind = decoded.get().toInt() and 0xff
+        if (decoded.short.toInt() != 0) throw PostemberDbException("unsupported Binary/1 frame flags")
+        val requestId = decoded.long
+        val length = decoded.int
+        val expectedCrc = decoded.int
+        if (length < 0 || length > MAX_BINARY_FRAME_PAYLOAD) {
+            throw PostemberDbException("Binary/1 frame length exceeds configured limit")
+        }
+        val payload = ByteArray(length)
+        input.readFully(payload)
+        val actualCrc = CRC32().apply { update(payload) }.value.toInt()
+        if (actualCrc != expectedCrc) throw PostemberDbException("Binary/1 payload checksum mismatch")
+        return BinaryResponse(kind, requestId, payload)
+    }
+
+    private fun JsonObject.toQueryResult(): PostemberQueryResult {
+        if (this["ok"]?.jsonPrimitive?.boolean != true) {
+            throw PostemberDbException(this["error"]?.jsonPrimitive?.contentOrNull ?: "binary SQL query failed")
+        }
+        return PostemberQueryResult(
+            message = this["message"]?.jsonPrimitive?.contentOrNull ?: "OK",
+            affectedRows = this["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L,
+            columns = this["columns"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList(),
+            rows = this["rows"]?.jsonArray?.map { row -> row.jsonArray.map { it.toNativeValue() } } ?: emptyList()
+        )
+    }
+
     private fun request(sql: String): PostemberQueryResult {
         require(sql.isNotBlank()) { "SQL statement cannot be blank" }
         val response = protocolRequestLine(sql)
@@ -444,6 +708,21 @@ class PostemberDbClient internal constructor(
         )
     }
 
+    private fun JsonObject.readRecord(): PostemberStoredRecord? {
+        val element = this["record"] ?: return null
+        if (element == JsonNull) return null
+        val record = element.jsonObject
+        val payloadHex = record["payload_hex"]?.jsonPrimitive?.content
+            ?: throw PostemberDbException("EF7 record response omitted payload_hex")
+        return PostemberStoredRecord(
+            namespaceId = record["namespace_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 record response omitted namespace_id"),
+            recordId = record["record_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 record response omitted record_id"),
+            payload = payloadHex.decodeHex()
+        )
+    }
+
     private fun JsonObject.readChunk(): PostemberChunk? {
         val element = this["chunk"] ?: return null
         if (element == JsonNull) return null
@@ -498,8 +777,21 @@ class PostemberDbClient internal constructor(
 }
 
 private const val MAX_LINE_BYTES = 64 * 1024
+private const val BINARY_HEADER_BYTES = 24
+private const val BINARY_PROTOCOL_VERSION = 1
+private const val MAX_BINARY_FRAME_PAYLOAD = 8 * 1024 * 1024
+private const val BINARY_QUERY = 1
+private const val BINARY_QUERY_RESULT = 2
+private const val BINARY_ERROR = 3
+private const val BINARY_PING = 4
+private const val BINARY_PONG = 5
+private const val BINARY_CHUNK_PUT = 16
+private const val BINARY_CHUNK_GET = 17
+private const val BINARY_CHUNK_DELETE = 18
+private const val BINARY_CHUNK_DATA = 19
 private const val MAX_EF7_WIRE_CUSTOM_BYTES = 24 * 1024
 private const val MAX_EF7_WIRE_CHUNK_BYTES = 24 * 1024
+private const val MAX_EF7_WIRE_RECORD_BYTES = 24 * 1024
 
 private fun ByteArray.toLowerHex(): String {
     val alphabet = "0123456789abcdef"
