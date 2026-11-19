@@ -235,3 +235,13 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Reopen/DML regression test covers insert, update, delete, unique index lookup, and persistence after another reopen.
 - [ ] SQL reads still materialize table rows in memory at open. Lazy point reads and bounded streaming scans remain pending.
 - [ ] PDB6 index/catalog transaction crash-point injection and automatic cleanup of unreachable overflow pages remain pending.
+
+
+## Prepared domain participants
+
+- [x] KV supports durable, restart-discoverable prepared mutation batches; direct writes are blocked while a prepare is unresolved.
+- [x] Registry can prepare value updates/deletions and participates through its own stable coordinator ID.
+- [x] EF7 can prepare raw keyspace batches and typed chunk replacements/deletions; payload pages are synced before descriptor preparation and old extents are not released by the prepared path.
+- [x] Coordinator replays committed participants idempotently, syncs APPLIED, then removes each participant prepare marker; crash retry is covered for KV and EF7, with Registry value application covered by tests.
+- [ ] SQL still needs a durable participant adapter. Until SQL is enlisted, these adapters do not provide cross-domain atomicity for SQL + KV + Registry + EF7.
+- [ ] Durable abort acknowledgements/recovery and snapshot-aware reclamation remain pending.

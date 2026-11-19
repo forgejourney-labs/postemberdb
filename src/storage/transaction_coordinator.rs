@@ -501,6 +501,34 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_applies_prepared_registry_value() {
+        let coordinator_path = path();
+        let registry_path = coordinator_path.with_extension("registry");
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut registry = crate::Registry::open(&registry_path).unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            let tx = coordinator.begin(1).unwrap();
+            registry.prepare_set_value(
+                tx, "SYSTEM", "Mode", crate::RegistryValue::String("PDB6".into()),
+            ).unwrap();
+            coordinator.mark_prepared(tx, 2).unwrap();
+            coordinator.commit(tx).unwrap();
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut registry];
+            coordinator.apply_committed(tx, &mut participants).unwrap();
+            assert_eq!(registry.get_value("SYSTEM", "Mode").unwrap(),
+                Some(crate::RegistryValue::String("PDB6".into())));
+            assert!(registry.pending_prepared_transactions().is_empty());
+        }
+        for suffix in [".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"] {
+            let mut candidate = registry_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
     fn complete_record_checksum_corruption_fails_closed() {
         let path = path();
         { let mut c = TransactionCoordinator::open(&path).unwrap(); c.begin(1).unwrap(); }
