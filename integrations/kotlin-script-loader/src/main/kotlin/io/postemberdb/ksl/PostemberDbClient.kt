@@ -68,6 +68,12 @@ data class PostemberChunk(
     val payload: ByteArray
 )
 
+data class PostemberStoredRecord(
+    val namespaceId: Long,
+    val recordId: Long,
+    val payload: ByteArray
+)
+
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
 class PostemberDbClient internal constructor(
     private val host: String,
@@ -105,6 +111,90 @@ class PostemberDbClient internal constructor(
 
     fun queryAsync(sql: String): CompletableFuture<PostemberQueryResult> =
         CompletableFuture.supplyAsync({ request(sql) }, executor)
+
+
+    fun putRecord(namespaceId: Long, recordId: Long, payload: ByteArray): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        require(payload.size <= MAX_EF7_WIRE_RECORD_BYTES) {
+            "EF7 JSONL/1 record payload limit is $MAX_EF7_WIRE_RECORD_BYTES bytes"
+        }
+        val encoded = payload.toLowerHex().ifEmpty { "-" }
+        protocolRequestLine("EF7 RECORD_PUT $namespaceId $recordId $encoded")
+    }
+
+    fun putRecordAsync(
+        namespaceId: Long,
+        recordId: Long,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync({ putRecord(namespaceId, recordId, payload); Unit }, executor)
+
+    fun putRecordWithExpiry(
+        namespaceId: Long,
+        recordId: Long,
+        expiresAtMs: Long,
+        payload: ByteArray
+    ): Unit {
+        check(!Bukkit.isPrimaryThread()) { "Use putRecordWithExpiryAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0 && expiresAtMs >= 0) {
+            "namespaceId, recordId and expiresAtMs must be non-negative (IDs must be positive)"
+        }
+        require(payload.size <= MAX_EF7_WIRE_RECORD_BYTES) {
+            "EF7 JSONL/1 record payload limit is $MAX_EF7_WIRE_RECORD_BYTES bytes"
+        }
+        val encoded = payload.toLowerHex().ifEmpty { "-" }
+        protocolRequestLine("EF7 RECORD_PUT_TTL $namespaceId $recordId $expiresAtMs $encoded")
+    }
+
+    fun putRecordWithExpiryAsync(
+        namespaceId: Long,
+        recordId: Long,
+        expiresAtMs: Long,
+        payload: ByteArray
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync(
+            { putRecordWithExpiry(namespaceId, recordId, expiresAtMs, payload); Unit }, executor
+        )
+
+    fun getRecord(namespaceId: Long, recordId: Long): PostemberStoredRecord? {
+        check(!Bukkit.isPrimaryThread()) { "Use getRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        return protocolRequestLine("EF7 RECORD_GET $namespaceId $recordId").readRecord()
+    }
+
+    fun getRecordAsync(
+        namespaceId: Long,
+        recordId: Long
+    ): CompletableFuture<PostemberStoredRecord?> =
+        CompletableFuture.supplyAsync({ getRecord(namespaceId, recordId) }, executor)
+
+    fun deleteRecord(namespaceId: Long, recordId: Long): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deleteRecordAsync() on Paper's main thread" }
+        require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
+        return protocolRequestLine("EF7 RECORD_DELETE $namespaceId $recordId")
+            ["affected_rows"]?.jsonPrimitive?.longOrNull == 1L
+    }
+
+    fun deleteRecordAsync(
+        namespaceId: Long,
+        recordId: Long
+    ): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deleteRecord(namespaceId, recordId) }, executor)
+
+    fun sweepExpiredRecords(nowMs: Long, limit: Int = 256): Long {
+        check(!Bukkit.isPrimaryThread()) { "Use sweepExpiredRecordsAsync() on Paper's main thread" }
+        require(nowMs >= 0) { "nowMs must be non-negative" }
+        require(limit in 1..10_000) { "TTL sweep limit must be 1..10000" }
+        return protocolRequestLine("EF7 RECORD_SWEEP $nowMs $limit")
+            ["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
+    }
+
+    fun sweepExpiredRecordsAsync(
+        nowMs: Long,
+        limit: Int = 256
+    ): CompletableFuture<Long> =
+        CompletableFuture.supplyAsync({ sweepExpiredRecords(nowMs, limit) }, executor)
 
     fun executeAsync(sql: String): CompletableFuture<Long> =
         queryAsync(sql).thenApply { it.affectedRows }
@@ -444,6 +534,21 @@ class PostemberDbClient internal constructor(
         )
     }
 
+    private fun JsonObject.readRecord(): PostemberStoredRecord? {
+        val element = this["record"] ?: return null
+        if (element == JsonNull) return null
+        val record = element.jsonObject
+        val payloadHex = record["payload_hex"]?.jsonPrimitive?.content
+            ?: throw PostemberDbException("EF7 record response omitted payload_hex")
+        return PostemberStoredRecord(
+            namespaceId = record["namespace_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 record response omitted namespace_id"),
+            recordId = record["record_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 record response omitted record_id"),
+            payload = payloadHex.decodeHex()
+        )
+    }
+
     private fun JsonObject.readChunk(): PostemberChunk? {
         val element = this["chunk"] ?: return null
         if (element == JsonNull) return null
@@ -500,6 +605,7 @@ class PostemberDbClient internal constructor(
 private const val MAX_LINE_BYTES = 64 * 1024
 private const val MAX_EF7_WIRE_CUSTOM_BYTES = 24 * 1024
 private const val MAX_EF7_WIRE_CHUNK_BYTES = 24 * 1024
+private const val MAX_EF7_WIRE_RECORD_BYTES = 24 * 1024
 
 private fun ByteArray.toLowerHex(): String {
     val alphabet = "0123456789abcdef"
