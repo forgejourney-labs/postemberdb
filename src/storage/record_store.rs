@@ -304,19 +304,10 @@ impl RecordStore {
     where
         I: IntoIterator<Item = u64>,
     {
-        let batch = record_ids.into_iter().take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
-        if batch.len() > MAX_BATCH_RECORDS {
-            return Err(DbError::Constraint(format!(
-                "record delete batch exceeds the maximum of {MAX_BATCH_RECORDS} IDs"
-            )));
-        }
-        let mut unique = BTreeSet::new();
-        for record_id in batch {
-            Self::validate_record_id(record_id)?;
-            unique.insert(record_id);
-        }
-        let keys = unique.into_iter().map(Self::record_key).collect::<Vec<_>>();
-        page_tree::remove_many(&mut self.store, &self.wal_path, &keys)
+        self.apply_batch(
+            std::iter::empty::<(u64, Vec<u8>)>(),
+            record_ids,
+        ).map(|(_, removed)| removed)
     }
 
     /// Checks whether a record descriptor exists.
