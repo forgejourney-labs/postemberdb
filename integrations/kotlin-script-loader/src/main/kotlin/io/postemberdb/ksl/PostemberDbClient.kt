@@ -17,6 +17,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 
 data class PostemberQueryResult(
     val message: String,
@@ -28,6 +29,30 @@ data class PostemberQueryResult(
     fun long(row: Int, column: Int): Long? = (rows[row][column] as? Number)?.toLong()
     fun boolean(row: Int, column: Int): Boolean? = rows[row][column] as? Boolean
 }
+
+data class PostemberPlayerProfile(
+    val uuid: UUID,
+    val username: String,
+    val firstJoinedMs: Long,
+    val lastSeenMs: Long,
+    val playtimeTicks: Long,
+    val customData: ByteArray = ByteArray(0)
+)
+
+data class PostemberStoredPlayerProfile(
+    val rowId: Long,
+    val profile: PostemberPlayerProfile
+)
+
+data class PostemberPlayerProfileUpsert(
+    val rowId: Long,
+    val profile: PostemberPlayerProfile
+)
+
+data class PostemberPlayerRemoval(
+    val rowId: Long,
+    val uuid: UUID
+)
 
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
 class PostemberDbClient internal constructor(
@@ -70,10 +95,163 @@ class PostemberDbClient internal constructor(
     fun executeAsync(sql: String): CompletableFuture<Long> =
         queryAsync(sql).thenApply { it.affectedRows }
 
+
+    fun putPlayerProfile(
+        namespaceId: Long,
+        rowId: Long,
+        profile: PostemberPlayerProfile
+    ) {
+        check(!Bukkit.isPrimaryThread()) { "Use putPlayerProfileAsync() on Paper's main thread" }
+        require(namespaceId > 0 && rowId > 0) { "namespaceId and rowId must be positive" }
+        require(profile.customData.size <= MAX_EF7_WIRE_CUSTOM_BYTES) {
+            "EF7 JSONL/1 customData limit is $MAX_EF7_WIRE_CUSTOM_BYTES bytes"
+        }
+        val command = listOf(
+            "EF7", "PROFILE_PUT", namespaceId.toString(), rowId.toString(),
+            profile.uuid.toString().replace("-", ""), profile.username,
+            profile.firstJoinedMs.toString(), profile.lastSeenMs.toString(),
+            profile.playtimeTicks.toString(),
+            profile.customData.toLowerHex().ifEmpty { "-" }
+        ).joinToString(" ")
+        protocolRequestLine(command)
+    }
+
+    fun putPlayerProfileAsync(
+        namespaceId: Long,
+        rowId: Long,
+        profile: PostemberPlayerProfile
+    ): CompletableFuture<Unit> =
+        CompletableFuture.supplyAsync({ putPlayerProfile(namespaceId, rowId, profile); Unit }, executor)
+
+
+    /**
+     * Commits typed player profile upserts/removals as one EF7 CoW-tree update.
+     * The JSONL bridge limits aggregate request size to one 64 KiB line.
+     */
+    fun applyPlayerProfileBatch(
+        namespaceId: Long,
+        upserts: List<PostemberPlayerProfileUpsert>,
+        removals: List<PostemberPlayerRemoval>
+    ): Long {
+        check(!Bukkit.isPrimaryThread()) { "Use applyPlayerProfileBatchAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "namespaceId must be positive" }
+        require(upserts.size + removals.size <= 2_500) { "EF7 profile batch is limited to 2,500 operations" }
+        val tokens = ArrayList<String>(5 + upserts.size * 7 + removals.size * 2)
+        tokens += "EF7"
+        tokens += "PROFILE_BATCH"
+        tokens += namespaceId.toString()
+        tokens += upserts.size.toString()
+        tokens += removals.size.toString()
+        for (item in upserts) {
+            require(item.rowId > 0) { "profile rowId must be positive" }
+            require(item.profile.customData.size <= MAX_EF7_WIRE_CUSTOM_BYTES) {
+                "EF7 JSONL/1 customData limit is $MAX_EF7_WIRE_CUSTOM_BYTES bytes per profile"
+            }
+            require(item.profile.username.isNotBlank() && item.profile.username.none { it.isWhitespace() }) {
+                "username must be a single Minecraft player-name token"
+            }
+            tokens += item.rowId.toString()
+            tokens += item.profile.uuid.toString().replace("-", "")
+            tokens += item.profile.username
+            tokens += item.profile.firstJoinedMs.toString()
+            tokens += item.profile.lastSeenMs.toString()
+            tokens += item.profile.playtimeTicks.toString()
+            tokens += item.profile.customData.toLowerHex().ifEmpty { "-" }
+        }
+        for (item in removals) {
+            require(item.rowId > 0) { "removed rowId must be positive" }
+            tokens += item.rowId.toString()
+            tokens += item.uuid.toString().replace("-", "")
+        }
+        val response = protocolRequestLine(tokens.joinToString(" "))
+        return response["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
+    }
+
+    fun applyPlayerProfileBatchAsync(
+        namespaceId: Long,
+        upserts: List<PostemberPlayerProfileUpsert>,
+        removals: List<PostemberPlayerRemoval>
+    ): CompletableFuture<Long> =
+        CompletableFuture.supplyAsync({ applyPlayerProfileBatch(namespaceId, upserts, removals) }, executor)
+
+    fun getPlayerProfile(
+        namespaceId: Long,
+        uuid: UUID
+    ): PostemberStoredPlayerProfile? {
+        check(!Bukkit.isPrimaryThread()) { "Use getPlayerProfileAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "namespaceId must be positive" }
+        val response = protocolRequestLine(
+            "EF7 PROFILE_GET $namespaceId ${uuid.toString().replace("-", "")}"
+        )
+        return response.readStoredProfile()
+    }
+
+    fun getPlayerProfileAsync(
+        namespaceId: Long,
+        uuid: UUID
+    ): CompletableFuture<PostemberStoredPlayerProfile?> =
+        CompletableFuture.supplyAsync({ getPlayerProfile(namespaceId, uuid) }, executor)
+
+    fun getPlayerProfileByName(
+        namespaceId: Long,
+        username: String
+    ): PostemberStoredPlayerProfile? {
+        check(!Bukkit.isPrimaryThread()) { "Use getPlayerProfileByNameAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "namespaceId must be positive" }
+        require(username.isNotBlank() && username.none { it.isWhitespace() }) {
+            "username must be a single Minecraft player-name token"
+        }
+        return protocolRequestLine("EF7 PROFILE_GET_NAME $namespaceId $username").readStoredProfile()
+    }
+
+    fun getPlayerProfileByNameAsync(
+        namespaceId: Long,
+        username: String
+    ): CompletableFuture<PostemberStoredPlayerProfile?> =
+        CompletableFuture.supplyAsync({ getPlayerProfileByName(namespaceId, username) }, executor)
+
+    fun deletePlayer(
+        namespaceId: Long,
+        rowId: Long,
+        uuid: UUID
+    ): Boolean {
+        check(!Bukkit.isPrimaryThread()) { "Use deletePlayerAsync() on Paper's main thread" }
+        require(namespaceId > 0 && rowId > 0) { "namespaceId and rowId must be positive" }
+        val response = protocolRequestLine(
+            "EF7 PLAYER_DELETE $namespaceId $rowId ${uuid.toString().replace("-", "")}"
+        )
+        return (response["affected_rows"] as? JsonPrimitive)?.longOrNull == 1L
+    }
+
+    fun deletePlayerAsync(
+        namespaceId: Long,
+        rowId: Long,
+        uuid: UUID
+    ): CompletableFuture<Boolean> =
+        CompletableFuture.supplyAsync({ deletePlayer(namespaceId, rowId, uuid) }, executor)
+
     private fun request(sql: String): PostemberQueryResult {
-        check(!closed.get()) { "PostemberDB KSL client is closed" }
         require(sql.isNotBlank()) { "SQL statement cannot be blank" }
-        require(sql.toByteArray(StandardCharsets.UTF_8).size <= 64 * 1024) { "SQL statement exceeds 64 KiB" }
+        val response = protocolRequestLine(sql)
+        val columns = response["columns"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+        val rows = response["rows"]?.jsonArray?.map { row ->
+            row.jsonArray.map { it.toNativeValue() }
+        } ?: emptyList()
+        return PostemberQueryResult(
+            message = response["message"]?.jsonPrimitive?.contentOrNull ?: "OK",
+            affectedRows = response["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L,
+            columns = columns,
+            rows = rows
+        )
+    }
+
+    private fun protocolRequestLine(command: String): JsonObject {
+        check(!closed.get()) { "PostemberDB KSL client is closed" }
+        require(command.isNotBlank()) { "PostemberDB request cannot be blank" }
+        require('\n' !in command && '\r' !in command) { "PostemberDB JSONL/1 accepts one command per line" }
+        require(command.toByteArray(StandardCharsets.UTF_8).size <= MAX_LINE_BYTES) {
+            "PostemberDB request exceeds 64 KiB"
+        }
         val address = InetAddress.getByName(host)
         require(address.isLoopbackAddress) { "PostemberDB connection must use loopback" }
 
@@ -91,7 +269,7 @@ class PostemberDbClient internal constructor(
             check(hello["ready"]?.jsonPrimitive?.boolean == true && hello["version"]?.jsonPrimitive?.int == 1) {
                 "PostemberDB server does not support JSONL/1"
             }
-            writer.write(sql)
+            writer.write(command)
             writer.write("\n")
             writer.flush()
             val responseLine = reader.readLine() ?: error("PostemberDB returned an empty response")
@@ -99,19 +277,64 @@ class PostemberDbClient internal constructor(
             if (response["ok"]?.jsonPrimitive?.boolean != true) {
                 throw PostemberDbException(response["error"]?.jsonPrimitive?.contentOrNull ?: "unknown database error")
             }
-            val columns = response["columns"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            val rows = response["rows"]?.jsonArray?.map { row -> row.jsonArray.map { it.toNativeValue() } } ?: emptyList()
-            return PostemberQueryResult(
-                message = response["message"]?.jsonPrimitive?.contentOrNull ?: "OK",
-                affectedRows = response["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L,
-                columns = columns,
-                rows = rows
-            )
+            return response
         }
     }
 
+    private fun JsonObject.readStoredProfile(): PostemberStoredPlayerProfile? {
+        val element = this["profile"] ?: return null
+        if (element == JsonNull) return null
+        val profile = element.jsonObject
+        val uuidHex = profile["uuid"]?.jsonPrimitive?.content
+            ?: throw PostemberDbException("EF7 response omitted player UUID")
+        if (uuidHex.length != 32 || uuidHex.any { it !in "0123456789abcdefABCDEF" }) {
+            throw PostemberDbException("EF7 response contains an invalid player UUID")
+        }
+        val uuid = UUID.fromString(
+            uuidHex.substring(0, 8) + "-" + uuidHex.substring(8, 12) + "-" +
+                uuidHex.substring(12, 16) + "-" + uuidHex.substring(16, 20) + "-" + uuidHex.substring(20)
+        )
+        val username = profile["username"]?.jsonPrimitive?.content
+            ?: throw PostemberDbException("EF7 response omitted player username")
+        val customHex = profile["custom_data_hex"]?.jsonPrimitive?.content ?: ""
+        return PostemberStoredPlayerProfile(
+            rowId = profile["row_id"]?.jsonPrimitive?.longOrNull
+                ?: throw PostemberDbException("EF7 response omitted row_id"),
+            profile = PostemberPlayerProfile(
+                uuid = uuid,
+                username = username,
+                firstJoinedMs = profile["first_joined_ms"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted first_joined_ms"),
+                lastSeenMs = profile["last_seen_ms"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted last_seen_ms"),
+                playtimeTicks = profile["playtime_ticks"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted playtime_ticks"),
+                customData = customHex.decodeHex()
+            )
+        )
+    }
+
+
     override fun close() {
         if (closed.compareAndSet(false, true)) executor.shutdownNow()
+    }
+}
+
+private const val MAX_LINE_BYTES = 64 * 1024
+private const val MAX_EF7_WIRE_CUSTOM_BYTES = 24 * 1024
+
+private fun ByteArray.toLowerHex(): String {
+    val alphabet = "0123456789abcdef"
+    val output = CharArray(size * 2)
+    for (index in indices) {
+        val value = this[index].toInt() and 0xff
+        output[index * 2] = alphabet[value ushr 4]
+        output[index * 2 + 1] = alphabet[value and 0x0f]
+    }
+    return String(output)
+}
+
+private fun String.decodeHex(): ByteArray {
+    require(length % 2 == 0 && all { it in "0123456789abcdefABCDEF" }) { "invalid hex value from EF7" }
+    return ByteArray(length / 2) { index ->
+        substring(index * 2, index * 2 + 2).toInt(16).toByte()
     }
 }
 
