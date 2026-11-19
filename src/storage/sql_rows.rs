@@ -309,6 +309,19 @@ mod tests {
     }
 
     #[test]
+    fn sql_row_store_rejects_oversized_batches_before_writing() {
+        let path = temp_path("batch-limit");
+        let mut rows = SqlRowStore::open(&path, 1).unwrap();
+        let batch = (1..=5_001u64)
+            .map(|row_id| (row_id, vec![Value::Integer(row_id as i64)]))
+            .collect::<Vec<_>>();
+        assert!(rows.put_many(batch).is_err());
+        assert!(rows.scan_ids(None, 10).unwrap().is_empty());
+        drop(rows);
+        cleanup(&path);
+    }
+
+    #[test]
     fn sql_row_decoder_rejects_truncated_and_trailing_data() {
         assert!(SqlRowStore::decode_row(b"SRW1", 1).is_err());
         let mut bytes = b"SRW1".to_vec();
