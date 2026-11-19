@@ -93,7 +93,10 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
 - [ ] General user-defined secondary indexes and index rebuild/verification tooling.
 - [ ] Integrate EF7 transactions with canonical SQL WAL, catalog and SQL executor; PDB5 remains authoritative.
-- [x] Narrow KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username, delete, and atomic profile batches; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
+- [x] KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username, delete, and atomic profile batches; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
+- [x] KSL JSONL/1 namespace administration: create/get/find/list/delete with parent-scoped hierarchy; bridge listing is capped at 64 entries per call.
+- [x] KSL JSONL/1 chunk CRUD with signed coordinates and a pre-read descriptor-size check; the bridge caps chunk payloads at 24 KiB.
+- [ ] Binary/framed KSL chunk streaming, bounded chunk-range scans, and atomic chunk batches; the JSONL line protocol is intentionally not used for large world payloads.
 - [ ] Build the addon against the installed KSL API and Paper dependencies; run end-to-end Paper/KSL integration tests.
 - [ ] JDBC driver and KSL SQL dialect/PreparedStatement support.
 - [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
