@@ -3,7 +3,7 @@
 //! This is a storage primitive, not yet the SQL Database backend. It provides
 //! one CoW root and one redo record for mixed logical mutations.
 
-use super::{extent::{self, ExtentFile}, page_tree};
+use super::{extent::{self, ExtentFile}, page_tree, participant::{self, PreparedBatch}};
 use super::pdb6::{DatabaseManifest, KEY_COUNTERS, KEY_DATABASE_ROOT, KEY_INDEX, KEY_ROW, KEY_TABLE};
 use crate::DbError;
 use fs2::FileExt;
@@ -97,6 +97,44 @@ impl Pdb6Store {
         page_tree::recover(&mut pages, &wal_path)?;
         page_tree::validate_tree(&mut pages)?;
         Ok(Self { pages, wal_path, _lock_file: lock_file })
+    }
+
+    pub(crate) fn prepare_participant_batch(
+        &mut self,
+        transaction_id: u64,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        participant::write_prepared(
+            &self.wal_path,
+            transaction_id,
+            &PreparedBatch { removals: removals.to_vec(), upserts: upserts.to_vec() },
+        )
+    }
+
+    pub(crate) fn read_prepared_value(
+        &self,
+        transaction_id: u64,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let batch = participant::read_prepared(&self.wal_path, transaction_id)?;
+        Ok(batch.upserts.into_iter().find(|(candidate, _)| candidate == key).map(|(_, value)| value))
+    }
+
+    pub(crate) fn pending_prepared_transactions(&self) -> Result<Vec<u64>, DbError> {
+        Ok(participant::list_prepared(&self.wal_path)?.into_iter().collect())
+    }
+
+    pub(crate) fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)
+    }
+
+    pub(crate) fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)
+    }
+
+    pub(crate) fn has_coordinator_commit(&mut self, transaction_id: u64) -> Result<bool, DbError> {
+        Ok(self.get(&super::pdb6::coordinator_tx_key(transaction_id))?.is_some())
     }
 
     pub(crate) fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {

@@ -21,7 +21,7 @@ pub trait CoordinatorParticipant {
     /// Stable domain ID recorded in the coordinator journal.
     fn participant_id(&self) -> u8;
     /// Whether the participant still has its durable prepare marker.
-    fn has_prepared(&self, transaction_id: u64) -> bool;
+    fn has_prepared(&self, transaction_id: u64) -> Result<bool, DbError>;
     /// Apply a prepared transaction. Must be idempotent until finalize_prepared.
     fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError>;
     /// Remove the prepare marker after the coordinator's APPLIED record is synced.
@@ -257,13 +257,13 @@ impl TransactionCoordinator {
                 .find(|participant| participant.participant_id() == id)
                 .ok_or_else(|| DbError::Storage(format!("coordinator participant {id} is not available for recovery")))?;
             if !applied.contains(&id) {
-                if !participant.has_prepared(txid) {
+                if !participant.has_prepared(txid)? {
                     return Err(DbError::Storage(format!("participant {id} is missing its durable prepare marker")));
                 }
                 participant.commit_prepared(txid)?;
                 self.mark_applied(txid, id)?;
             }
-            if participant.has_prepared(txid) {
+            if participant.has_prepared(txid)? {
                 participant.finalize_prepared(txid)?;
             }
         }
@@ -283,10 +283,26 @@ impl TransactionCoordinator {
     }
 }
 
+impl CoordinatorParticipant for crate::Database {
+    fn participant_id(&self) -> u8 { 0 }
+    fn has_prepared(&self, transaction_id: u64) -> Result<bool, DbError> {
+        Ok(self.pending_prepared_transactions()?.contains(&transaction_id))
+    }
+    fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Database::commit_prepared(self, transaction_id)
+    }
+    fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Database::finalize_prepared(self, transaction_id)
+    }
+    fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Database::rollback_prepared(self, transaction_id)
+    }
+}
+
 impl CoordinatorParticipant for crate::KeyValueStore {
     fn participant_id(&self) -> u8 { 1 }
-    fn has_prepared(&self, transaction_id: u64) -> bool {
-        self.pending_prepared_transactions().contains(&transaction_id)
+    fn has_prepared(&self, transaction_id: u64) -> Result<bool, DbError> {
+        Ok(self.pending_prepared_transactions().contains(&transaction_id))
     }
     fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
         crate::KeyValueStore::commit_prepared(self, transaction_id)

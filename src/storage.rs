@@ -415,6 +415,7 @@ pub(super) fn persist_pdb6_transition(
     previous: &BTreeMap<String, Table>,
     next: &BTreeMap<String, Table>,
     generation: u64,
+    coordinator_txid: Option<u64>,
 ) -> Result<u64, DbError> {
     let mut store = Pdb6Store::open(path, 128)?;
     let mut manifest = store.manifest()?
@@ -562,6 +563,12 @@ pub(super) fn persist_pdb6_transition(
         }
     }
 
+    if let Some(transaction_id) = coordinator_txid {
+        other_upserts.push((
+            pdb6::coordinator_tx_key(transaction_id),
+            transaction_id.to_le_bytes().to_vec(),
+        ));
+    }
     if row_upserts.is_empty() && other_upserts.is_empty() && removals.is_empty() {
         return Ok(manifest.generation);
     }

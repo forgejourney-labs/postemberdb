@@ -610,6 +610,91 @@ impl Database {
         }
     }
 
+    /// Durably prepares a SQL statement batch for the cross-domain coordinator.
+    /// The database must already be migrated to PDB6.
+    pub fn prepare_sql(
+        &mut self,
+        transaction_id: u64,
+        statements: &[String],
+    ) -> Result<(), DbError> {
+        if !self.pdb6_mode {
+            return Err(DbError::Constraint("SQL coordinator participation requires a PDB6-backed database".into()));
+        }
+        if statements.is_empty() || statements.len() > 5_000 {
+            return Err(DbError::Constraint("prepared SQL batch must contain 1..=5000 statements".into()));
+        }
+        if !self.pending_prepared_transactions()?.is_empty() {
+            return Err(DbError::Storage("SQL has another unresolved prepared transaction".into()));
+        }
+        let mut session = self.begin_session();
+        for statement in statements {
+            session.execute(statement)?;
+        }
+        let encoded = encode_coordinator_sql_statements(statements)?;
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+        let mut store = crate::storage::pdb6_store::Pdb6Store::open(path, 128)?;
+        store.prepare_participant_batch(transaction_id, &[], &[(b"SQL/STATEMENTS".to_vec(), encoded)])
+    }
+
+    pub fn pending_prepared_transactions(&self) -> Result<Vec<u64>, DbError> {
+        if !self.pdb6_mode { return Ok(Vec::new()); }
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+        crate::storage::pdb6_store::Pdb6Store::open(path, 128)?.pending_prepared_transactions()
+    }
+
+    pub fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        if !self.pdb6_mode {
+            return Err(DbError::Constraint("SQL coordinator participation requires PDB6".into()));
+        }
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+        let (already_committed, encoded) = {
+            let mut store = crate::storage::pdb6_store::Pdb6Store::open(path, 128)?;
+            if store.has_coordinator_commit(transaction_id)? {
+                (true, Vec::new())
+            } else {
+                (false, store.read_prepared_value(transaction_id, b"SQL/STATEMENTS")?
+                    .ok_or_else(|| DbError::Storage("prepared SQL statement batch is missing".into()))?)
+            }
+        };
+        if already_committed { return Ok(()); }
+        let statements = decode_coordinator_sql_statements(&encoded)?;
+        let mut session = self.begin_session();
+        for statement in statements { session.execute(&statement)?; }
+        let sequence = self.wal_sequence.checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
+        self.wal_sequence = crate::storage::persist_pdb6_transition(
+            path, &self.tables, &session.staged.tables, sequence, Some(transaction_id),
+        )?;
+        self.tables = session.staged.tables;
+        self.revision = self.revision.wrapping_add(1);
+        self.ember_indexes_valid = false;
+        Ok(())
+    }
+
+    pub fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("SQL participant has no persistent path".into()))?;
+        crate::storage::pdb6_store::Pdb6Store::open(path, 128)?.finalize_prepared(transaction_id)
+    }
+
+    pub fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("SQL participant has no persistent path".into()))?;
+        crate::storage::pdb6_store::Pdb6Store::open(path, 128)?.rollback_prepared(transaction_id)
+    }
+
+    fn ensure_no_prepared_sql_transactions(&self) -> Result<(), DbError> {
+        if !self.pdb6_mode { return Ok(()); }
+        if self.pending_prepared_transactions()?.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Storage("SQL writes are blocked while a coordinator transaction is unresolved".into()))
+        }
+    }
+
     /// Commit a previously staged session if no other writer changed the database.
     pub fn commit_session(&mut self, session: DatabaseSession) -> Result<(), DbError> {
         if session.base_revision != self.revision {
@@ -617,12 +702,13 @@ impl Database {
         }
         if session.statements.is_empty() { return Ok(()); }
         if self.pdb6_mode {
+            self.ensure_no_prepared_sql_transactions()?;
             let path = self.storage_path.as_deref()
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
             let sequence = self.wal_sequence.checked_add(1)
                 .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
             self.wal_sequence = crate::storage::persist_pdb6_transition(
-                path, &self.tables, &session.staged.tables, sequence,
+                path, &self.tables, &session.staged.tables, sequence, None,
             )?;
         } else if self.wal_path.is_some() {
             let sequence = self.append_wal_transaction(&session.statements)?;
@@ -1073,6 +1159,54 @@ impl Database {
 
 /// An owned transaction session suitable for request/response server protocols.
 /// Changes remain private until Database::commit_session accepts the base revision.
+const COORDINATOR_SQL_MAGIC: &[u8; 4] = b"PSQL";
+fn encode_coordinator_sql_statements(statements: &[String]) -> Result<Vec<u8>, DbError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(COORDINATOR_SQL_MAGIC);
+    out.extend_from_slice(&(statements.len() as u32).to_le_bytes());
+    for statement in statements {
+        let bytes = statement.as_bytes();
+        if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
+            return Err(DbError::Constraint("prepared SQL statement must contain 1..=16 MiB".into()));
+        }
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+        if out.len() > 256 * 1024 * 1024 {
+            return Err(DbError::Constraint("prepared SQL batch exceeds 256 MiB".into()));
+        }
+    }
+    let checksum = crate::protocol::crc32(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    Ok(out)
+}
+
+fn decode_coordinator_sql_statements(bytes: &[u8]) -> Result<Vec<String>, DbError> {
+    if bytes.len() < 12 || &bytes[..4] != COORDINATOR_SQL_MAGIC
+        || u32::from_le_bytes(bytes[bytes.len()-4..].try_into().unwrap()) != crate::protocol::crc32(&bytes[..bytes.len()-4]) {
+        return Err(DbError::Storage("prepared SQL statement batch is corrupt".into()));
+    }
+    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if count == 0 || count > 5_000 { return Err(DbError::Storage("prepared SQL statement count is invalid".into())); }
+    let end = bytes.len() - 4;
+    let mut cursor = 8usize;
+    let mut statements = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_end = cursor.checked_add(4).ok_or_else(|| DbError::Storage("prepared SQL offset overflow".into()))?;
+        if length_end > end { return Err(DbError::Storage("prepared SQL batch is truncated".into())); }
+        let length = u32::from_le_bytes(bytes[cursor..length_end].try_into().unwrap()) as usize;
+        cursor = length_end;
+        let next = cursor.checked_add(length).ok_or_else(|| DbError::Storage("prepared SQL length overflow".into()))?;
+        if length == 0 || length > 16 * 1024 * 1024 || next > end {
+            return Err(DbError::Storage("prepared SQL statement length is invalid".into()));
+        }
+        statements.push(String::from_utf8(bytes[cursor..next].to_vec())
+            .map_err(|_| DbError::Storage("prepared SQL statement is not UTF-8".into()))?);
+        cursor = next;
+    }
+    if cursor != end { return Err(DbError::Storage("prepared SQL batch has trailing bytes".into())); }
+    Ok(statements)
+}
+
 pub struct DatabaseSession {
     base_revision: u64,
     staged: Database,
@@ -1135,12 +1269,13 @@ impl Transaction<'_> {
             return Ok(());
         }
         if self.database.pdb6_mode {
+            self.database.ensure_no_prepared_sql_transactions()?;
             let path = self.database.storage_path.as_deref()
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
             let sequence = self.database.wal_sequence.checked_add(1)
                 .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
             self.database.wal_sequence = crate::storage::persist_pdb6_transition(
-                path, &self.database.tables, &self.staged.tables, sequence,
+                path, &self.database.tables, &self.staged.tables, sequence, None,
             )?;
         } else if self.database.wal_path.is_some() {
             let sequence = self.database.append_wal_transaction(&self.statements)?;
