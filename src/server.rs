@@ -1,4 +1,4 @@
-use postemberdb::{Database, DatabaseSession, QueryResult, Value};
+use postemberdb::{Database, DatabaseSession, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,6 +8,7 @@ use std::thread;
 const MAX_CLIENTS: usize = 128;
 const MAX_SQL_LINE_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT_SECS: u64 = 30;
+const MAX_EF7_WIRE_CUSTOM_BYTES: usize = 24 * 1024;
 
 struct ConnectionGuard(Arc<AtomicUsize>);
 
@@ -69,6 +70,9 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
     let database = Database::open(data_path)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let database = Arc::new(std::sync::Mutex::new(database));
+    let ef7_store = EmberForge7Store::open(data_path, 256)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let ef7_store = Arc::new(std::sync::Mutex::new(ef7_store));
     let active_clients = Arc::new(AtomicUsize::new(0));
 
     for incoming in listener.incoming() {
@@ -84,13 +88,14 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
                     match active_clients.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => {
                             let db = database.clone();
+                            let ef7 = ef7_store.clone();
                             let active = active_clients.clone();
                             let active_on_failure = active_clients.clone();
                             match thread::Builder::new()
                                 .name("postemberdb-client".into())
                                 .spawn(move || {
                                     let _guard = ConnectionGuard(active);
-                                    if let Err(error) = handle_client(stream, db) {
+                                    if let Err(error) = handle_client(stream, db, ef7) {
                                         eprintln!("client error: {error}");
                                     }
                                 })
@@ -116,6 +121,7 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
 fn handle_client(
     mut stream: TcpStream,
     database: std::sync::Arc<std::sync::Mutex<Database>>,
+    ef7: std::sync::Arc<std::sync::Mutex<EmberForge7Store>>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))?;
@@ -141,6 +147,20 @@ fn handle_client(
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
             stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
+            stream.flush()?;
+            continue;
+        }
+
+        if jsonl_mode && command.starts_with("EF7 ") {
+            let response = if session.is_some() {
+                json_error("EF7 commands cannot run inside a SQL transaction; EF7 is a separate storage domain")
+            } else {
+                match ef7.lock() {
+                    Ok(mut store) => handle_ef7_command(command, &mut store),
+                    Err(_) => json_error("EF7 storage lock poisoned"),
+                }
+            };
+            stream.write_all(response.as_bytes())?;
             stream.flush()?;
             continue;
         }
@@ -193,6 +213,186 @@ fn handle_client(
     }
     // An uncommitted session is dropped and therefore rolled back on disconnect.
     Ok(())
+}
+
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 || !value.is_ascii() {
+        return Err("hex data must contain an even number of ASCII digits".into());
+    }
+    let mut output = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let digit = |byte: u8| -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        };
+        let high = digit(pair[0]).ok_or_else(|| "invalid hexadecimal data".to_owned())?;
+        let low = digit(pair[1]).ok_or_else(|| "invalid hexadecimal data".to_owned())?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(value.len() * 2);
+    for byte in value {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn decode_uuid(value: &str) -> Result<[u8; 16], String> {
+    if value.len() != 32 {
+        return Err("UUID must be 32 hexadecimal characters without hyphens".into());
+    }
+    decode_hex(value)?.try_into().map_err(|_| "UUID must decode to exactly 16 bytes".into())
+}
+
+fn json_profile(row_id: u64, profile: &EmberForge7PlayerProfile) -> Result<String, String> {
+    if profile.custom_data.len() > MAX_EF7_WIRE_CUSTOM_BYTES {
+        return Err(format!(
+            "profile custom_data exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_CUSTOM_BYTES} bytes; use the Rust API for larger profiles"
+        ));
+    }
+    Ok(format!(
+        "{{\"row_id\":{row_id},\"uuid\":{},\"username\":{},\"first_joined_ms\":{},\"last_seen_ms\":{},\"playtime_ticks\":{},\"custom_data_hex\":{}}}",
+        json_escape(&encode_hex(&profile.uuid)),
+        json_escape(&profile.username),
+        profile.first_joined_ms,
+        profile.last_seen_ms,
+        profile.playtime_ticks,
+        json_escape(&encode_hex(&profile.custom_data)),
+    ))
+}
+
+fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 2 || parts[0] != "EF7" {
+        return json_error("invalid EF7 command");
+    }
+    let parse_id = |index: usize, label: &str| -> Result<u64, String> {
+        parts.get(index).ok_or_else(|| format!("missing {label}"))?
+            .parse::<u64>().map_err(|_| format!("invalid {label}"))
+    };
+    let result: Result<String, String> = (|| {
+        match parts[1] {
+            "PROFILE_PUT" => {
+                if parts.len() != 10 { return Err("usage: EF7 PROFILE_PUT <namespace> <row_id> <uuid_hex> <username> <first_joined_ms> <last_seen_ms> <playtime_ticks> <custom_hex|->".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let row_id = parse_id(3, "row ID")?;
+                let uuid = decode_uuid(parts[4])?;
+                let first_joined_ms = parse_id(6, "first_joined_ms")?;
+                let last_seen_ms = parse_id(7, "last_seen_ms")?;
+                let playtime_ticks = parse_id(8, "playtime_ticks")?;
+                let custom_data = if parts[9] == "-" { Vec::new() } else { decode_hex(parts[9])? };
+                if custom_data.len() > MAX_EF7_WIRE_CUSTOM_BYTES {
+                    return Err(format!("custom_data exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_CUSTOM_BYTES} bytes"));
+                }
+                let profile = EmberForge7PlayerProfile {
+                    uuid, username: parts[5].to_owned(), first_joined_ms, last_seen_ms,
+                    playtime_ticks, custom_data,
+                };
+                store.put_player_profile(namespace, row_id, &profile)
+                    .map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 player profile stored"))
+            }
+
+            "PROFILE_BATCH" => {
+                if parts.len() < 5 { return Err("usage: EF7 PROFILE_BATCH <namespace> <upsert_count> <remove_count> ...".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let upsert_count = parts[3].parse::<usize>().map_err(|_| "invalid upsert count".to_owned())?;
+                let remove_count = parts[4].parse::<usize>().map_err(|_| "invalid removal count".to_owned())?;
+                let total = upsert_count.checked_add(remove_count).ok_or_else(|| "profile batch count overflow".to_owned())?;
+                if total > 2_500 {
+                    return Err("EF7 profile batch exceeds 2,500 operations".into());
+                }
+                let expected_len = 5usize.checked_add(upsert_count.checked_mul(7).ok_or_else(|| "profile batch token count overflow".to_owned())?)
+                    .and_then(|value| value.checked_add(remove_count.checked_mul(2)?))
+                    .ok_or_else(|| "profile batch token count overflow".to_owned())?;
+                if parts.len() != expected_len {
+                    return Err("EF7 profile batch token count does not match its operation counts".into());
+                }
+                let mut upserts = Vec::with_capacity(upsert_count);
+                let mut removals = Vec::with_capacity(remove_count);
+                let mut offset = 5usize;
+                for _ in 0..upsert_count {
+                    let row_id = parts[offset].parse::<u64>().map_err(|_| "invalid profile row ID".to_owned())?;
+                    let uuid = decode_uuid(parts[offset + 1])?;
+                    let username = parts[offset + 2].to_owned();
+                    let first_joined_ms = parts[offset + 3].parse::<u64>().map_err(|_| "invalid first_joined_ms".to_owned())?;
+                    let last_seen_ms = parts[offset + 4].parse::<u64>().map_err(|_| "invalid last_seen_ms".to_owned())?;
+                    let playtime_ticks = parts[offset + 5].parse::<u64>().map_err(|_| "invalid playtime_ticks".to_owned())?;
+                    let custom_data = if parts[offset + 6] == "-" { Vec::new() } else { decode_hex(parts[offset + 6])? };
+                    if custom_data.len() > MAX_EF7_WIRE_CUSTOM_BYTES {
+                        return Err(format!("custom_data exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_CUSTOM_BYTES} bytes"));
+                    }
+                    upserts.push((namespace, row_id, EmberForge7PlayerProfile {
+                        uuid, username, first_joined_ms, last_seen_ms, playtime_ticks, custom_data,
+                    }));
+                    offset += 7;
+                }
+                for _ in 0..remove_count {
+                    let row_id = parts[offset].parse::<u64>().map_err(|_| "invalid removed player row ID".to_owned())?;
+                    let uuid = decode_uuid(parts[offset + 1])?;
+                    removals.push((namespace, row_id, uuid));
+                    offset += 2;
+                }
+                let (removed_keys, inserted_keys) = store.apply_player_profile_batch(&upserts, &removals)
+                    .map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 profile batch committed\",\"affected_rows\":{total},\"index_entries_removed\":{removed_keys},\"index_entries_written\":{inserted_keys}}}\n"
+                ))
+            }
+            "PROFILE_GET" => {
+                if parts.len() != 4 { return Err("usage: EF7 PROFILE_GET <namespace> <uuid_hex>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let uuid = decode_uuid(parts[3])?;
+                match store.get_player_profile(namespace, uuid).map_err(|error| error.to_string())? {
+                    Some((row_id, profile)) => {
+                        let profile_json = json_profile(row_id, &profile)?;
+                        Ok(format!("{{\"ok\":true,\"message\":\"profile found\",\"profile\":{profile_json}}}\n"))
+                    }
+                    None => Ok("{\"ok\":true,\"message\":\"profile not found\",\"profile\":null}\n".into()),
+                }
+            }
+            "PROFILE_GET_NAME" => {
+                if parts.len() != 4 { return Err("usage: EF7 PROFILE_GET_NAME <namespace> <username>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                match store.get_player_profile_by_name(namespace, parts[3]).map_err(|error| error.to_string())? {
+                    Some((row_id, profile)) => {
+                        let profile_json = json_profile(row_id, &profile)?;
+                        Ok(format!("{{\"ok\":true,\"message\":\"profile found\",\"profile\":{profile_json}}}\n"))
+                    }
+                    None => Ok("{\"ok\":true,\"message\":\"profile not found\",\"profile\":null}\n".into()),
+                }
+            }
+            "PLAYER_DELETE" => {
+                if parts.len() != 5 { return Err("usage: EF7 PLAYER_DELETE <namespace> <row_id> <uuid_hex>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let row_id = parse_id(3, "row ID")?;
+                let uuid = decode_uuid(parts[4])?;
+                let deleted = store.delete_player(namespace, row_id, uuid)
+                    .map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{},\"affected_rows\":{},\"profile\":null}}\n",
+                    json_escape(if deleted { "player deleted" } else { "player not found" }),
+                    u8::from(deleted),
+                ))
+            }
+            _ => Err("unsupported EF7 command".into()),
+        }
+    })();
+    match result {
+        Ok(response) => response,
+        Err(error) => json_error(&error),
+    }
 }
 
 fn json_escape(value: &str) -> String {
@@ -259,7 +459,7 @@ fn format_result(result: QueryResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_bounded_line, validate_bind_address};
-    use postemberdb::{QueryResult, Value};
+    use postemberdb::{EmberForge7Store, QueryResult, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -288,9 +488,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let database = Arc::new(Mutex::new(postemberdb::Database::new()));
+        let ef7_path = std::env::temp_dir().join(format!(
+            "postemberdb-jsonl-ef7-{}-{}.pbd", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            super::handle_client(stream, database).unwrap();
+            super::handle_client(stream, database, ef7).unwrap();
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -321,9 +526,75 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("Ada"));
 
+        let uuid = "11111111111111111111111111111111";
+        writeln!(client, "EF7 PROFILE_PUT 7 41 {uuid} Steve 100 200 300 01020304").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 player profile stored"));
+        writeln!(client, "BEGIN").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("transaction started"));
+        writeln!(client, "EF7 PROFILE_GET 7 {uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("cannot run inside a SQL transaction"));
+        writeln!(client, "ROLLBACK").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("transaction rolled back"));
+        writeln!(client, "EF7 PROFILE_GET 7 invalid").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("32 hexadecimal characters"));
+        writeln!(client, "EF7 PROFILE_GET 7 {uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"username\":\"Steve\""));
+        assert!(line.contains("\"custom_data_hex\":\"01020304\""));
+        writeln!(client, "EF7 PROFILE_GET_NAME 7 STEVE").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"row_id\":41"));
+        let removed_uuid = "33333333333333333333333333333333";
+        writeln!(client, "EF7 PROFILE_PUT 7 42 {removed_uuid} Notch 110 210 310 0708").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 player profile stored"));
+        let new_uuid = "22222222222222222222222222222222";
+        writeln!(client, "EF7 PROFILE_BATCH 7 1 1 41 {new_uuid} Alex 100 250 400 0506 42 {removed_uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 profile batch committed"));
+        writeln!(client, "EF7 PROFILE_GET 7 {uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"profile\":null"));
+        writeln!(client, "EF7 PROFILE_GET_NAME 7 ALEX").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"username\":\"Alex\""));
+        writeln!(client, "EF7 PROFILE_GET 7 {removed_uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"profile\":null"));
+        writeln!(client, "EF7 PLAYER_DELETE 7 41 {new_uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("player deleted"));
+        writeln!(client, "EF7 PROFILE_GET 7 {uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"profile\":null"));
+
         writeln!(client, "QUIT").unwrap();
         drop(client);
         worker.join().unwrap();
+        for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
+            let mut sidecar = ef7_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
     }
 
     #[test]
