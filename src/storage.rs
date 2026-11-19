@@ -14,6 +14,7 @@ pub(crate) mod page_tree;
 pub mod record_store;
 pub mod sql_rows;
 mod pages;
+mod pdb6;
 mod wal;
 
 use pages::{decode_pages, encode_pages};
