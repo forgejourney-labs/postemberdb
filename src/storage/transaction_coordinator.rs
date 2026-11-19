@@ -472,19 +472,21 @@ mod tests {
     fn coordinator_applies_prepared_ef7_chunk_after_reopen() {
         let coordinator_path = path();
         let ef7_path = coordinator_path.with_extension("ef7");
+        let tx;
         {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            tx = coordinator.begin(1).unwrap();
             let mut store = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
             store.create_namespace(1, None, crate::storage::emberforge7::EmberForge7NamespaceKind::World, "world").unwrap();
             store.put_chunk(1, 4, -8, b"old").unwrap();
-            store.prepare_put_chunk(9, 1, 4, -8, b"new payload").unwrap();
+            store.prepare_put_chunk(tx, 1, 4, -8, b"new payload").unwrap();
+            coordinator.mark_prepared(tx, 3).unwrap();
+            coordinator.commit(tx).unwrap();
         }
         {
             let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
             let mut store = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
-            assert_eq!(store.pending_prepared_transactions(), vec![9]);
-            let tx = coordinator.begin(1).unwrap();
-            coordinator.mark_prepared(tx, 3).unwrap();
-            coordinator.commit(tx).unwrap();
+            assert_eq!(store.pending_prepared_transactions(), vec![tx]);
             let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut store];
             coordinator.apply_committed(tx, &mut participants).unwrap();
             assert_eq!(store.get_chunk(1, 4, -8).unwrap(), Some(b"new payload".to_vec()));
