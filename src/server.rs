@@ -303,6 +303,53 @@ fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
                     .map_err(|error| error.to_string())?;
                 Ok(json_ok_message("EF7 player profile stored"))
             }
+
+            "PROFILE_BATCH" => {
+                if parts.len() < 5 { return Err("usage: EF7 PROFILE_BATCH <namespace> <upsert_count> <remove_count> ...".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let upsert_count = parts[3].parse::<usize>().map_err(|_| "invalid upsert count".to_owned())?;
+                let remove_count = parts[4].parse::<usize>().map_err(|_| "invalid removal count".to_owned())?;
+                let total = upsert_count.checked_add(remove_count).ok_or_else(|| "profile batch count overflow".to_owned())?;
+                if total > 2_500 {
+                    return Err("EF7 profile batch exceeds 2,500 operations".into());
+                }
+                let expected_len = 5usize.checked_add(upsert_count.checked_mul(7).ok_or_else(|| "profile batch token count overflow".to_owned())?)
+                    .and_then(|value| value.checked_add(remove_count.checked_mul(2)?))
+                    .ok_or_else(|| "profile batch token count overflow".to_owned())?;
+                if parts.len() != expected_len {
+                    return Err("EF7 profile batch token count does not match its operation counts".into());
+                }
+                let mut upserts = Vec::with_capacity(upsert_count);
+                let mut removals = Vec::with_capacity(remove_count);
+                let mut offset = 5usize;
+                for _ in 0..upsert_count {
+                    let row_id = parts[offset].parse::<u64>().map_err(|_| "invalid profile row ID".to_owned())?;
+                    let uuid = decode_uuid(parts[offset + 1])?;
+                    let username = parts[offset + 2].to_owned();
+                    let first_joined_ms = parts[offset + 3].parse::<u64>().map_err(|_| "invalid first_joined_ms".to_owned())?;
+                    let last_seen_ms = parts[offset + 4].parse::<u64>().map_err(|_| "invalid last_seen_ms".to_owned())?;
+                    let playtime_ticks = parts[offset + 5].parse::<u64>().map_err(|_| "invalid playtime_ticks".to_owned())?;
+                    let custom_data = if parts[offset + 6] == "-" { Vec::new() } else { decode_hex(parts[offset + 6])? };
+                    if custom_data.len() > MAX_EF7_WIRE_CUSTOM_BYTES {
+                        return Err(format!("custom_data exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_CUSTOM_BYTES} bytes"));
+                    }
+                    upserts.push((namespace, row_id, EmberForge7PlayerProfile {
+                        uuid, username, first_joined_ms, last_seen_ms, playtime_ticks, custom_data,
+                    }));
+                    offset += 7;
+                }
+                for _ in 0..remove_count {
+                    let row_id = parts[offset].parse::<u64>().map_err(|_| "invalid removed player row ID".to_owned())?;
+                    let uuid = decode_uuid(parts[offset + 1])?;
+                    removals.push((namespace, row_id, uuid));
+                    offset += 2;
+                }
+                let (removed_keys, inserted_keys) = store.apply_player_profile_batch(&upserts, &removals)
+                    .map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\\"ok\\":true,\\"message\\":\\"EF7 profile batch committed\\",\\"affected_rows\\":{total},\\"index_entries_removed\\":{removed_keys},\\"index_entries_written\\":{inserted_keys}}}\\n"
+                ))
+            }
             "PROFILE_GET" => {
                 if parts.len() != 4 { return Err("usage: EF7 PROFILE_GET <namespace> <uuid_hex>".into()); }
                 let namespace = parse_id(2, "namespace ID")?;
