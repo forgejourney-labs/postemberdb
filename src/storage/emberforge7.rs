@@ -1566,7 +1566,7 @@ mod tests {
             assert_eq!(store.stats(), before);
             store.apply_chunk_batch(77, &[(0, 0, b"replacement".to_vec())], &[(-1, 2)]).unwrap();
             assert_eq!(store.get_chunk(77, -1, 2).unwrap(), None);
-            assert_eq!(store.get_chunk(1, 0, 0).unwrap(), Some(b"replacement".to_vec()));
+            assert_eq!(store.get_chunk(77, 0, 0).unwrap(), Some(b"replacement".to_vec()));
         }
         {
             let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
