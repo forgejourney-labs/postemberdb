@@ -234,7 +234,12 @@ impl RecordStore {
             descriptors.push((Self::record_key(*record_id), descriptor.encode().to_vec()));
         }
 
-        let removals = delete_ids.into_iter().map(Self::record_key).collect::<Vec<_>>();
+        // Upserts win for IDs present in both sets. Excluding those IDs from
+        // removals avoids an unnecessary delete/reinsert path through the tree.
+        let removals = delete_ids.into_iter()
+            .filter(|record_id| !unique.contains_key(record_id))
+            .map(Self::record_key)
+            .collect::<Vec<_>>();
         let (removed, inserted) = page_tree::apply_mutations(
             &mut self.store,
             &self.wal_path,
