@@ -35,10 +35,60 @@ Example script call:
 
 Use queryAsync / executeAsync from script callbacks. Synchronous query and execute reject Paper's main thread to prevent server stalls. postemberText safely quotes SQL text values; keep SQL identifiers static. The current wire protocol accepts one SQL statement per line and does not yet expose native prepared statements or a transaction scope in the addon. Requests beyond the bounded async queue are rejected rather than accumulated without limit.
 
+## EF7 Minecraft player profiles
+
+The JSONL/1 bridge also exposes a narrow EF7 player-profile API. These operations use the dedicated EF7 sidecar, not SQL tables:
+
+```kotlin
+import java.util.UUID
+
+val profile = PostemberPlayerProfile(
+    uuid = player.uniqueId,
+    username = player.name,
+    firstJoinedMs = player.firstPlayed,
+    lastSeenMs = System.currentTimeMillis(),
+    playtimeTicks = 0L,
+    customData = byteArrayOf()
+)
+
+postemberDb().putPlayerProfileAsync(7L, stableRowId, profile)
+    .thenRun {
+        // Schedule any Bukkit/Paper API work back on the server thread.
+    }
+
+postemberDb().getPlayerProfileAsync(7L, player.uniqueId)
+    .thenAccept { stored ->
+        if (stored != null) {
+            val savedUsername = stored.profile.username
+            val stableRowId = stored.rowId
+        }
+    }
+
+``
+
+For high-volume updates, send a batch rather than opening one connection per player:
+
+```kotlin
+val upserts = listOf(
+    PostemberPlayerProfileUpsert(stableRowId, profile)
+)
+val removals = emptyList<PostemberPlayerRemoval>()
+
+postemberDb().applyPlayerProfileBatchAsync(7L, upserts, removals)
+```
+
+The batch command accepts up to 2,500 total profile operations. The 64 KiB protocol line and 24 KiB per-profile custom-data bridge cap can impose a lower practical batch size.
+
+Available operations are `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, `deletePlayerAsync`, and `applyPlayerProfileBatchAsync`. The batch method accepts `PostemberPlayerProfileUpsert` and `PostemberPlayerRemoval` items and applies all profile/index changes through one EF7 commit. Prefer it for groups of player updates rather than issuing one connection per player. Synchronous variants exist for worker threads and reject calls from Paper's main thread. Profile custom data is capped at 24 KiB by this text/hex JSONL bridge; the native Rust EF7 API supports records up to 64 MiB.
+
+The server stores UUID and case-insensitive username indexes together with the typed profile in EF7. Each profile update is one EF7 CoW-tree publication. These commands are rejected while the connection has an open SQL transaction: SQL and EF7 are separate durability domains and do not yet share a cross-domain commit.
+
+The current addon profile API does not expose world chunk payloads, arbitrary EF7 records, namespace administration, prepared SQL statements, or JDBC. Keep the numeric namespace and row IDs stable in the plugin. Namespace IDs may represent different servers/worlds/plugins according to your application's schema.
+
 ## Protocol and safety limits
 
-- JSONL protocol version: 1.
-- Maximum SQL statement: 64 KiB.
+- JSONL protocol version: 1, including the EF7 player-profile command extension.
+- Maximum request line: 64 KiB; EF7 custom profile bytes are limited to 24 KiB in this bridge.
 - Server client limit and I/O timeouts remain enforced by PostemberDB.
 - Loopback only; do not expose port 7432 to a network.
 - This is a first integration milestone, not a JDBC driver and not a replacement for KSL's existing SQLite/MySQL/MariaDB/PostgreSQL support.
