@@ -942,7 +942,7 @@ mod tests {
         let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            super::handle_client(stream, database, ef7).unwrap();
+            super::handle_client(stream, database, ef7, None, false).unwrap();
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
         let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            super::handle_client(stream, database, ef7).unwrap();
+            super::handle_client(stream, database, ef7, None, false).unwrap();
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -1185,16 +1185,17 @@ mod tests {
 
     #[test]
     fn server_accepts_only_loopback_bind_addresses() {
-        assert!(validate_bind_address("127.0.0.1:7432").is_ok());
-        assert!(validate_bind_address("[::1]:7432").is_ok());
+        assert!(validate_bind_address("127.0.0.1:7432", false).is_ok());
+        assert!(validate_bind_address("[::1]:7432", false).is_ok());
         assert_eq!(
-            validate_bind_address("0.0.0.0:7432").unwrap_err().kind(),
+            validate_bind_address("0.0.0.0:7432", false).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
-            validate_bind_address("db.example.com:7432").unwrap_err().kind(),
+            validate_bind_address("db.example.com:7432", false).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+        assert!(validate_bind_address("0.0.0.0:7432", true).is_ok());
     }
 
     #[test]
