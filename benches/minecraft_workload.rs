@@ -158,13 +158,13 @@ fn main() {
         let name_search_elapsed = name_search_start.elapsed();
 
         const EF7_CHUNKS: usize = 128;
-        let chunk_write_start = Instant::now();
-        for id in 0..EF7_CHUNKS {
+        let chunk_batch = (0..EF7_CHUNKS).map(|id| {
             let x = (id as i32 % 16) - 8;
             let z = (id as i32 / 16) - 4;
-            ef7.put_chunk(2, x, z, &vec![(id % 251) as u8; 8 * 1024])
-                .expect("write EF7 world chunk");
-        }
+            (x, z, vec![(id % 251) as u8; 8 * 1024])
+        }).collect::<Vec<_>>();
+        let chunk_write_start = Instant::now();
+        ef7.apply_chunk_batch(2, &chunk_batch, &[]).expect("atomic EF7 world chunk batch");
         let chunk_write_elapsed = chunk_write_start.elapsed();
         let chunk_scan_start = Instant::now();
         let chunks = ef7.scan_chunks(2, -8, -4, 7, 3, EF7_CHUNKS)
@@ -181,7 +181,7 @@ fn main() {
         println!("ef7_world_chunks={EF7_CHUNKS}");
         println!("ef7_chunk_write_elapsed_ms={}", chunk_write_elapsed.as_millis());
         println!("ef7_chunk_scan_elapsed_ms={}", chunk_scan_start.elapsed().as_millis());
-        println!("ef7_page_cache={:?}", ef7.stats());
+        println!("ef7_storage_stats={:?}", ef7.stats());
     }
     for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
         let mut path = PathBuf::from(ef7_path.as_os_str());
