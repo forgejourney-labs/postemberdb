@@ -163,8 +163,8 @@ class PostemberDbClient internal constructor(
             tokens += item.rowId.toString()
             tokens += item.uuid.toString().replace("-", "")
         }
-        return protocolRequestLine(tokens.joinToString(" "))
-            ["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
+        val response = protocolRequestLine(tokens.joinToString(" "))
+        return response["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
     }
 
     fun applyPlayerProfileBatchAsync(
