@@ -377,7 +377,7 @@ mod tests {
         let upserts = (2..=2_501u64)
             .map(|id| (id, vec![Value::Integer(id as i64)]))
             .collect::<Vec<_>>();
-        let deletes = (3_000..=5_000u64).collect::<Vec<_>>();
+        let deletes = (3_000..=5_500u64).collect::<Vec<_>>();
         assert!(rows.apply_batch(upserts, deletes).is_err());
         assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![1]);
         drop(rows);
