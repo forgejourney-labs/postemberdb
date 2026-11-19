@@ -44,6 +44,16 @@ data class PostemberStoredPlayerProfile(
     val profile: PostemberPlayerProfile
 )
 
+data class PostemberPlayerProfileUpsert(
+    val rowId: Long,
+    val profile: PostemberPlayerProfile
+)
+
+data class PostemberPlayerRemoval(
+    val rowId: Long,
+    val uuid: UUID
+)
+
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
 class PostemberDbClient internal constructor(
     private val host: String,
@@ -112,6 +122,57 @@ class PostemberDbClient internal constructor(
         profile: PostemberPlayerProfile
     ): CompletableFuture<Unit> =
         CompletableFuture.supplyAsync({ putPlayerProfile(namespaceId, rowId, profile); Unit }, executor)
+
+
+    /**
+     * Commits typed player profile upserts/removals as one EF7 CoW-tree update.
+     * The JSONL bridge limits aggregate request size to one 64 KiB line.
+     */
+    fun applyPlayerProfileBatch(
+        namespaceId: Long,
+        upserts: List<PostemberPlayerProfileUpsert>,
+        removals: List<PostemberPlayerRemoval>
+    ): Long {
+        check(!Bukkit.isPrimaryThread()) { "Use applyPlayerProfileBatchAsync() on Paper's main thread" }
+        require(namespaceId > 0) { "namespaceId must be positive" }
+        require(upserts.size + removals.size <= 2_500) { "EF7 profile batch is limited to 2,500 operations" }
+        val tokens = ArrayList<String>(5 + upserts.size * 7 + removals.size * 2)
+        tokens += "EF7"
+        tokens += "PROFILE_BATCH"
+        tokens += namespaceId.toString()
+        tokens += upserts.size.toString()
+        tokens += removals.size.toString()
+        for (item in upserts) {
+            require(item.rowId > 0) { "profile rowId must be positive" }
+            require(item.profile.customData.size <= MAX_EF7_WIRE_CUSTOM_BYTES) {
+                "EF7 JSONL/1 customData limit is $MAX_EF7_WIRE_CUSTOM_BYTES bytes per profile"
+            }
+            require(item.profile.username.isNotBlank() && item.profile.username.none { it.isWhitespace() }) {
+                "username must be a single Minecraft player-name token"
+            }
+            tokens += item.rowId.toString()
+            tokens += item.profile.uuid.toString().replace("-", "")
+            tokens += item.profile.username
+            tokens += item.profile.firstJoinedMs.toString()
+            tokens += item.profile.lastSeenMs.toString()
+            tokens += item.profile.playtimeTicks.toString()
+            tokens += item.profile.customData.toLowerHex().ifEmpty { "-" }
+        }
+        for (item in removals) {
+            require(item.rowId > 0) { "removed rowId must be positive" }
+            tokens += item.rowId.toString()
+            tokens += item.uuid.toString().replace("-", "")
+        }
+        return protocolRequestLine(tokens.joinToString(" "))
+            ["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
+    }
+
+    fun applyPlayerProfileBatchAsync(
+        namespaceId: Long,
+        upserts: List<PostemberPlayerProfileUpsert>,
+        removals: List<PostemberPlayerRemoval>
+    ): CompletableFuture<Long> =
+        CompletableFuture.supplyAsync({ applyPlayerProfileBatch(namespaceId, upserts, removals) }, executor)
 
     fun getPlayerProfile(
         namespaceId: Long,
