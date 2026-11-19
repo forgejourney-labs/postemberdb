@@ -494,11 +494,16 @@ impl Database {
 
     /// Opens the database's independent persistent key/value sidecar.
     pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
+        self.open_key_value_store_with_cache_capacity(128)
+    }
+
+    /// Opens the database's key/value sidecar with a configurable page-cache capacity.
+    pub fn open_key_value_store_with_cache_capacity(&self, capacity_pages: usize) -> Result<KeyValueStore, DbError> {
         let path = self.storage_path.as_ref()
             .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent key/value sidecar".into()))?;
         let mut path = path.as_os_str().to_os_string();
         path.push(".kv");
-        KeyValueStore::open(PathBuf::from(path))
+        KeyValueStore::open_with_cache_capacity(PathBuf::from(path), capacity_pages)
     }
 
     /// Opens the database's registry-like hierarchical configuration sidecar.
