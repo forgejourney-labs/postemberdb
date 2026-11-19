@@ -54,6 +54,8 @@ The optional addon now exposes EF7 profile operations on its existing loopback J
 
 The current bridge caps profile custom bytes at 24 KiB because the JSONL request line is limited to 64 KiB and the byte payload is hex-encoded. The native Rust EF7 API supports up to 64 MiB records. World chunk APIs and general namespace administration are not yet exposed to Kotlin.
 
+The JSONL extension commands are `EF7 PROFILE_PUT`, `EF7 PROFILE_GET`, `EF7 PROFILE_GET_NAME`, `EF7 PLAYER_DELETE`, and `EF7 PROFILE_BATCH`. `PROFILE_BATCH` carries a namespace ID, upsert/removal counts, typed profile tuples, and removal tuples; the server validates the complete bounded request before calling the single-commit EF7 batch API. Responses are one JSON line. The client rejects embedded newlines, checks the 64 KiB request size, and uses hex encoding for binary custom data.
+
 EF7 commands are rejected while a SQL transaction session is open. SQL WAL and EF7 sidecar commits are separate durability domains; the server does not claim a cross-domain atomic transaction. The bridge remains loopback-only, without TLS/authentication, and is not a JDBC driver.
 
 ## Scaling roadmap
