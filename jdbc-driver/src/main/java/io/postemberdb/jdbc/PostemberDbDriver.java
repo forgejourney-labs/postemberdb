@@ -33,6 +33,10 @@ public final class PostemberDbDriver implements Driver {
         int connectTimeout = integerProperty(props, "connectTimeout", 5000);
         int socketTimeout = integerProperty(props, "socketTimeout", 30000);
         boolean tls = Boolean.parseBoolean(props.getProperty("ssl", "true"));
+        String user = props.getProperty("user");
+        String password = props.getProperty("password");
+        if (tls && (user == null || user.isBlank() || password == null))
+            throw new SQLException("TLS PostemberDB connections require user and password properties", "28000");
         Socket socket = null;
         try {
             if (tls) {
@@ -56,8 +60,6 @@ public final class PostemberDbDriver implements Driver {
             if (greeting == null || !greeting.startsWith("PostemberDB/")) throw new SQLException("Unexpected PostemberDB server greeting", "08001");
             writer.write("POSTEMBERDB JSONL/1\n"); writer.flush();
             checkResponse(reader.readLine(), "protocol handshake");
-            String user = props.getProperty("user");
-            String password = props.getProperty("password");
             if (user != null && !user.isBlank()) {
                 if (password == null) throw new SQLException("JDBC password property is required when user is supplied", "28000");
                 if (user.indexOf('\n') >= 0 || user.indexOf('\r') >= 0 || password.indexOf('\n') >= 0 || password.indexOf('\r') >= 0)
