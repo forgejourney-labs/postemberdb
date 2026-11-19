@@ -1560,12 +1560,12 @@ mod tests {
             assert_eq!(store.get_chunk(77, -1, 2).unwrap(), Some(b"one".to_vec()));
             assert_eq!(store.get_chunk(77, 0, 0).unwrap(), Some(vec![0x44; 70_000]));
             let before = store.stats();
-            assert!(store.apply_chunk_batch(&[
+            assert!(store.apply_chunk_batch(77, &[
                 (4, 5, b"a".to_vec()), (4, 5, b"b".to_vec()),
             ], &[]).is_err());
             assert_eq!(store.stats(), before);
-            store.apply_chunk_batch(&[(0, 0, b"replacement".to_vec())], &[(-1, 2)]).unwrap();
-            assert_eq!(store.get_chunk(1, -1, 2).unwrap(), None);
+            store.apply_chunk_batch(77, &[(0, 0, b"replacement".to_vec())], &[(-1, 2)]).unwrap();
+            assert_eq!(store.get_chunk(77, -1, 2).unwrap(), None);
             assert_eq!(store.get_chunk(1, 0, 0).unwrap(), Some(b"replacement".to_vec()));
         }
         {
