@@ -323,6 +323,54 @@ impl Registry {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Ok(Self { store: KeyValueStore::open(path)? })
     }
+    pub fn pending_prepared_transactions(&self) -> Vec<u64> {
+        self.store.pending_prepared_transactions()
+    }
+
+    pub fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.commit_prepared(transaction_id)
+    }
+
+    pub fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.finalize_prepared(transaction_id)
+    }
+
+    pub fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.rollback_prepared(transaction_id)
+    }
+
+    /// Stages a registry value update for a coordinator transaction.
+    pub fn prepare_set_value(
+        &mut self,
+        transaction_id: u64,
+        path: &str,
+        name: &str,
+        value: RegistryValue,
+    ) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.prepare_batch(transaction_id, &[], &[(key, value.encode())])
+    }
+
+    /// Stages a registry value deletion for a coordinator transaction.
+    pub fn prepare_delete_value(
+        &mut self,
+        transaction_id: u64,
+        path: &str,
+        name: &str,
+    ) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.prepare_batch(transaction_id, &[key], &[])
+    }
 
     /// Creates a top-level hive, for example `SYSTEM` or `USERS`.
     pub fn create_hive(&mut self, name: &str) -> Result<(), DbError> {

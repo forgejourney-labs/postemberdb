@@ -16,6 +16,20 @@ const RECORD_VERSION: u8 = 1;
 const RECORD_BYTES: usize = 24;
 const MAX_PARTICIPANTS: u8 = 32;
 
+/// A durable page-tree participant that can replay a prepared coordinator batch.
+pub trait CoordinatorParticipant {
+    /// Stable domain ID recorded in the coordinator journal.
+    fn participant_id(&self) -> u8;
+    /// Whether the participant still has its durable prepare marker.
+    fn has_prepared(&self, transaction_id: u64) -> bool;
+    /// Apply a prepared transaction. Must be idempotent until finalize_prepared.
+    fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError>;
+    /// Remove the prepare marker after the coordinator's APPLIED record is synced.
+    fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError>;
+    /// Discard a prepared transaction after a durable ABORT decision.
+    fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState { Preparing, Committed, Aborted }
 
@@ -215,6 +229,46 @@ impl TransactionCoordinator {
         })).collect()
     }
 
+    /// Replays every prepared participant after a durable COMMIT decision.
+    /// APPLIED is synced before its prepare marker is removed, so recovery can
+    /// safely retry a participant commit or finish marker cleanup after a crash.
+    pub fn apply_committed(
+        &mut self,
+        txid: u64,
+        participants: &mut [&mut dyn CoordinatorParticipant],
+    ) -> Result<(), DbError> {
+        let tx = self.transactions.get(&txid)
+            .ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
+        if tx.state != TransactionState::Committed {
+            return Err(DbError::Constraint("participants can only apply a committed transaction".into()));
+        }
+        let prepared = tx.prepared.iter().copied().collect::<Vec<_>>();
+        let applied = tx.applied.clone();
+        let mut supplied = BTreeSet::new();
+        for participant in participants.iter() {
+            let id = participant.participant_id();
+            if !supplied.insert(id) {
+                return Err(DbError::Constraint("duplicate coordinator participant ID".into()));
+            }
+        }
+        for id in prepared {
+            let participant = participants.iter_mut()
+                .find(|participant| participant.participant_id() == id)
+                .ok_or_else(|| DbError::Storage(format!("coordinator participant {id} is not available for recovery")))?;
+            if !applied.contains(&id) {
+                if !participant.has_prepared(txid) {
+                    return Err(DbError::Storage(format!("participant {id} is missing its durable prepare marker")));
+                }
+                participant.commit_prepared(txid)?;
+                self.mark_applied(txid, id)?;
+            }
+            if participant.has_prepared(txid) {
+                participant.finalize_prepared(txid)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn state(&self, txid: u64) -> Option<TransactionState> {
         self.transactions.get(&txid).map(|tx| tx.state)
     }
@@ -336,6 +390,33 @@ mod tests {
             assert!(c.committed_pending_apply().is_empty());
         }
         cleanup(&path);
+    }
+
+    #[test]
+    fn coordinator_applies_and_finalizes_a_prepared_kv_participant() {
+        let coordinator_path = path();
+        let kv_path = coordinator_path.with_extension("kv");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            kv.prepare_batch(1, &[b"old".to_vec()], &[(b"new".to_vec(), b"value".to_vec())]).unwrap();
+            tx = coordinator.begin(1).unwrap();
+            coordinator.mark_prepared(tx, 1).unwrap();
+            coordinator.commit(tx).unwrap();
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut kv];
+            coordinator.apply_committed(tx, &mut participants).unwrap();
+            assert_eq!(kv.get(b"new").unwrap(), Some(b"value".to_vec()));
+            assert!(kv.get(b"old").unwrap().is_none());
+            assert!(kv.pending_prepared_transactions().is_empty());
+            assert!(coordinator.committed_pending_apply().is_empty());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"] {
+            let mut candidate = kv_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
     }
 
     #[test]
