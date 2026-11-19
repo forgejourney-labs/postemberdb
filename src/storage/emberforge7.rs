@@ -567,6 +567,29 @@ impl EmberForge7Store {
         self.read_payload(RecordDescriptor::decode(&value)?).map(Some)
     }
 
+    /// Reads a chunk only when its stored length fits the caller's explicit
+    /// byte budget. The descriptor is checked before any payload pages are read.
+    pub fn get_chunk_limited(
+        &mut self,
+        world_namespace_id: u64,
+        chunk_x: i32,
+        chunk_z: i32,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        if max_bytes > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 chunk read budget cannot exceed 64 MiB".into()));
+        }
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        let descriptor = RecordDescriptor::decode(&value)?;
+        if descriptor.total_len > max_bytes as u64 {
+            return Err(DbError::Constraint(format!(
+                "EF7 chunk payload exceeds the requested read budget of {max_bytes} bytes"
+            )));
+        }
+        self.read_payload(descriptor).map(Some)
+    }
+
     pub fn delete_chunk(
         &mut self, world_namespace_id: u64, chunk_x: i32, chunk_z: i32,
     ) -> Result<bool, DbError> {
@@ -1585,6 +1608,10 @@ mod tests {
             }
             assert_eq!(store.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
             assert_eq!(store.get_chunk(44, 99, 99).unwrap(), None);
+            let large_payload = vec![0x5a; 24 * 1024 + 1];
+            store.put_chunk(44, 10, 10, &large_payload).unwrap();
+            assert!(store.get_chunk_limited(44, 10, 10, 24 * 1024).is_err());
+            assert_eq!(store.get_chunk_limited(44, 10, 10, large_payload.len()).unwrap(), Some(large_payload.clone()));
             let scan = store.scan_chunks(44, -1, -3, 1, 2, 10).unwrap();
             assert_eq!(scan.iter().map(|(x, z, _)| (*x, *z)).collect::<Vec<_>>(),
                 vec![(-1, -3), (-1, 2), (0, 0), (1, -2)]);
@@ -1597,6 +1624,8 @@ mod tests {
             let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
             assert_eq!(reopened.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
             assert_eq!(reopened.get_chunk(44, 0, 0).unwrap(), None);
+            assert_eq!(reopened.get_chunk_limited(44, 10, 10, 24 * 1024).unwrap_err().to_string(),
+                "constraint violation: EF7 chunk payload exceeds the requested read budget of 24576 bytes");
         }
         cleanup(&path);
     }
