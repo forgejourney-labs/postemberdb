@@ -23,3 +23,10 @@ jobs:
         run: cargo build --release
       - name: Compile benchmarks
         run: cargo bench --no-run
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Test JDBC driver
+        run: mvn -B -f jdbc-driver/pom.xml test

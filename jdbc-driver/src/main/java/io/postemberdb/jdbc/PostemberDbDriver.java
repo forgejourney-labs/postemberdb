@@ -360,7 +360,7 @@ public final class PostemberDbDriver implements Driver {
                 case "getDouble": { Object v=value(args[0]); return v==null?0d:v instanceof Number x?x.doubleValue():Double.parseDouble(v.toString()); }
                 case "getBoolean": { Object v=value(args[0]); return v==null?false:v instanceof Boolean x?x:Boolean.parseBoolean(v.toString()); }
                 case "getBigDecimal": { Object v=value(args[0]); return v==null?null:new BigDecimal(v.toString()); }
-                case "getDate": { Object v=value(args[0]); return v==null?null:Date.valueOf(v.toString()); }
+                case "getDate": { Object v=value(args[0]); return v==null?null:java.sql.Date.valueOf(v.toString()); }
                 case "getTimestamp": { Object v=value(args[0]); return v==null?null:Timestamp.valueOf(v.toString()); }
                 case "wasNull": return wasNull;
                 case "findColumn": { String label=(String)args[0]; int i=query.columns().indexOf(label); if(i<0)i=query.columns().indexOf(label.toLowerCase(Locale.ROOT)); if(i<0)throw new SQLException("Unknown column "+label); return i+1; }
@@ -423,7 +423,7 @@ public final class PostemberDbDriver implements Driver {
                 case "getDatabaseProductVersion" -> "0.1.0";
                 case "getConnection" -> proxy(Connection.class,connection);
                 case "supportsTransactions" -> true;
-                case "supportsBatchUpdates" -> true;
+                case "supportsBatchUpdates" -> false;
                 case "supportsSavepoints","supportsMultipleResultSets" -> false;
                 case "getDefaultTransactionIsolation" -> Connection.TRANSACTION_READ_COMMITTED;
                 case "getIdentifierQuoteString" -> "\`";

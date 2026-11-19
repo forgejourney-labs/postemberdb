@@ -332,10 +332,18 @@ fn permission_for_sql(command: &str) -> Option<Permission> {
 }
 
 fn permission_for_ef7(command: &str) -> Option<Permission> {
-    let operation = command.split_whitespace().nth(1)?.to_ascii_uppercase();
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    let operation = parts.get(1)?.to_ascii_uppercase();
+    let subcommand = parts.get(2).map(|s| s.to_ascii_uppercase());
     match operation.as_str() {
-        "GET" | "LIST" | "SCAN" | "PLAYER_GET" | "NAMESPACE_GET" | "RECORD_GET" => Some(Permission::Ef7Read),
+        "GET" | "LIST" | "SCAN" => Some(Permission::Ef7Read),
+        "NAMESPACE" | "RECORD" | "PLAYER" | "CHUNK" => match subcommand.as_deref() {
+            Some("GET") | Some("LIST") | Some("SCAN") => Some(Permission::Ef7Read),
+            Some("CREATE") | Some("PUT") | Some("DELETE") | Some("SWEEP") => Some(Permission::Ef7Write),
+            _ => None,
+        },
         "PUT" | "DELETE" | "CREATE" | "SWEEP" | "PLAYER_PUT" => Some(Permission::Ef7Write),
+        "PLAYER_GET" | "NAMESPACE_GET" | "RECORD_GET" => Some(Permission::Ef7Read),
         _ => None,
     }
 }
