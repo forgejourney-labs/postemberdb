@@ -14,12 +14,30 @@ mod sql;
 mod kv;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
+pub use storage::record_store::RecordStore;
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
     parse_value, split_csv, starts_with_kw, take_parenthesized, value_to_sql,
     validate_value,
 };
+
+/// Runtime statistics for the bounded fixed-page buffer pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCacheStats {
+    /// Maximum number of decoded page payloads retained by this file handle.
+    pub capacity_pages: usize,
+    /// Number of decoded page payloads currently resident.
+    pub resident_pages: usize,
+    /// Total bytes held by cached page payloads.
+    pub resident_bytes: usize,
+    /// Reads served directly from the cache.
+    pub hits: u64,
+    /// Reads that required loading and validating a page from the file.
+    pub misses: u64,
+    /// Cached pages removed to make room for newer pages or a smaller capacity.
+    pub evictions: u64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -477,11 +495,33 @@ impl Database {
 
     /// Opens the database's independent persistent key/value sidecar.
     pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
+        self.open_key_value_store_with_cache_capacity(128)
+    }
+
+    /// Opens the database's key/value sidecar with a configurable page-cache capacity.
+    pub fn open_key_value_store_with_cache_capacity(&self, capacity_pages: usize) -> Result<KeyValueStore, DbError> {
         let path = self.storage_path.as_ref()
             .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent key/value sidecar".into()))?;
         let mut path = path.as_os_str().to_os_string();
         path.push(".kv");
-        KeyValueStore::open(PathBuf::from(path))
+        KeyValueStore::open_with_cache_capacity(PathBuf::from(path), capacity_pages)
+    }
+
+    /// Opens the database's independent variable-length record sidecar.
+    ///
+    /// Records use caller-supplied stable IDs and are not automatically enlisted
+    /// in SQL transactions or maintained as a mirror of SQL table rows.
+    pub fn open_record_store(&self) -> Result<RecordStore, DbError> {
+        self.open_record_store_with_cache_capacity(128)
+    }
+
+    /// Opens the record sidecar with a configurable decoded-page cache capacity.
+    pub fn open_record_store_with_cache_capacity(&self, capacity_pages: usize) -> Result<RecordStore, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent record sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".rows");
+        RecordStore::open_with_cache_capacity(PathBuf::from(path), capacity_pages)
     }
 
     /// Opens the database's registry-like hierarchical configuration sidecar.
