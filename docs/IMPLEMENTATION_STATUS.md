@@ -207,7 +207,7 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Publishes the PDB6 manifest only after the copy is complete; PDB5 snapshot/WAL are not modified by the migration.
 - [x] Bounded row and index batches to 5,000 mutations.
 - [x] Read-back verification of catalog records, every migrated row payload, every index key, and catalog cardinality before publishing the manifest.
-- [ ] PDB6 is not yet the live SQL authority. Normal SQL reads/writes still use PDB5 and in-memory tables.
+- [x] PDB6 is the live SQL authority after explicit migration; PDB5-only databases remain readable and continue using PDB5 until `postemberdb migrate-pdb6 <data-file>` is run.
 - [ ] Automatic resume/cleanup of partially copied overflow pages and full end-to-end migration verification remain pending; interrupted copies require operator removal of the incomplete PDB6 sidecars before retry.
 
 
@@ -216,7 +216,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Durable coordinator decision journal with monotonic transaction IDs, bounded participant sets, fsync'd BEGIN/PREPARED/COMMIT/ABORT records, and CRC validation.
 - [x] Recovery reports undecided transactions and truncates only a torn final record; complete corrupt records fail closed.
 - [x] COMMIT is rejected until every participant has a durable PREPARED marker.
-- [ ] SQL, KV, Registry, and EF7 still need participant adapters with durable prepare, idempotent commit/rollback, and recovery integration. This journal alone does not provide cross-domain atomicity.
+- [x] KV, Registry, and EF7 now have durable prepared-participant adapters with idempotent committed replay and APPLIED acknowledgements.
+- [ ] SQL still needs a durable participant adapter. Full SQL + KV + Registry + EF7 atomicity is not available yet.
 
 
 ## Coordinator participant-application recovery
@@ -224,7 +225,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Coordinator journal now records durable per-participant APPLIED acknowledgements after COMMIT.
 - [x] Recovery distinguishes committed transactions that still need participant application from transactions whose participants have all acknowledged.
 - [x] APPLIED records are checksummed, ordered after COMMIT, and reject duplicate or unprepared participant IDs.
-- [ ] SQL, KV, Registry, and EF7 adapters still need to implement durable prepare and idempotent commit/rollback. The journal and acknowledgement protocol do not by themselves enlist those stores or provide cross-domain atomicity.
+- [x] KV, Registry, and EF7 are enlisted through durable prepare markers and idempotent commit replay; coordinator APPLIED is synced before prepare-marker cleanup.
+- [ ] SQL adapter and durable abort-acknowledgement recovery remain pending; the system does not yet guarantee cross-domain atomicity across all four domains.
 
 
 ## Live PDB6 SQL authority
@@ -245,3 +247,18 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Coordinator replays committed participants idempotently, syncs APPLIED, then removes each participant prepare marker; crash retry is covered for KV and EF7, with Registry value application covered by tests.
 - [ ] SQL still needs a durable participant adapter. Until SQL is enlisted, these adapters do not provide cross-domain atomicity for SQL + KV + Registry + EF7.
 - [ ] Durable abort acknowledgements/recovery and snapshot-aware reclamation remain pending.
+
+
+## TLS, authentication, RBAC and JDBC baseline
+
+- [x] TLS listener using rustls; non-loopback binds are refused unless TLS mode is enabled.
+- [x] Argon2id password hashes, user enable/disable, role permission sets, and hidden-terminal-password user provisioning.
+- [x] SQL and EF7 read/write authorization on JSONL and supported binary operations; unknown command classes fail closed.
+- [x] Standalone JDBC Maven module with Connection, Statement, PreparedStatement, ResultSet, metadata basics, TLS and JSONL/1 transport.
+- [ ] Server-side prepared-statement protocol, streaming ResultSets, JDBC batch/generated keys/savepoints, and complete JDBC metadata remain pending.
+- [ ] Mutual TLS, per-user rate/connection quotas, audit logging, password rotation, and schema/table-scoped grants remain pending.
+
+## Vacuum and snapshots
+
+- [ ] Reachability-based page reclamation across current roots, named snapshots, and active reader pins is not yet implemented.
+- [ ] Snapshot root persistence, reader epochs/pins, crash-safe vacuum progress, and safe page reuse remain required before enabling general page freeing.

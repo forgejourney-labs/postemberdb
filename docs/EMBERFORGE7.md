@@ -131,3 +131,8 @@ The EF7 sidecar lock prevents multiple processes from concurrently opening the s
 The first EF7 record/chunk format remains version 1. Existing EF7 raw player records without the newer identity metadata can be reverse-resolved by a bounded UUID scan during updates/deletes; this compatibility path is capped at 100,000 UUID index entries per namespace.
 
 EF7 is still a standalone Minecraft/KSL record engine, not the canonical SQL storage backend. It does not yet replace PDB5 SQL snapshots/WAL, coordinate commits with SQL/KV/Registry sidecars, provide general user-defined secondary indexes, or expose a JDBC driver. EF7's redo publication and allocator behavior still need targeted crash-point fault injection, long-running multi-process tests, and realistic Minecraft/KSL end-to-end benchmarks. Do not treat it as production-ready until those gates are complete.
+
+
+## Coordinator participation
+
+EF7 now supports durable prepared batches and typed chunk replacement/deletion for coordinator transactions. Prepared chunk payload pages are synced before descriptor preparation; committed replay is idempotent, and old extents in this prepared path are retained for later reachability-aware vacuum. This does not yet make EF7 atomic with SQL because the SQL participant adapter is still pending.
