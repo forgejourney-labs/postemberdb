@@ -13,6 +13,15 @@ fn main() {
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             server::run_server(&address, &data_path)
         }
+        Some("migrate-pdb6") => {
+            let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
+            let mut database = Database::open(&data_path)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            database.migrate_to_pdb6()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            println!("PDB6 is now the SQL authority for {data_path}; PDB5 files were retained.");
+            Ok(())
+        }
         Some("server-tls") => {
             let address = args.next().unwrap_or_else(|| "0.0.0.0:7432".into());
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
@@ -109,6 +118,7 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  postemberdb server [127.0.0.1:7432] [data-file]");
     eprintln!("  postemberdb server-tls [0.0.0.0:7432] [data-file] [cert.pem] [key.pem]");
+    eprintln!("  postemberdb migrate-pdb6 [data-file]");
     eprintln!("  postemberdb user add <data-file> <username> <admin|read-only|read-write>");
     eprintln!("  postemberdb check [data-file]");
     eprintln!("  postemberdb checkpoint [data-file]");

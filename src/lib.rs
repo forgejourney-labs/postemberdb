@@ -621,8 +621,9 @@ impl Database {
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
             let sequence = self.wal_sequence.checked_add(1)
                 .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
-            crate::storage::persist_pdb6_transition(path, &self.tables, &session.staged.tables, sequence)?;
-            self.wal_sequence = sequence;
+            self.wal_sequence = crate::storage::persist_pdb6_transition(
+                path, &self.tables, &session.staged.tables, sequence,
+            )?;
         } else if self.wal_path.is_some() {
             let sequence = self.append_wal_transaction(&session.statements)?;
             self.wal_sequence = sequence;
@@ -1138,10 +1139,9 @@ impl Transaction<'_> {
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
             let sequence = self.database.wal_sequence.checked_add(1)
                 .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
-            crate::storage::persist_pdb6_transition(
+            self.database.wal_sequence = crate::storage::persist_pdb6_transition(
                 path, &self.database.tables, &self.staged.tables, sequence,
             )?;
-            self.database.wal_sequence = sequence;
         } else if self.database.wal_path.is_some() {
             let sequence = self.database.append_wal_transaction(&self.statements)?;
             self.database.wal_sequence = sequence;

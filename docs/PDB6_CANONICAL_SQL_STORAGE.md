@@ -112,3 +112,6 @@ when opening PDB6. It is an authority transition, not yet the final lazy RowStor
 point reads, bounded scans, and a shared row/page cache remain future work.
 Transactions are bounded by the current PDB6 5,000-mutation limit. Dropping
 tables is not supported by the PDB6 transition writer.
+
+
+Existing PDB5 databases are migrated explicitly with `postemberdb migrate-pdb6 <data-file>`. The migration is non-destructive: the PDB5 snapshot/WAL remain in place, and the new PDB6 manifest becomes the SQL authority. Opening an unmigrated PDB5 database does not silently change its format.

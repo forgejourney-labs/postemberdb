@@ -469,7 +469,11 @@ pub(super) fn persist_pdb6_transition(
             indexes: catalog_indexes,
             next_row_id: table.next_row_id,
         };
-        other_upserts.push((pdb6::table_key(table_id)?, catalog.encode()?));
+        let catalog_key = pdb6::table_key(table_id)?;
+        let catalog_bytes = catalog.encode()?;
+        if store.get(&catalog_key)?.as_deref() != Some(catalog_bytes.as_slice()) {
+            other_upserts.push((catalog_key, catalog_bytes));
+        }
 
         let old_table = previous.get(table_name);
         let indexes_changed = old_table.is_none_or(|old| {
@@ -558,6 +562,10 @@ pub(super) fn persist_pdb6_transition(
         }
     }
 
+    if row_upserts.is_empty() && other_upserts.is_empty() && removals.is_empty() {
+        return Ok(manifest.generation);
+    }
+
     manifest.generation = generation;
     manifest.last_tx_id = manifest.last_tx_id.checked_add(1)
         .ok_or_else(|| DbError::Storage("PDB6 transaction ID space exhausted".into()))?;
@@ -566,7 +574,7 @@ pub(super) fn persist_pdb6_transition(
     other_upserts.push((pdb6::database_root_key(), manifest.encode()?));
 
     store.apply_row_batch(row_upserts, other_upserts, removals)?;
-    Ok(())
+    Ok(generation)
 }
 
 fn storage_error(error: io::Error) -> DbError { DbError::Storage(error.to_string()) }
