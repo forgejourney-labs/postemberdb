@@ -15,7 +15,7 @@ pub mod record_store;
 pub mod sql_rows;
 mod pages;
 mod pdb6;
-mod pdb6_store;
+pub(crate) mod pdb6_store;
 pub mod emberforge;
 pub mod emberforge7;
 mod wal;

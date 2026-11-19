@@ -317,8 +317,8 @@ impl CoordinatorParticipant for crate::KeyValueStore {
 
 impl CoordinatorParticipant for crate::storage::emberforge7::EmberForge7Store {
     fn participant_id(&self) -> u8 { 3 }
-    fn has_prepared(&self, transaction_id: u64) -> bool {
-        self.pending_prepared_transactions().contains(&transaction_id)
+    fn has_prepared(&self, transaction_id: u64) -> Result<bool, DbError> {
+        Ok(self.pending_prepared_transactions().contains(&transaction_id))
     }
     fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
         crate::storage::emberforge7::EmberForge7Store::commit_prepared(self, transaction_id)
@@ -333,8 +333,8 @@ impl CoordinatorParticipant for crate::storage::emberforge7::EmberForge7Store {
 
 impl CoordinatorParticipant for crate::Registry {
     fn participant_id(&self) -> u8 { 2 }
-    fn has_prepared(&self, transaction_id: u64) -> bool {
-        self.pending_prepared_transactions().contains(&transaction_id)
+    fn has_prepared(&self, transaction_id: u64) -> Result<bool, DbError> {
+        Ok(self.pending_prepared_transactions().contains(&transaction_id))
     }
     fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
         crate::Registry::commit_prepared(self, transaction_id)
@@ -510,6 +510,45 @@ mod tests {
         }
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal", ".ef7.wal.prepared.9"] {
             let mut candidate = ef7_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
+    fn coordinator_replays_pdb6_sql_participant_idempotently() {
+        let coordinator_path = path();
+        let database_path = coordinator_path.with_extension("pbd");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut database = crate::Database::open(&database_path).unwrap();
+            database.migrate_to_pdb6().unwrap();
+            database.execute("CREATE TABLE players (uuid TEXT, name TEXT)").unwrap();
+            tx = coordinator.begin(1).unwrap();
+            database.prepare_sql(tx, &[String::from(
+                "INSERT INTO players (uuid, name) VALUES ('player-1', 'Alex')"
+            )]).unwrap();
+            assert!(database.execute("INSERT INTO players (uuid, name) VALUES ('blocked', 'Blocked')").is_err());
+            coordinator.mark_prepared(tx, 0).unwrap();
+            coordinator.commit(tx).unwrap();
+            // Simulate a crash after SQL root publication but before APPLIED.
+            database.commit_prepared(tx).unwrap();
+        }
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut database = crate::Database::open(&database_path).unwrap();
+            assert_eq!(database.pending_prepared_transactions().unwrap(), vec![tx]);
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut database];
+            coordinator.apply_committed(tx, &mut participants).unwrap();
+            let result = database.execute("SELECT * FROM players").unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert!(database.pending_prepared_transactions().unwrap().is_empty());
+            assert!(coordinator.committed_pending_apply().is_empty());
+        }
+        for suffix in ["", ".lock", ".wal", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal", ".pdb6.wal.prepared.1"] {
+            let mut candidate = database_path.as_os_str().to_os_string();
             candidate.push(suffix);
             let _ = fs::remove_file(PathBuf::from(candidate));
         }

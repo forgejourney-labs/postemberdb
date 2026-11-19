@@ -630,7 +630,10 @@ impl Database {
         for statement in statements {
             session.execute(statement)?;
         }
-        let encoded = encode_coordinator_sql_statements(statements)?;
+        if session.statements.is_empty() {
+            return Err(DbError::Constraint("SQL coordinator participant requires at least one write statement".into()));
+        }
+        let encoded = encode_coordinator_sql_statements(&session.statements)?;
         let path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
         let mut store = crate::storage::pdb6_store::Pdb6Store::open(path, 128)?;
