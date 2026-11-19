@@ -45,6 +45,7 @@ Large text values can span multiple EPG1 pages. RecordStore validates page and w
 - ID scans do not load row payloads.
 - Row scans are capped at 5,000 rows and 256 MiB of encoded payload per call.
 - Rows are returned in ascending stable row-ID order.
+- Mixed row upserts and deletes can be published atomically in one descriptor-tree root update through `apply_batch`.
 - One record is capped at 64 MiB by RecordStore.
 
 ## Integration status — important
