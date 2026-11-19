@@ -261,6 +261,43 @@ impl ExtentFile {
         Ok(())
     }
 
+    /// Writes a contiguous run of already-reserved pages and performs one data sync.
+    /// This is used by overflow-record writers to avoid one fsync per chunk.
+    pub(crate) fn write_pages(&mut self, start_page_id: u64, payloads: &[Vec<u8>]) -> Result<(), DbError> {
+        self.ensure_healthy()?;
+        if payloads.is_empty() {
+            return Err(DbError::Storage("cannot write an empty page run".into()));
+        }
+        let end = start_page_id.checked_add(payloads.len() as u64)
+            .ok_or_else(|| DbError::Storage("page run end overflow".into()))?;
+        for (index, payload) in payloads.iter().enumerate() {
+            if payload.len() > PAGE_PAYLOAD_SIZE {
+                return Err(DbError::Storage(format!("page payload exceeds the {PAGE_PAYLOAD_SIZE}-byte limit")));
+            }
+            let page_id = start_page_id + index as u64;
+            if !is_allocated(&self.metadata, page_id) {
+                return Err(DbError::Storage(format!("page {page_id} is not allocated")));
+            }
+        }
+        for (index, payload) in payloads.iter().enumerate() {
+            let page_id = start_page_id + index as u64;
+            let encoded = encode_data_page(page_id, self.metadata.generation, payload);
+            if let Err(error) = write_at(&mut self.file, page_offset(page_id)?, &encoded) {
+                self.poisoned = true;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(storage_error(error));
+        }
+        for (index, payload) in payloads.iter().enumerate() {
+            self.page_cache.insert(start_page_id + index as u64, payload.clone());
+        }
+        let _ = end;
+        Ok(())
+    }
+
     /// Reads and validates one allocated page, using the bounded LRU cache on hits.
     pub(crate) fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>, DbError> {
         self.ensure_healthy()?;
