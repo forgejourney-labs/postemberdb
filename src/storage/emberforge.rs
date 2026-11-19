@@ -268,7 +268,7 @@ impl EmberForgeStore {
         let page_count_u64 = u64::try_from(page_count)
             .map_err(|_| DbError::Constraint("EFE page count conversion overflow".into()))?;
         let start = self.pages.allocate_extent(page_count_u64)?;
-        let checksum = checksum(payload);
+        let record_checksum = checksum(payload);
         let mut page_payloads = Vec::with_capacity(page_count);
         for index in 0..page_count {
             let offset = index * CHUNK_CAPACITY;
@@ -280,7 +280,7 @@ impl EmberForgeStore {
             page.extend_from_slice(&(index as u32).to_le_bytes());
             page.extend_from_slice(&(page_count as u32).to_le_bytes());
             page.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            page.extend_from_slice(&checksum.to_le_bytes());
+            page.extend_from_slice(&record_checksum.to_le_bytes());
             page.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
             page.extend_from_slice(&checksum(chunk).to_le_bytes());
             page.extend_from_slice(chunk);
@@ -291,7 +291,7 @@ impl EmberForgeStore {
             start_page: start,
             page_count: page_count as u32,
             total_len: payload.len() as u64,
-            checksum,
+            checksum: record_checksum,
         })
     }
 
