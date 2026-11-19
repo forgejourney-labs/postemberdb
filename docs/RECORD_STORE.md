@@ -29,6 +29,8 @@ The sidecar base is <code>server.pbd.rows</code>; it creates the files `.rows.pa
 - `put_many(records)` writes up to 5,000 unique records (last-write-wins for duplicate IDs) and publishes all descriptors through one CoW root update.
 - `get(id)` returns the complete record or `None` when it does not exist.
 - `contains(id)` checks the record descriptor.
+- `scan_ids(after, limit)` returns up to 5,000 IDs in ascending order without reading record payloads; pass the last ID as `after` to continue.
+- `scan_records(after, limit)` reads one bounded page of records, capped at 5,000 records and 256 MiB of payload data.
 - `delete(id)` removes the descriptor and returns whether it existed.
 - `delete_many(ids)` removes up to 5,000 IDs through one CoW root update; duplicate and missing IDs are ignored.
 - `page_cache_stats()` reports cache hits, misses, evictions, residency, and capacity.
@@ -46,6 +48,7 @@ A write first reserves a contiguous page extent and writes/syncs all data pages.
 
 - Maximum record size is 64 MiB.
 - Reads materialize the complete record into a Vec; streaming I/O is future work.
+- `scan_ids` paginates the descriptor tree without loading payloads; `scan_records` bounds both record count and aggregate payload bytes.
 - Page writes are synced individually; batched page-write scheduling is not implemented yet.
 - Replaced and deleted record extents are not reclaimed yet. They remain allocated until reachability-aware vacuum is available.
 - The RecordStore sidecar has an exclusive process/handle lock, but it does not join the SQL transaction WAL. SQL + RecordStore atomic transactions are not supported.
