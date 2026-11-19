@@ -24,6 +24,8 @@ const KEY_PLAYER_NAME: u8 = 0x53;
 const KEY_PLAYER_ROW_META: u8 = 0x54;
 const KEY_CHUNK_DATA: u8 = 0x55;
 const KEY_NAMESPACE_NAME: u8 = 0x56;
+const KEY_RECORD_TTL: u8 = 0x57;
+const KEY_RECORD_TTL_META: u8 = 0x58;
 const FORMAT_VERSION: u8 = 1;
 
 
@@ -154,6 +156,43 @@ fn decode_chunk_coordinates(key: &[u8]) -> Result<(u64, i32, i32), DbError> {
         return Err(DbError::Storage("EF7 chunk key contains reserved namespace zero".into()));
     }
     Ok((namespace_id, x as i32, z as i32))
+}
+
+
+fn record_ttl_key(expires_at_ms: u64, namespace_id: u64, record_id: u64) -> Result<Vec<u8>, DbError> {
+    if namespace_id == 0 || record_id == 0 {
+        return Err(DbError::Constraint("EF7 TTL namespace and record IDs must be non-zero".into()));
+    }
+    let mut key = Vec::with_capacity(25);
+    key.push(KEY_RECORD_TTL);
+    key.extend_from_slice(&expires_at_ms.to_be_bytes());
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&record_id.to_be_bytes());
+    Ok(key)
+}
+
+fn record_ttl_meta_key(namespace_id: u64, record_id: u64) -> Result<Vec<u8>, DbError> {
+    if namespace_id == 0 || record_id == 0 {
+        return Err(DbError::Constraint("EF7 TTL namespace and record IDs must be non-zero".into()));
+    }
+    let mut key = Vec::with_capacity(17);
+    key.push(KEY_RECORD_TTL_META);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&record_id.to_be_bytes());
+    Ok(key)
+}
+
+fn decode_record_ttl_key(key: &[u8]) -> Result<(u64, u64, u64), DbError> {
+    if key.len() != 25 || key[0] != KEY_RECORD_TTL {
+        return Err(DbError::Storage("invalid EF7 record TTL index key".into()));
+    }
+    let expires_at_ms = u64::from_be_bytes(key[1..9].try_into().unwrap());
+    let namespace_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
+    let record_id = u64::from_be_bytes(key[17..25].try_into().unwrap());
+    if namespace_id == 0 || record_id == 0 {
+        return Err(DbError::Storage("EF7 record TTL index contains a reserved identifier".into()));
+    }
+    Ok((expires_at_ms, namespace_id, record_id))
 }
 
 fn prefix_upper_key(prefix: &[u8]) -> Vec<u8> {
@@ -519,7 +558,9 @@ impl EmberForge7Store {
         identity_prefix.extend_from_slice(&id.to_be_bytes());
         let mut chunk_prefix = vec![KEY_CHUNK_DATA];
         chunk_prefix.extend_from_slice(&id.to_be_bytes());
-        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix, chunk_prefix] {
+        let mut ttl_meta_prefix = vec![KEY_RECORD_TTL_META];
+        ttl_meta_prefix.extend_from_slice(&id.to_be_bytes());
+        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix, chunk_prefix, ttl_meta_prefix] {
             if !page_tree::scan_range_limited(
                 &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(1),
             )?.is_empty() {
@@ -638,21 +679,110 @@ impl EmberForge7Store {
         Ok(result)
     }
 
-    /// Stores or replaces a record up to 64 MiB. Data pages become durable
-    /// before the CoW descriptor root is published.
+    /// Stores or replaces a record with an absolute Unix-millisecond expiry.
+    /// Descriptor and TTL indexes are committed in one CoW root publication.
+    pub fn put_record_with_expiry(
+        &mut self,
+        namespace_id: u64,
+        record_id: u64,
+        expires_at_ms: u64,
+        payload: &[u8],
+    ) -> Result<(), DbError> {
+        self.put_record_internal(namespace_id, record_id, Some(expires_at_ms), payload)
+    }
+
+    /// Stores or replaces a record without an expiry, removing any prior TTL entry.
     pub fn put_record(&mut self, namespace_id: u64, record_id: u64, payload: &[u8]) -> Result<(), DbError> {
+        self.put_record_internal(namespace_id, record_id, None, payload)
+    }
+
+    fn put_record_internal(
+        &mut self,
+        namespace_id: u64,
+        record_id: u64,
+        expires_at_ms: Option<u64>,
+        payload: &[u8],
+    ) -> Result<(), DbError> {
         let key = record_key(namespace_id, record_id)?;
+        let meta_key = record_ttl_meta_key(namespace_id, record_id)?;
         let old = self.pages_descriptor(&key)?;
+        let old_expiry = page_tree::get(&mut self.pages, &meta_key)?
+            .map(|value| {
+                if value.len() != 8 {
+                    return Err(DbError::Storage("malformed EF7 record TTL metadata".into()));
+                }
+                Ok(u64::from_be_bytes(value[..8].try_into().unwrap()))
+            }).transpose()?;
         let descriptor = self.write_payload(payload)?;
-        page_tree::apply_mutations(
-            &mut self.pages, &self.wal_path, &[], &[(key, descriptor.encode()?)],
-        )?;
+        let mut removals = Vec::new();
+        if let Some(expiry) = old_expiry {
+            removals.push(record_ttl_key(expiry, namespace_id, record_id)?);
+        }
+        let mut upserts = vec![(key, descriptor.encode()?)];
+        match expires_at_ms {
+            Some(expiry) => {
+                upserts.push((record_ttl_key(expiry, namespace_id, record_id)?, Vec::new()));
+                upserts.push((meta_key, expiry.to_be_bytes().to_vec()));
+            }
+            None => removals.push(meta_key),
+        }
+        // On an uncertain publication error, keep the newly allocated extent.
+        // Releasing it here could free pages if the root became durable just
+        // before the error was reported; unreachable pages are reclaimed by
+        // future recovery/vacuum work instead of risking a live-record alias.
+        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)?;
         if let Some(previous) = old {
             if previous.start_page != descriptor.start_page {
                 self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
             }
         }
         Ok(())
+    }
+
+    /// Removes at most the requested number of records whose expiry is <= now_ms.
+    /// All descriptor and TTL-index removals share one CoW publication.
+    pub fn sweep_expired_records(&mut self, now_ms: u64, limit: usize) -> Result<usize, DbError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(DbError::Constraint("EF7 TTL sweep limit must be 1..=10000".into()));
+        }
+        let lower = vec![KEY_RECORD_TTL];
+        let mut upper = vec![KEY_RECORD_TTL];
+        upper.extend_from_slice(&now_ms.to_be_bytes());
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        let entries = page_tree::scan_range_limited(&mut self.pages, &lower, &upper, Some(limit))?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut removals = Vec::with_capacity(entries.len() * 3);
+        let mut reclaimed = Vec::with_capacity(entries.len());
+        for (ttl_key, _) in &entries {
+            let (expiry, namespace_id, record_id) = decode_record_ttl_key(ttl_key)?;
+            let meta_key = record_ttl_meta_key(namespace_id, record_id)?;
+            let meta = page_tree::get(&mut self.pages, &meta_key)?
+                .ok_or_else(|| DbError::Storage("EF7 TTL index is missing record metadata".into()))?;
+            if meta.len() != 8 || u64::from_be_bytes(meta[..8].try_into().unwrap()) != expiry {
+                return Err(DbError::Storage("EF7 TTL index and record metadata disagree".into()));
+            }
+            let record = record_key(namespace_id, record_id)?;
+            if let Some(descriptor) = self.pages_descriptor(&record)? {
+                reclaimed.push(descriptor);
+            }
+            removals.push(ttl_key.clone());
+            removals.push(meta_key);
+            if self.pages_descriptor(&record)?.is_some() {
+                removals.push(record);
+            }
+        }
+        let expected_removed = removals.len();
+        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
+        if removed != expected_removed {
+            return Err(DbError::Storage("EF7 TTL sweep did not remove every indexed key".into()));
+        }
+        for descriptor in reclaimed {
+            self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
+        }
+        Ok(entries.len())
     }
 
     /// Reads and verifies a complete record. Returns None when it is absent.
@@ -662,14 +792,48 @@ impl EmberForge7Store {
         self.read_payload(descriptor).map(Some)
     }
 
-    /// Deletes a record. Its pages are reclaimed only after the descriptor
-    /// removal is durably published.
+    /// Reads a record only when its descriptor length fits the caller's byte budget.
+    /// The size is checked before any overflow pages are loaded.
+    pub fn get_record_limited(
+        &mut self,
+        namespace_id: u64,
+        record_id: u64,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        if max_bytes > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 record read budget cannot exceed 64 MiB".into()));
+        }
+        let key = record_key(namespace_id, record_id)?;
+        let Some(descriptor) = self.pages_descriptor(&key)? else { return Ok(None); };
+        if descriptor.total_len > max_bytes as u64 {
+            return Err(DbError::Constraint(format!(
+                "EF7 record payload exceeds the requested read budget of {max_bytes} bytes"
+            )));
+        }
+        self.read_payload(descriptor).map(Some)
+    }
+
+    /// Deletes a record and its TTL indexes in one CoW publication.
     pub fn delete_record(&mut self, namespace_id: u64, record_id: u64) -> Result<bool, DbError> {
         let key = record_key(namespace_id, record_id)?;
+        let meta_key = record_ttl_meta_key(namespace_id, record_id)?;
         let Some(descriptor) = self.pages_descriptor(&key)? else { return Ok(false); };
-        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &[key], &[])?;
-        if removed != 1 {
-            return Err(DbError::Storage("EF7 record disappeared during locked deletion".into()));
+        let old_expiry = page_tree::get(&mut self.pages, &meta_key)?
+            .map(|value| {
+                if value.len() != 8 {
+                    return Err(DbError::Storage("malformed EF7 record TTL metadata".into()));
+                }
+                Ok(u64::from_be_bytes(value[..8].try_into().unwrap()))
+            }).transpose()?;
+        let mut removals = vec![key];
+        if let Some(expiry) = old_expiry {
+            removals.push(meta_key);
+            removals.push(record_ttl_key(expiry, namespace_id, record_id)?);
+        }
+        let expected_removed = removals.len();
+        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
+        if removed != expected_removed {
+            return Err(DbError::Storage("EF7 record deletion did not remove all descriptor and TTL keys".into()));
         }
         self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
         Ok(true)
@@ -1455,6 +1619,45 @@ mod tests {
             let small = b"reused page range";
             store.put_record(1, 8, small).unwrap();
             assert_eq!(store.get_record(1, 8).unwrap(), Some(small.to_vec()));
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn record_ttl_rekeys_atomically_sweeps_with_budget_and_survives_reopen() {
+        let path = path("record-ttl");
+        {
+            let mut store = EmberForge7Store::open(&path, 24).unwrap();
+            store.put_record_with_expiry(1, 10, 100, b"expires-first").unwrap();
+            let oversized = vec![0x44; 24 * 1024 + 1];
+            store.put_record(1, 99, &oversized).unwrap();
+            assert!(store.get_record_limited(1, 99, 24 * 1024).is_err());
+            assert_eq!(store.get_record_limited(1, 99, oversized.len()).unwrap(), Some(oversized));
+            assert!(store.delete_record(1, 99).unwrap());
+            store.put_record_with_expiry(1, 20, 200, b"expires-later").unwrap();
+            store.put_record_with_expiry(1, 30, 300, b"will-be-persistent").unwrap();
+
+            // Replacing a TTL record without expiry removes its previous index entry.
+            store.put_record(1, 30, b"persistent").unwrap();
+            assert_eq!(store.sweep_expired_records(150, 1).unwrap(), 1);
+            assert_eq!(store.get_record(1, 10).unwrap(), None);
+            assert_eq!(store.get_record(1, 20).unwrap(), Some(b"expires-later".to_vec()));
+            assert_eq!(store.get_record(1, 30).unwrap(), Some(b"persistent".to_vec()));
+
+            // Re-keying the expiry must not leave the old timestamp in the index.
+            store.put_record_with_expiry(1, 20, 400, b"rescheduled").unwrap();
+            assert_eq!(store.sweep_expired_records(250, 10).unwrap(), 0);
+            assert_eq!(store.sweep_expired_records(450, 1).unwrap(), 1);
+            assert_eq!(store.get_record(1, 20).unwrap(), None);
+            assert_eq!(store.get_record(1, 30).unwrap(), Some(b"persistent".to_vec()));
+            assert!(store.delete_record(1, 30).unwrap(), "deleting a record without TTL must succeed");
+            assert_eq!(store.sweep_expired_records(u64::MAX, 10).unwrap(), 0);
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 24).unwrap();
+            assert_eq!(reopened.get_record(1, 10).unwrap(), None);
+            assert_eq!(reopened.get_record(1, 20).unwrap(), None);
+            assert_eq!(reopened.get_record(1, 30).unwrap(), None);
         }
         cleanup(&path);
     }
