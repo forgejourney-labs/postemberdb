@@ -421,7 +421,7 @@ public final class PostemberDbDriver implements Driver {
                 case "supportsBatchUpdates" -> false;
                 case "supportsSavepoints","supportsMultipleResultSets" -> false;
                 case "getDefaultTransactionIsolation" -> Connection.TRANSACTION_READ_COMMITTED;
-                case "getIdentifierQuoteString" -> "\`";
+                case "getIdentifierQuoteString" -> "`";
                 case "getCatalogSeparator" -> ".";
                 case "getCatalogTerm" -> "database";
                 case "getSchemaTerm" -> "schema";
