@@ -718,8 +718,8 @@ fn json_escape(value: &str) -> String {
     output.push('"');
     for character in value.chars() {
         match character {
-            '"' => output.push_str("\\""),
-            '\\' => output.push_str("\\\"),
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
