@@ -47,6 +47,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] RecordStore put_many/delete_many batches validate before allocation and publish descriptor changes through one page-tree redo record/root update (up to 5,000 IDs and 256 MiB of unique record data per put batch).
 - [x] RecordStore provides bounded ordered ID pagination without reading payloads, plus record-page reads capped at 5,000 records and 256 MiB per call.
 - [x] Standalone `SqlRowStore` stores typed SRW1 SQL row records over RecordStore pages, with stable-ID lookup, bounded scans, schema-width checks, and corruption validation; it is not yet integrated into `Database`.
+- [x] RecordStore and SqlRowStore expose mixed upsert/delete batches committed through one descriptor-tree redo frame and one atomic root publication; this is a storage primitive, not yet the SQL transaction coordinator.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
