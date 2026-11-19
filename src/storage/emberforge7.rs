@@ -1137,6 +1137,7 @@ impl EmberForge7Store {
     /// CoW redo/root publication. Payload extents are reclaimed after commit.
     pub fn apply_chunk_batch(
         &mut self,
+        world_namespace_id: u64,
         upserts: &[(i32, i32, Vec<u8>)],
         removals: &[(i32, i32)],
     ) -> Result<(usize, usize), DbError> {
@@ -1149,7 +1150,7 @@ impl EmberForge7Store {
         let mut upsert_keys = BTreeSet::new();
         let mut total_bytes = 0usize;
         for (x, z, payload) in upserts {
-            let key = chunk_key(1, *x, *z)?;
+            let key = chunk_key(world_namespace_id, *x, *z)?;
             if !upsert_keys.insert(key) {
                 return Err(DbError::Constraint("EF7 chunk batch contains duplicate coordinates".into()));
             }
@@ -1166,7 +1167,7 @@ impl EmberForge7Store {
         let mut removal_set = BTreeSet::new();
         let mut removed_extents = Vec::with_capacity(removals.len());
         for (x, z) in removals {
-            let key = chunk_key(1, *x, *z)?;
+            let key = chunk_key(world_namespace_id, *x, *z)?;
             if !removal_set.insert(key.clone()) || upsert_keys.contains(&key) {
                 return Err(DbError::Constraint("EF7 chunk batch contains duplicate or overlapping coordinates".into()));
             }
@@ -1552,7 +1553,7 @@ mod tests {
         let path = path("chunk-batch");
         {
             let mut store = EmberForge7Store::open(&path, 16).unwrap();
-            store.apply_chunk_batch(&[
+            store.apply_chunk_batch(1, &[
                 (-1, 2, b"one".to_vec()),
                 (0, 0, vec![0x44; 70_000]),
                 (1, -2, b"three".to_vec()),
