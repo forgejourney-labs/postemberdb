@@ -1,4 +1,4 @@
-use super::{Column, DataType, Database, DbError, IndexKey, Row, Table, Value};
+use super::{validate_value, Column, DataType, Database, DbError, IndexKey, Row, Table, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -53,7 +53,15 @@ impl Database {
             .map_err(storage_error)?;
         FileExt::try_lock_exclusive(&lock_file)
             .map_err(|error| DbError::Storage(format!("database is already open by another process or handle: {error}")))?;
-        let mut db = if path.exists() {
+        let pdb6_state = load_pdb6_database(&path)?;
+        let mut db = if let Some((tables, generation)) = pdb6_state {
+            let mut database = Self::new();
+            database.tables = tables;
+            database.wal_sequence = generation;
+            database.revision = generation;
+            database.pdb6_mode = true;
+            database
+        } else if path.exists() {
             Self::decode_file(&path)?
         } else {
             Self::new()
@@ -61,12 +69,14 @@ impl Database {
         db.storage_path = Some(path.clone());
         db.wal_path = Some(wal_file_path(&path));
         db._lock_file = Some(std::sync::Arc::new(lock_file));
-        if !path.exists() {
-            db.write_snapshot()?;
+        if !db.pdb6_mode {
+            if !path.exists() {
+                db.write_snapshot()?;
+            }
+            db.replay_wal()?;
+            recover_page_tree(&path)?;
+            db.ember_indexes_valid = db.sync_ember_indexes()?;
         }
-        db.replay_wal()?;
-        recover_page_tree(&path)?;
-        db.ember_indexes_valid = db.sync_ember_indexes()?;
         Ok(db)
     }
 
@@ -74,6 +84,11 @@ impl Database {
     /// The snapshot records the last applied WAL sequence, so a crash between
     /// the snapshot rename and WAL truncation cannot replay committed writes twice.
     pub fn save(&self) -> Result<(), DbError> {
+        // PDB6 commits publish their own durable page-tree root. Never rewrite
+        // the retained PDB5 compatibility snapshot from a PDB6-backed handle.
+        if self.pdb6_mode {
+            return Ok(());
+        }
         self.write_snapshot()?;
         if let Some(path) = &self.wal_path {
             let file = OpenOptions::new().create(true).write(true).truncate(true).open(path).map_err(storage_error)?;
@@ -309,6 +324,248 @@ impl Database {
         }
         Ok(Database { tables, storage_path: None, wal_path: None, _lock_file: None, wal_sequence, revision: wal_sequence, ember_indexes_valid: false, ember_index_journal: Vec::new(), ember_journal_supported: true })
     }
+}
+
+
+/// Opens PDB6 as the SQL authority when a complete manifest is present.
+/// Legacy PDB5 remains untouched and readable until this explicit switch.
+fn load_pdb6_database(path: &Path) -> Result<Option<(BTreeMap<String, Table>, u64)>, DbError> {
+    let mut pages_path = path.as_os_str().to_os_string();
+    pages_path.push(".pdb6.pages");
+    if !PathBuf::from(pages_path).exists() {
+        return Ok(None);
+    }
+    let mut store = Pdb6Store::open(path, 128)?;
+    let Some(manifest) = store.manifest()? else {
+        return Ok(None);
+    };
+    if manifest.table_count > MAX_ITEMS as u32
+        || manifest.next_table_id <= u64::from(manifest.table_count)
+    {
+        return Err(DbError::Storage("PDB6 manifest counters are inconsistent".into()));
+    }
+
+    let mut tables = BTreeMap::new();
+    for table_id in 1..=u64::from(manifest.table_count) {
+        let key = pdb6::table_key(table_id)?;
+        let bytes = store.get(&key)?
+            .ok_or_else(|| DbError::Storage(format!("PDB6 manifest references missing table {table_id}")))?;
+        let catalog = CatalogTable::decode(&bytes)?;
+        if catalog.table_id != table_id {
+            return Err(DbError::Storage("PDB6 catalog key and table ID disagree".into()));
+        }
+        let columns = catalog.columns.iter().map(|column| Column {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        }).collect::<Vec<_>>();
+        let mut table = Table {
+            columns,
+            rows: Vec::new(),
+            next_row_id: catalog.next_row_id,
+            row_positions: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+        };
+
+        let mut after = None;
+        loop {
+            let row_ids = store.scan_row_ids(table_id, after, 5_000)?;
+            if row_ids.is_empty() { break; }
+            for row_id in &row_ids {
+                let payload = store.get_row_payload(table_id, *row_id)?
+                    .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for table {table_id}, row {row_id}")))?;
+                let values = sql_rows::SqlRowStore::decode_values(&payload, table.columns.len())?;
+                for (column, value) in table.columns.iter().zip(&values) {
+                    validate_value(column, value)?;
+                }
+                if *row_id == 0 || *row_id >= table.next_row_id {
+                    return Err(DbError::Storage("PDB6 row ID is outside the table allocator range".into()));
+                }
+                let position = table.rows.len();
+                if table.row_positions.insert(*row_id, position).is_some() {
+                    return Err(DbError::Storage("duplicate PDB6 row ID".into()));
+                }
+                table.rows.push(Row { row_id: *row_id, values });
+            }
+            after = row_ids.last().copied();
+            if row_ids.len() < 5_000 { break; }
+        }
+
+        for index in &catalog.indexes {
+            let names = index.columns.iter().map(|ordinal| {
+                table.columns.get(*ordinal as usize)
+                    .map(|column| column.name.clone())
+                    .ok_or_else(|| DbError::Storage("PDB6 index references a missing column".into()))
+            }).collect::<Result<Vec<_>, _>>()?;
+            table.add_index_columns(index.name.clone(), &names, index.unique)?;
+        }
+        if tables.insert(catalog.name.clone(), table).is_some() {
+            return Err(DbError::Storage("duplicate table name in PDB6 catalog".into()));
+        }
+    }
+    Ok(Some((tables, manifest.generation)))
+}
+
+/// Persists one complete SQL transaction through a single PDB6 root publication.
+/// Row payloads, catalog records, secondary-index deltas and the manifest all
+/// become visible together; PDB5 WAL is not consulted in PDB6 mode.
+pub(super) fn persist_pdb6_transition(
+    path: &Path,
+    previous: &BTreeMap<String, Table>,
+    next: &BTreeMap<String, Table>,
+    generation: u64,
+) -> Result<(), DbError> {
+    let mut store = Pdb6Store::open(path, 128)?;
+    let mut manifest = store.manifest()?
+        .ok_or_else(|| DbError::Storage("PDB6 SQL authority has no completion manifest".into()))?;
+
+    let mut table_ids = BTreeMap::<String, u64>::new();
+    for table_id in 1..=u64::from(manifest.table_count) {
+        let bytes = store.get(&pdb6::table_key(table_id)?)?
+            .ok_or_else(|| DbError::Storage(format!("PDB6 catalog entry {table_id} is missing")))?;
+        let catalog = CatalogTable::decode(&bytes)?;
+        if table_ids.insert(catalog.name, table_id).is_some() {
+            return Err(DbError::Storage("duplicate table name in PDB6 catalog".into()));
+        }
+    }
+    if previous.keys().any(|name| !next.contains_key(name)) {
+        return Err(DbError::Unsupported("dropping SQL tables is not supported by the PDB6 transition writer".into()));
+    }
+
+    let mut row_upserts = Vec::<(u64, u64, Vec<u8>)>::new();
+    let mut other_upserts = Vec::<(Vec<u8>, Vec<u8>)>::new();
+    let mut removals = Vec::<Vec<u8>>::new();
+    let mut next_table_id = manifest.next_table_id;
+    let mut new_table_count = manifest.table_count;
+
+    for (table_name, table) in next {
+        let table_id = if let Some(id) = table_ids.get(table_name) {
+            *id
+        } else {
+            let id = next_table_id;
+            next_table_id = next_table_id.checked_add(1)
+                .ok_or_else(|| DbError::Storage("PDB6 table ID space exhausted".into()))?;
+            new_table_count = new_table_count.checked_add(1)
+                .ok_or_else(|| DbError::Storage("PDB6 table count overflow".into()))?;
+            table_ids.insert(table_name.clone(), id);
+            id
+        };
+        let catalog_indexes = table.indexes.iter().map(|(name, index)| {
+            let columns = index.column_indices.iter()
+                .map(|column| u32::try_from(*column)
+                    .map_err(|_| DbError::Constraint("PDB6 index column ordinal exceeds u32".into())))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CatalogIndex { name: name.clone(), columns, unique: index.unique })
+        }).collect::<Result<Vec<_>, DbError>>()?;
+        let catalog = CatalogTable {
+            table_id,
+            name: table_name.clone(),
+            columns: table.columns.iter().map(|column| CatalogColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            }).collect(),
+            indexes: catalog_indexes,
+            next_row_id: table.next_row_id,
+        };
+        other_upserts.push((pdb6::table_key(table_id)?, catalog.encode()?));
+
+        let old_table = previous.get(table_name);
+        let indexes_changed = old_table.is_none_or(|old| {
+            old.columns.iter().map(|c| (&c.name, &c.data_type, c.nullable))
+                .ne(table.columns.iter().map(|c| (&c.name, &c.data_type, c.nullable)))
+            || old.indexes.iter().map(|(name, index)| (name, &index.column_indices, index.unique))
+                .ne(table.indexes.iter().map(|(name, index)| (name, &index.column_indices, index.unique)))
+        });
+
+        if indexes_changed {
+            if let Some(old) = old_table {
+                for (index_offset, _) in old.indexes.values().enumerate() {
+                    let index_id = u64::try_from(index_offset + 1)
+                        .map_err(|_| DbError::Storage("PDB6 index ID space exhausted".into()))?;
+                    let prefix = pdb6::index_prefix(table_id, index_id)?;
+                    let mut cursor: Option<Vec<u8>> = None;
+                    loop {
+                        let page = store.scan_prefix_after(&prefix, cursor.as_deref(), 5_000)?;
+                        if page.is_empty() { break; }
+                        cursor = page.last().map(|(key, _)| key.clone());
+                        removals.extend(page.into_iter().map(|(key, _)| key));
+                        if removals.len() > 5_000 {
+                            return Err(DbError::Constraint("PDB6 transaction exceeds the 5,000-mutation limit while rebuilding indexes".into()));
+                        }
+                    }
+                }
+            }
+            for (index_offset, index) in table.indexes.values().enumerate() {
+                let index_id = u64::try_from(index_offset + 1)
+                    .map_err(|_| DbError::Storage("PDB6 index ID space exhausted".into()))?;
+                for row in &table.rows {
+                    let encoded = index_codec::encode_index_key(&IndexKey::from_columns(&row.values, &index.column_indices))?;
+                    let mut key = pdb6::index_key(table_id, index_id, &encoded)?;
+                    key.extend_from_slice(&row.row_id.to_be_bytes());
+                    if key.len() > 1_024 {
+                        return Err(DbError::Constraint("PDB6 index key exceeds 1,024 bytes".into()));
+                    }
+                    other_upserts.push((key, Vec::new()));
+                }
+            }
+            for row in &table.rows {
+                let payload = sql_rows::SqlRowStore::encode_values(&row.values, table.columns.len())?;
+                row_upserts.push((table_id, row.row_id, payload));
+            }
+        } else {
+            let old = old_table.expect("unchanged indexes require an old table");
+            let old_rows = old.rows.iter().map(|row| (row.row_id, row))
+                .collect::<BTreeMap<_, _>>();
+            let new_rows = table.rows.iter().map(|row| (row.row_id, row))
+                .collect::<BTreeMap<_, _>>();
+
+            for (row_id, old_row) in &old_rows {
+                let changed = new_rows.get(row_id).is_none_or(|new_row| old_row.values != new_row.values);
+                if !changed { continue; }
+                if new_rows.contains_key(row_id) {
+                    // Replacing a row keeps its stable ID but changes its payload.
+                } else {
+                    removals.push(pdb6::row_key(table_id, *row_id)?);
+                }
+                for (index_offset, index) in old.indexes.values().enumerate() {
+                    let index_id = u64::try_from(index_offset + 1)
+                        .map_err(|_| DbError::Storage("PDB6 index ID space exhausted".into()))?;
+                    let encoded = index_codec::encode_index_key(&IndexKey::from_columns(&old_row.values, &index.column_indices))?;
+                    let mut key = pdb6::index_key(table_id, index_id, &encoded)?;
+                    key.extend_from_slice(&row_id.to_be_bytes());
+                    removals.push(key);
+                }
+            }
+            for (row_id, new_row) in &new_rows {
+                let changed = old_rows.get(row_id).is_none_or(|old_row| old_row.values != new_row.values);
+                if !changed { continue; }
+                let payload = sql_rows::SqlRowStore::encode_values(&new_row.values, table.columns.len())?;
+                row_upserts.push((table_id, *row_id, payload));
+                for (index_offset, index) in table.indexes.values().enumerate() {
+                    let index_id = u64::try_from(index_offset + 1)
+                        .map_err(|_| DbError::Storage("PDB6 index ID space exhausted".into()))?;
+                    let encoded = index_codec::encode_index_key(&IndexKey::from_columns(&new_row.values, &index.column_indices))?;
+                    let mut key = pdb6::index_key(table_id, index_id, &encoded)?;
+                    key.extend_from_slice(&row_id.to_be_bytes());
+                    if key.len() > 1_024 {
+                        return Err(DbError::Constraint("PDB6 index key exceeds 1,024 bytes".into()));
+                    }
+                    other_upserts.push((key, Vec::new()));
+                }
+            }
+        }
+    }
+
+    manifest.generation = generation;
+    manifest.last_tx_id = manifest.last_tx_id.checked_add(1)
+        .ok_or_else(|| DbError::Storage("PDB6 transaction ID space exhausted".into()))?;
+    manifest.next_table_id = next_table_id;
+    manifest.table_count = new_table_count;
+    other_upserts.push((pdb6::database_root_key(), manifest.encode()?));
+
+    store.apply_row_batch(row_upserts, other_upserts, removals)?;
+    Ok(())
 }
 
 fn storage_error(error: io::Error) -> DbError { DbError::Storage(error.to_string()) }

@@ -474,6 +474,8 @@ pub struct Database {
     _lock_file: Option<Arc<std::fs::File>>,
     wal_sequence: u64,
     revision: u64,
+    /// True when the PDB6 manifest is the durable SQL authority.
+    pdb6_mode: bool,
     ember_indexes_valid: bool,
     ember_index_journal: Vec<EmberIndexDelta>,
     ember_journal_supported: bool,
@@ -488,6 +490,7 @@ impl Default for Database {
             _lock_file: None,
             wal_sequence: 0,
             revision: 0,
+            pdb6_mode: false,
             ember_indexes_valid: false,
             ember_index_journal: Vec::new(),
             ember_journal_supported: true,
@@ -596,6 +599,7 @@ impl Database {
                 _lock_file: None,
                 wal_sequence: self.wal_sequence,
                 revision: self.revision,
+                pdb6_mode: false,
                 ember_indexes_valid: false,
                 ember_index_journal: Vec::new(),
                 ember_journal_supported: true,
@@ -610,7 +614,14 @@ impl Database {
             return Err(DbError::TransactionConflict);
         }
         if session.statements.is_empty() { return Ok(()); }
-        if self.wal_path.is_some() {
+        if self.pdb6_mode {
+            let path = self.storage_path.as_deref()
+                .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+            let sequence = self.wal_sequence.checked_add(1)
+                .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
+            super::storage::persist_pdb6_transition(path, &self.tables, &session.staged.tables, sequence)?;
+            self.wal_sequence = sequence;
+        } else if self.wal_path.is_some() {
             let sequence = self.append_wal_transaction(&session.statements)?;
             self.wal_sequence = sequence;
         }
@@ -618,15 +629,17 @@ impl Database {
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
-        // The SQL WAL is the commit authority. Apply a derived index delta only
-        // after the SQL commit is durable; on failure queries use memory indexes.
-        self.ember_indexes_valid = self
-            .sync_ember_indexes_journal(
-                &session.staged.ember_index_journal,
-                session.staged.ember_journal_supported,
-                previous_mirror_valid,
-            )
-            .unwrap_or(false);
+        // PDB6 owns the catalog, rows and indexes in one root publication. The
+        // legacy EmberTree index mirror is used only by PDB5 databases.
+        if !self.pdb6_mode {
+            self.ember_indexes_valid = self
+                .sync_ember_indexes_journal(
+                    &session.staged.ember_index_journal,
+                    session.staged.ember_journal_supported,
+                    previous_mirror_valid,
+                )
+                .unwrap_or(false);
+        }
         Ok(())
     }
 
@@ -643,6 +656,7 @@ impl Database {
             _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
+            pdb6_mode: false,
             ember_indexes_valid: false,
             ember_index_journal: Vec::new(),
             ember_journal_supported: true,
