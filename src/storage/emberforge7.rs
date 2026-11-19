@@ -756,18 +756,6 @@ impl EmberForge7Store {
             return Err(DbError::Constraint("legacy EF7 UUID reverse lookup exceeded 100,000 entries; run the EF7 identity migration".into()));
         }
         let mut found = None;
-        for (_, value) in entries {
-            if value.len() != 8 {
-                return Err(DbError::Storage("malformed legacy EF7 UUID index value".into()));
-            }
-            if u64::from_be_bytes(value[..8].try_into().unwrap()) == row_id {
-                // The UUID is encoded in the key after its type and namespace.
-                // The caller's scan result key is retained below in the migration branch.
-            }
-        }
-        let entries = page_tree::scan_range_limited(
-            &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(100_001),
-        )?;
         for (key, value) in entries {
             if value.len() != 8 {
                 return Err(DbError::Storage("malformed legacy EF7 UUID index value".into()));
@@ -1107,6 +1095,92 @@ mod tests {
             let mut reopened = EmberForge7Store::open(&path, 32).unwrap();
             assert_eq!(reopened.get_player(7, uuid_a).unwrap(), None);
             assert_eq!(reopened.get_player(7, uuid_b).unwrap(), Some((102, b"updated-player-b".to_vec())));
+        }
+        cleanup(&path);
+    }
+
+
+    #[test]
+    fn namespaces_are_hierarchical_unique_and_deletable_only_when_empty() {
+        let path = path("namespaces");
+        let mut store = EmberForge7Store::open(&path, 16).unwrap();
+        let root = store.create_namespace(1, None, EmberForge7NamespaceKind::Server, "Lobby").unwrap();
+        assert_eq!(root.name, "lobby");
+        let world = store.create_namespace(2, Some(1), EmberForge7NamespaceKind::World, "Survival_01").unwrap();
+        assert_eq!(world.parent_id, Some(1));
+        assert_eq!(store.find_namespace(Some(1), "SURVIVAL_01").unwrap(), Some(world.clone()));
+        assert_eq!(store.list_namespaces(Some(1), 10).unwrap(), vec![world.clone()]);
+        assert!(store.create_namespace(3, Some(1), EmberForge7NamespaceKind::Plugin, "survival_01").is_err());
+        assert!(store.delete_namespace(1).is_err(), "a namespace with children cannot be removed");
+        store.put_record(2, 100, b"world metadata").unwrap();
+        assert!(store.delete_namespace(2).is_err(), "a namespace with records cannot be removed");
+        assert!(store.delete_record(2, 100).unwrap());
+        assert!(store.delete_namespace(2).unwrap());
+        assert!(store.delete_namespace(1).unwrap());
+        assert!(store.get_namespace(1).unwrap().is_none());
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn typed_player_profiles_rekey_uuid_and_name_indexes_atomically() {
+        let path = path("typed-player");
+        let first_uuid = [0x31; 16];
+        let second_uuid = [0x32; 16];
+        {
+            let mut store = EmberForge7Store::open(&path, 24).unwrap();
+            let first = EmberForge7PlayerProfile {
+                uuid: first_uuid, username: "Steve".into(),
+                first_joined_ms: 100, last_seen_ms: 200,
+                playtime_ticks: 900, custom_data: vec![1, 2, 3, 4],
+            };
+            store.put_player_profile(7, 55, &first).unwrap();
+            assert_eq!(store.get_player_profile(7, first_uuid).unwrap(), Some((55, first.clone())));
+            assert_eq!(store.get_player_profile_by_name(7, "STEVE").unwrap(), Some((55, first)));
+
+            let renamed = EmberForge7PlayerProfile {
+                uuid: second_uuid, username: "Alex_2".into(),
+                first_joined_ms: 100, last_seen_ms: 300,
+                playtime_ticks: 1_200, custom_data: vec![9, 8, 7],
+            };
+            store.put_player_profile(7, 55, &renamed).unwrap();
+            assert!(store.get_player_profile(7, first_uuid).unwrap().is_none());
+            assert!(store.get_player_profile_by_name(7, "Steve").unwrap().is_none());
+            assert_eq!(store.get_player_profile_by_name(7, "alex_2").unwrap(), Some((55, renamed.clone())));
+            assert_eq!(store.get_player_profile(7, second_uuid).unwrap(), Some((55, renamed)));
+            assert!(store.delete_player(7, 55, first_uuid).is_err());
+            assert!(store.delete_player(7, 55, second_uuid).unwrap());
+            assert!(store.get_player_profile_by_name(7, "Alex_2").unwrap().is_none());
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 24).unwrap();
+            assert!(reopened.get_player_profile(7, second_uuid).unwrap().is_none());
+        }
+        drop(());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn player_identity_metadata_survives_raw_batch_update_and_uuid_reassignment() {
+        let path = path("batch-rekey");
+        let old_uuid = [0x41; 16];
+        let new_uuid = [0x42; 16];
+        {
+            let mut store = EmberForge7Store::open(&path, 16).unwrap();
+            let profile = EmberForge7PlayerProfile {
+                uuid: old_uuid, username: "Builder".into(),
+                first_joined_ms: 10, last_seen_ms: 20, playtime_ticks: 30,
+                custom_data: vec![1],
+            };
+            store.put_player_profile(5, 77, &profile).unwrap();
+            store.apply_player_batch(&[(5, 77, new_uuid, b"raw-data".to_vec())], &[]).unwrap();
+            assert!(store.get_player(5, old_uuid).unwrap().is_none());
+            assert_eq!(store.get_player(5, new_uuid).unwrap(), Some((77, b"raw-data".to_vec())));
+            assert!(store.get_player_profile_by_name(5, "Builder").unwrap().is_none());
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
+            assert_eq!(reopened.get_player(5, new_uuid).unwrap(), Some((77, b"raw-data".to_vec())));
         }
         cleanup(&path);
     }
