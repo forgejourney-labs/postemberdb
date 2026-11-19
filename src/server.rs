@@ -1,4 +1,4 @@
-use postemberdb::{Database, DatabaseSession, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
+use postemberdb::{Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +9,8 @@ const MAX_CLIENTS: usize = 128;
 const MAX_SQL_LINE_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT_SECS: u64 = 30;
 const MAX_EF7_WIRE_CUSTOM_BYTES: usize = 24 * 1024;
+const MAX_EF7_WIRE_CHUNK_BYTES: usize = 24 * 1024;
+const MAX_EF7_NAMESPACE_LIST: usize = 64;
 
 struct ConnectionGuard(Arc<AtomicUsize>);
 
@@ -255,6 +257,51 @@ fn decode_uuid(value: &str) -> Result<[u8; 16], String> {
     decode_hex(value)?.try_into().map_err(|_| "UUID must decode to exactly 16 bytes".into())
 }
 
+fn parse_optional_namespace_parent(value: &str) -> Result<Option<u64>, String> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let parent = value.parse::<u64>().map_err(|_| "invalid namespace parent ID".to_owned())?;
+    if parent == 0 {
+        return Err("namespace parent ID must be non-zero".into());
+    }
+    Ok(Some(parent))
+}
+
+fn parse_namespace_kind(value: &str) -> Result<EmberForge7NamespaceKind, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "server" => Ok(EmberForge7NamespaceKind::Server),
+        "world" => Ok(EmberForge7NamespaceKind::World),
+        "plugin" => Ok(EmberForge7NamespaceKind::Plugin),
+        "playerdata" | "player_data" => Ok(EmberForge7NamespaceKind::PlayerData),
+        "custom" => Ok(EmberForge7NamespaceKind::Custom),
+        _ => Err("namespace kind must be server, world, plugin, playerdata or custom".into()),
+    }
+}
+
+fn namespace_kind_name(kind: EmberForge7NamespaceKind) -> &'static str {
+    match kind {
+        EmberForge7NamespaceKind::Server => "server",
+        EmberForge7NamespaceKind::World => "world",
+        EmberForge7NamespaceKind::Plugin => "plugin",
+        EmberForge7NamespaceKind::PlayerData => "playerdata",
+        EmberForge7NamespaceKind::Custom => "custom",
+    }
+}
+
+fn json_namespace(namespace: &EmberForge7Namespace) -> String {
+    let parent = namespace.parent_id.map_or_else(|| "null".to_owned(), |id| id.to_string());
+    format!(
+        "{{\"id\":{},\"parent_id\":{},\"kind\":{},\"name\":{}}}",
+        namespace.id, parent, json_escape(namespace_kind_name(namespace.kind)), json_escape(&namespace.name)
+    )
+}
+
+fn json_namespaces(namespaces: &[EmberForge7Namespace]) -> String {
+    let encoded = namespaces.iter().map(json_namespace).collect::<Vec<_>>().join(",");
+    format!("[{encoded}]")
+}
+
 fn json_profile(row_id: u64, profile: &EmberForge7PlayerProfile) -> Result<String, String> {
     if profile.custom_data.len() > MAX_EF7_WIRE_CUSTOM_BYTES {
         return Err(format!(
@@ -281,8 +328,103 @@ fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
         parts.get(index).ok_or_else(|| format!("missing {label}"))?
             .parse::<u64>().map_err(|_| format!("invalid {label}"))
     };
+    let parse_i32 = |index: usize, label: &str| -> Result<i32, String> {
+        parts.get(index).ok_or_else(|| format!("missing {label}"))?
+            .parse::<i32>().map_err(|_| format!("invalid {label}"))
+    };
     let result: Result<String, String> = (|| {
         match parts[1] {
+            "NS_CREATE" => {
+                if parts.len() != 6 { return Err("usage: EF7 NS_CREATE <id> <parent_id|-> <kind> <name>".into()); }
+                let id = parse_id(2, "namespace ID")?;
+                let parent_id = parse_optional_namespace_parent(parts[3])?;
+                let kind = parse_namespace_kind(parts[4])?;
+                let namespace = store.create_namespace(id, parent_id, kind, parts[5])
+                    .map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 namespace created\",\"namespace\":{}}}\n",
+                    json_namespace(&namespace)
+                ))
+            }
+            "NS_GET" => {
+                if parts.len() != 3 { return Err("usage: EF7 NS_GET <id>".into()); }
+                let id = parse_id(2, "namespace ID")?;
+                let namespace = store.get_namespace(id).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 namespace lookup\",\"namespace\":{}}}\n",
+                    namespace.as_ref().map_or_else(|| "null".to_owned(), json_namespace)
+                ))
+            }
+            "NS_FIND" => {
+                if parts.len() != 4 { return Err("usage: EF7 NS_FIND <parent_id|-> <name>".into()); }
+                let parent_id = parse_optional_namespace_parent(parts[2])?;
+                let namespace = store.find_namespace(parent_id, parts[3]).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 namespace lookup\",\"namespace\":{}}}\n",
+                    namespace.as_ref().map_or_else(|| "null".to_owned(), json_namespace)
+                ))
+            }
+            "NS_LIST" => {
+                if parts.len() != 4 { return Err("usage: EF7 NS_LIST <parent_id|-> <limit>".into()); }
+                let parent_id = parse_optional_namespace_parent(parts[2])?;
+                let limit = parts[3].parse::<usize>().map_err(|_| "invalid namespace list limit".to_owned())?;
+                if limit == 0 || limit > MAX_EF7_NAMESPACE_LIST {
+                    return Err(format!("KSL namespace list limit must be 1..={MAX_EF7_NAMESPACE_LIST}"));
+                }
+                let namespaces = store.list_namespaces(parent_id, limit).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 namespaces listed\",\"namespaces\":{}}}\n",
+                    json_namespaces(&namespaces)
+                ))
+            }
+            "NS_DELETE" => {
+                if parts.len() != 3 { return Err("usage: EF7 NS_DELETE <id>".into()); }
+                let id = parse_id(2, "namespace ID")?;
+                let deleted = store.delete_namespace(id).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
+                    json_escape(if deleted { "EF7 namespace deleted" } else { "EF7 namespace not found" }),
+                    u8::from(deleted)
+                ))
+            }
+            "CHUNK_PUT" => {
+                if parts.len() != 6 { return Err("usage: EF7 CHUNK_PUT <namespace> <chunk_x> <chunk_z> <payload_hex|->".into()); }
+                let namespace = parse_id(2, "world namespace ID")?;
+                let chunk_x = parse_i32(3, "chunk X")?;
+                let chunk_z = parse_i32(4, "chunk Z")?;
+                let payload = if parts[5] == "-" { Vec::new() } else { decode_hex(parts[5])? };
+                if payload.len() > MAX_EF7_WIRE_CHUNK_BYTES {
+                    return Err(format!("chunk payload exceeds the KSL JSONL/1 limit of {MAX_EF7_WIRE_CHUNK_BYTES} bytes"));
+                }
+                store.put_chunk(namespace, chunk_x, chunk_z, &payload).map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 chunk stored"))
+            }
+            "CHUNK_GET" => {
+                if parts.len() != 5 { return Err("usage: EF7 CHUNK_GET <namespace> <chunk_x> <chunk_z>".into()); }
+                let namespace = parse_id(2, "world namespace ID")?;
+                let chunk_x = parse_i32(3, "chunk X")?;
+                let chunk_z = parse_i32(4, "chunk Z")?;
+                match store.get_chunk_limited(namespace, chunk_x, chunk_z, MAX_EF7_WIRE_CHUNK_BYTES)
+                    .map_err(|error| error.to_string())? {
+                    Some(payload) => Ok(format!(
+                        "{{\"ok\":true,\"message\":\"EF7 chunk found\",\"chunk\":{{\"namespace_id\":{},\"chunk_x\":{},\"chunk_z\":{},\"payload_hex\":{}}}}}\n",
+                        namespace, chunk_x, chunk_z, json_escape(&encode_hex(&payload))
+                    )),
+                    None => Ok("{\"ok\":true,\"message\":\"EF7 chunk not found\",\"chunk\":null}\n".into()),
+                }
+            }
+            "CHUNK_DELETE" => {
+                if parts.len() != 5 { return Err("usage: EF7 CHUNK_DELETE <namespace> <chunk_x> <chunk_z>".into()); }
+                let namespace = parse_id(2, "world namespace ID")?;
+                let chunk_x = parse_i32(3, "chunk X")?;
+                let chunk_z = parse_i32(4, "chunk Z")?;
+                let deleted = store.delete_chunk(namespace, chunk_x, chunk_z).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
+                    json_escape(if deleted { "EF7 chunk deleted" } else { "EF7 chunk not found" }),
+                    u8::from(deleted)
+                ))
+            }
             "PROFILE_PUT" => {
                 if parts.len() != 10 { return Err("usage: EF7 PROFILE_PUT <namespace> <row_id> <uuid_hex> <username> <first_joined_ms> <last_seen_ms> <playtime_ticks> <custom_hex|->".into()); }
                 let namespace = parse_id(2, "namespace ID")?;
@@ -526,6 +668,39 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("Ada"));
 
+        writeln!(client, "EF7 NS_CREATE 1 - server hub").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"name\":\"hub\""));
+        writeln!(client, "EF7 NS_CREATE 7 1 world survival").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"kind\":\"world\""));
+        writeln!(client, "EF7 NS_FIND 1 SURVIVAL").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"id\":7"));
+        writeln!(client, "EF7 NS_LIST 1 10").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"namespaces\":["));
+        writeln!(client, "EF7 CHUNK_PUT 7 -12 34 00ff102030").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 chunk stored"));
+        writeln!(client, "EF7 NS_DELETE 7").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("not empty"));
+        writeln!(client, "EF7 CHUNK_GET 7 -12 34").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"payload_hex\":\"00ff102030\""));
+        writeln!(client, "EF7 CHUNK_DELETE 7 -12 34").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 chunk deleted"));
+
         let uuid = "11111111111111111111111111111111";
         writeln!(client, "EF7 PROFILE_PUT 7 41 {uuid} Steve 100 200 300 01020304").unwrap();
         line.clear();
@@ -586,6 +761,14 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"profile\":null"));
+        writeln!(client, "EF7 NS_DELETE 7").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("namespace deleted"));
+        writeln!(client, "EF7 NS_DELETE 1").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("namespace deleted"));
 
         writeln!(client, "QUIT").unwrap();
         drop(client);
