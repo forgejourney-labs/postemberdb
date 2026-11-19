@@ -83,12 +83,48 @@ Available operations are `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getP
 
 The server stores UUID and case-insensitive username indexes together with the typed profile in EF7. Each profile update is one EF7 CoW-tree publication. These commands are rejected while the connection has an open SQL transaction: SQL and EF7 are separate durability domains and do not yet share a cross-domain commit.
 
-The current addon profile API does not expose world chunk payloads, arbitrary EF7 records, namespace administration, prepared SQL statements, or JDBC. Keep the numeric namespace and row IDs stable in the plugin. Namespace IDs may represent different servers/worlds/plugins according to your application's schema.
+The KSL addon now exposes bounded namespace administration and chunk CRUD in addition to player profiles. Keep namespace IDs stable in plugin configuration; a common layout is a server namespace with one child world namespace per world. Namespace deletion is deliberately non-cascading and succeeds only when the namespace has no children, player records, generic records, or chunks.
+
+## EF7 namespace and chunk API
+
+Create a hierarchy with stable numeric IDs:
+
+```kotlin
+val serverNamespace = postemberDb().createNamespaceAsync(
+    id = 1L, parentId = null, kind = "server", name = "survival"
+).join()
+
+val worldNamespace = postemberDb().createNamespaceAsync(
+    id = 10L, parentId = serverNamespace.id, kind = "world", name = "overworld"
+).join()
+
+val children = postemberDb().listNamespacesAsync(serverNamespace.id, 32).join()
+val found = postemberDb().findNamespaceAsync(serverNamespace.id, "OVERWORLD").join()
+```
+
+Namespace kinds are `server`, `world`, `plugin`, `playerdata`, and `custom`. Names are case-insensitive for lookup and must use 1–128 ASCII letters, digits, dots, underscores, or hyphens. Listing through the KSL bridge is capped at 64 entries per request.
+
+Store a bounded chunk payload using signed Minecraft chunk coordinates:
+
+```kotlin
+val bytes = byteArrayOf(0x01, 0x02, 0x03)
+postemberDb().putChunkAsync(worldNamespace.id, -12, 34, bytes).join()
+
+val chunk = postemberDb().getChunkAsync(worldNamespace.id, -12, 34).join()
+if (chunk != null) {
+    val storedBytes = chunk.payload
+}
+
+postemberDb().deleteChunkAsync(worldNamespace.id, -12, 34).join()
+```
+
+The line-oriented JSONL/1 bridge caps chunk payloads at 24 KiB because binary data is hex-encoded inside a 64 KiB request/response line. Reads inspect the stored descriptor length before reading payload pages and reject larger chunks rather than allocating and returning an oversized response. The native Rust API still supports chunk records up to 64 MiB. Large world-chunk transport, chunk-range streaming, and atomic chunk batches are intentionally not exposed through this text bridge; they require a separate bounded binary/framed protocol. All synchronous namespace/chunk methods reject calls on Paper's main thread; use the `Async` variants from gameplay callbacks.
 
 ## Protocol and safety limits
 
-- JSONL protocol version: 1, including the EF7 player-profile command extension.
-- Maximum request line: 64 KiB; EF7 custom profile bytes are limited to 24 KiB in this bridge.
+- JSONL protocol version: 1, including EF7 player-profile, namespace, and bounded chunk command extensions.
+- Maximum request line: 64 KiB; EF7 custom profile and chunk payloads are limited to 24 KiB in this bridge.
+- Namespace listing through KSL is capped at 64 metadata entries per request; chunk reads enforce the byte budget before loading payload pages.
 - Server client limit and I/O timeouts remain enforced by PostemberDB.
 - Loopback only; do not expose port 7432 to a network.
 - This is a first integration milestone, not a JDBC driver and not a replacement for KSL's existing SQLite/MySQL/MariaDB/PostgreSQL support.
