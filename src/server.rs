@@ -969,6 +969,7 @@ mod tests {
         assert!(line.contains("namespace deleted"));
 
         writeln!(client, "QUIT").unwrap();
+        drop(reader);
         drop(client);
         worker.join().unwrap();
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
