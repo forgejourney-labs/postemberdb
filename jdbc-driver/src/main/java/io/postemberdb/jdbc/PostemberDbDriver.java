@@ -21,11 +21,6 @@ import java.util.logging.Logger;
 public final class PostemberDbDriver implements Driver {
     private static final String PREFIX = "jdbc:postemberdb://";
     private static final ObjectMapper JSON = new ObjectMapper();
-    static {
-        try { DriverManager.registerDriver(new PostemberDbDriver()); }
-        catch (SQLException e) { throw new ExceptionInInitializerError(e); }
-    }
-
     @Override public Connection connect(String url, Properties info) throws SQLException {
         if (!acceptsURL(url)) return null;
         Properties props = info == null ? new Properties() : info;
