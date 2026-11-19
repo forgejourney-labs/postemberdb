@@ -15,6 +15,7 @@ pub mod record_store;
 pub mod sql_rows;
 mod pages;
 mod pdb6;
+mod pdb6_store;
 mod wal;
 
 use pages::{decode_pages, encode_pages};
