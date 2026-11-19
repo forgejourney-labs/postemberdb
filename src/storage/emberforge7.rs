@@ -1600,6 +1600,40 @@ mod tests {
     }
 
     #[test]
+    fn record_ttl_rekeys_atomically_sweeps_with_budget_and_survives_reopen() {
+        let path = path("record-ttl");
+        {
+            let mut store = EmberForge7Store::open(&path, 24).unwrap();
+            store.put_record_with_expiry(1, 10, 100, b"expires-first").unwrap();
+            store.put_record_with_expiry(1, 20, 200, b"expires-later").unwrap();
+            store.put_record_with_expiry(1, 30, 300, b"will-be-persistent").unwrap();
+
+            // Replacing a TTL record without expiry removes its previous index entry.
+            store.put_record(1, 30, b"persistent").unwrap();
+            assert_eq!(store.sweep_expired_records(150, 1).unwrap(), 1);
+            assert_eq!(store.get_record(1, 10).unwrap(), None);
+            assert_eq!(store.get_record(1, 20).unwrap(), Some(b"expires-later".to_vec()));
+            assert_eq!(store.get_record(1, 30).unwrap(), Some(b"persistent".to_vec()));
+
+            // Re-keying the expiry must not leave the old timestamp in the index.
+            store.put_record_with_expiry(1, 20, 400, b"rescheduled").unwrap();
+            assert_eq!(store.sweep_expired_records(250, 10).unwrap(), 0);
+            assert_eq!(store.sweep_expired_records(450, 1).unwrap(), 1);
+            assert_eq!(store.get_record(1, 20).unwrap(), None);
+            assert_eq!(store.get_record(1, 30).unwrap(), Some(b"persistent".to_vec()));
+            assert!(store.delete_record(1, 30).unwrap(), "deleting a record without TTL must succeed");
+            assert_eq!(store.sweep_expired_records(u64::MAX, 10).unwrap(), 0);
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 24).unwrap();
+            assert_eq!(reopened.get_record(1, 10).unwrap(), None);
+            assert_eq!(reopened.get_record(1, 20).unwrap(), None);
+            assert_eq!(reopened.get_record(1, 30).unwrap(), None);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn player_uuid_mapping_and_record_commit_together() {
         let path = path("player-uuid");
         let uuid = [0x5au8; 16];
