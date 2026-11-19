@@ -374,6 +374,129 @@ impl EmberForge7Store {
         Ok(Self { pages, wal_path, _lock_file: lock_file })
     }
 
+
+    /// Creates a namespace and its parent-scoped name index atomically.
+    pub fn create_namespace(
+        &mut self,
+        id: u64,
+        parent_id: Option<u64>,
+        kind: EmberForge7NamespaceKind,
+        name: &str,
+    ) -> Result<EmberForge7Namespace, DbError> {
+        let canonical = normalize_namespace_name(name)?;
+        let namespace = EmberForge7Namespace { id, parent_id, kind, name: canonical };
+        let metadata_key = namespace_key(id)?;
+        let name_key = namespace_name_key(parent_id, &namespace.name)?;
+        if let Some(parent) = parent_id {
+            if self.get_namespace(parent)?.is_none() {
+                return Err(DbError::Constraint("EF7 namespace parent does not exist".into()));
+            }
+        }
+        if page_tree::get(&mut self.pages, &metadata_key)?.is_some() {
+            return Err(DbError::Constraint("EF7 namespace ID already exists".into()));
+        }
+        if page_tree::get(&mut self.pages, &name_key)?.is_some() {
+            return Err(DbError::Constraint("EF7 namespace name already exists under this parent".into()));
+        }
+        page_tree::apply_mutations(
+            &mut self.pages, &self.wal_path, &[],
+            &[(metadata_key, namespace.encode()?), (name_key, id.to_be_bytes().to_vec())],
+        )?;
+        Ok(namespace)
+    }
+
+    pub fn get_namespace(&mut self, id: u64) -> Result<Option<EmberForge7Namespace>, DbError> {
+        let key = namespace_key(id)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        let namespace = EmberForge7Namespace::decode(&value)?;
+        if namespace.id != id {
+            return Err(DbError::Storage("EF7 namespace key and metadata ID disagree".into()));
+        }
+        Ok(Some(namespace))
+    }
+
+    pub fn find_namespace(
+        &mut self,
+        parent_id: Option<u64>,
+        name: &str,
+    ) -> Result<Option<EmberForge7Namespace>, DbError> {
+        let key = namespace_name_key(parent_id, name)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        if value.len() != 8 {
+            return Err(DbError::Storage("malformed EF7 namespace name index value".into()));
+        }
+        let id = u64::from_be_bytes(value[..8].try_into().unwrap());
+        let Some(namespace) = self.get_namespace(id)? else {
+            return Err(DbError::Storage("EF7 namespace name index points to missing metadata".into()));
+        };
+        if namespace.parent_id != parent_id || namespace.name != normalize_namespace_name(name)? {
+            return Err(DbError::Storage("EF7 namespace name index does not match metadata".into()));
+        }
+        Ok(Some(namespace))
+    }
+
+    /// Returns namespaces in key order, bounded to 10,000 entries per call.
+    pub fn list_namespaces(
+        &mut self,
+        parent_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<EmberForge7Namespace>, DbError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(DbError::Constraint("EF7 namespace list limit must be 1..=10000".into()));
+        }
+        let mut prefix = vec![KEY_NAMESPACE_NAME];
+        prefix.extend_from_slice(&parent_id.unwrap_or(0).to_be_bytes());
+        let entries = page_tree::scan_range_limited(
+            &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(limit),
+        )?;
+        let mut result = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.len() <= prefix.len() || value.len() != 8 {
+                return Err(DbError::Storage("malformed EF7 namespace name index entry".into()));
+            }
+            let id = u64::from_be_bytes(value[..8].try_into().unwrap());
+            let namespace = self.get_namespace(id)?
+                .ok_or_else(|| DbError::Storage("EF7 namespace index points to missing metadata".into()))?;
+            if namespace.parent_id != parent_id || key != namespace_name_key(parent_id, &namespace.name)? {
+                return Err(DbError::Storage("EF7 namespace index key does not match metadata".into()));
+            }
+            result.push(namespace);
+        }
+        Ok(result)
+    }
+
+    /// Deletes only empty namespaces. Children, records and player indexes
+    /// must be removed first; namespace metadata and name index are one commit.
+    pub fn delete_namespace(&mut self, id: u64) -> Result<bool, DbError> {
+        let Some(namespace) = self.get_namespace(id)? else { return Ok(false); };
+        let mut child_prefix = vec![KEY_NAMESPACE_NAME];
+        child_prefix.extend_from_slice(&id.to_be_bytes());
+        let mut record_prefix = vec![KEY_RECORD];
+        record_prefix.extend_from_slice(&id.to_be_bytes());
+        let mut uuid_prefix = vec![KEY_PLAYER_UUID];
+        uuid_prefix.extend_from_slice(&id.to_be_bytes());
+        let mut name_prefix = vec![KEY_PLAYER_NAME];
+        name_prefix.extend_from_slice(&id.to_be_bytes());
+        let mut identity_prefix = vec![KEY_PLAYER_ROW_META];
+        identity_prefix.extend_from_slice(&id.to_be_bytes());
+        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix] {
+            if !page_tree::scan_range_limited(
+                &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(1),
+            )?.is_empty() {
+                return Err(DbError::Constraint("EF7 namespace is not empty".into()));
+            }
+        }
+        let metadata_key = namespace_key(id)?;
+        let name_key = namespace_name_key(namespace.parent_id, &namespace.name)?;
+        let (removed, _) = page_tree::apply_mutations(
+            &mut self.pages, &self.wal_path, &[metadata_key, name_key], &[],
+        )?;
+        if removed != 2 {
+            return Err(DbError::Storage("EF7 namespace deletion did not remove both metadata keys".into()));
+        }
+        Ok(true)
+    }
+
     /// Stores or replaces a record up to 64 MiB. Data pages become durable
     /// before the CoW descriptor root is published.
     pub fn put_record(&mut self, namespace_id: u64, record_id: u64, payload: &[u8]) -> Result<(), DbError> {
