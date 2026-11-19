@@ -40,6 +40,8 @@ pub struct RecoveredTransaction {
     pub prepared_participants: Vec<u8>,
     /// Participants whose durable commit application has been acknowledged.
     pub applied_participants: Vec<u8>,
+    /// Participants whose durable abort cleanup has been acknowledged.
+    pub rolled_back_participants: Vec<u8>,
     pub state: TransactionState,
 }
 
@@ -48,6 +50,7 @@ struct TransactionRecord {
     participant_count: u8,
     prepared: BTreeSet<u8>,
     applied: BTreeSet<u8>,
+    rolled_back: BTreeSet<u8>,
     state: TransactionState,
 }
 
@@ -94,6 +97,7 @@ impl TransactionCoordinator {
                         participant_count,
                         prepared: BTreeSet::new(),
                         applied: BTreeSet::new(),
+                        rolled_back: BTreeSet::new(),
                         state: TransactionState::Preparing,
                     });
                     last_id = txid;
@@ -123,6 +127,15 @@ impl TransactionCoordinator {
                         return Err(DbError::Storage("invalid or duplicate transaction APPLIED record".into()));
                     }
                 }
+                6 => {
+                    let tx = transactions.get_mut(&txid).ok_or_else(|| DbError::Storage("ROLLED_BACK record references an unknown transaction".into()))?;
+                    if tx.state != TransactionState::Aborted
+                        || participant_count != tx.participant_count
+                        || !tx.prepared.contains(&participant)
+                        || !tx.rolled_back.insert(participant) {
+                        return Err(DbError::Storage("invalid or duplicate transaction ROLLED_BACK record".into()));
+                    }
+                }
                 _ => return Err(DbError::Storage("unknown transaction coordinator journal record".into())),
             }
         }
@@ -146,6 +159,7 @@ impl TransactionCoordinator {
             participant_count,
             prepared: BTreeSet::new(),
             applied: BTreeSet::new(),
+            rolled_back: BTreeSet::new(),
             state: TransactionState::Preparing,
         });
         self.next_transaction_id = next;
@@ -221,11 +235,73 @@ impl TransactionCoordinator {
         Ok(())
     }
 
+    /// Records durable cleanup of one participant after an ABORT decision.
+    pub fn mark_rolled_back(&mut self, txid: u64, participant_id: u8) -> Result<(), DbError> {
+        let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
+        if tx.state != TransactionState::Aborted
+            || !tx.prepared.contains(&participant_id)
+            || tx.rolled_back.contains(&participant_id) {
+            return Err(DbError::Constraint("participant cannot be marked rolled back in the current transaction state".into()));
+        }
+        let count = tx.participant_count;
+        self.append(6, participant_id, txid, count)?;
+        self.transactions.get_mut(&txid).unwrap().rolled_back.insert(participant_id);
+        Ok(())
+    }
+
+    /// Returns aborted transactions whose prepared participants still need cleanup.
+    pub fn aborted_pending_rollback(&self) -> Vec<RecoveredTransaction> {
+        self.transactions.iter().filter_map(|(id, tx)| {
+            (tx.state == TransactionState::Aborted && tx.rolled_back.len() < tx.prepared.len())
+                .then(|| RecoveredTransaction {
+                    transaction_id: *id,
+                    participant_count: tx.participant_count,
+                    prepared_participants: tx.prepared.iter().copied().collect(),
+                    applied_participants: tx.applied.iter().copied().collect(),
+                    rolled_back_participants: tx.rolled_back.iter().copied().collect(),
+                    state: tx.state,
+                })
+        }).collect()
+    }
+
+    /// Durably decides ABORT (if needed), then retries every participant's
+    /// idempotent rollback and records a synced ROLLED_BACK acknowledgement.
+    pub fn rollback_prepared_participants(
+        &mut self,
+        txid: u64,
+        participants: &mut [&mut dyn CoordinatorParticipant],
+    ) -> Result<(), DbError> {
+        let state = self.transactions.get(&txid)
+            .ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?.state;
+        if state == TransactionState::Preparing {
+            self.rollback(txid)?;
+        } else if state != TransactionState::Aborted {
+            return Err(DbError::Constraint("only an aborted transaction can roll back participants".into()));
+        }
+        let tx = self.transactions.get(&txid).unwrap();
+        let pending = tx.prepared.difference(&tx.rolled_back).copied().collect::<Vec<_>>();
+        let mut supplied = BTreeSet::new();
+        for participant in participants.iter() {
+            if !supplied.insert(participant.participant_id()) {
+                return Err(DbError::Constraint("duplicate coordinator participant ID".into()));
+            }
+        }
+        for id in pending {
+            let participant = participants.iter_mut()
+                .find(|participant| participant.participant_id() == id)
+                .ok_or_else(|| DbError::Storage(format!("coordinator participant {id} is not available for abort recovery")))?;
+            participant.rollback_prepared(txid)?;
+            self.mark_rolled_back(txid, id)?;
+        }
+        Ok(())
+    }
+
     pub fn in_doubt(&self) -> Vec<RecoveredTransaction> {
         self.transactions.iter().filter_map(|(id, tx)| (tx.state == TransactionState::Preparing).then(|| RecoveredTransaction {
             transaction_id: *id, participant_count: tx.participant_count,
             prepared_participants: tx.prepared.iter().copied().collect(),
             applied_participants: tx.applied.iter().copied().collect(),
+            rolled_back_participants: tx.rolled_back.iter().copied().collect(),
             state: tx.state,
         })).collect()
     }
@@ -510,6 +586,43 @@ mod tests {
         }
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal", ".ef7.wal.prepared.9"] {
             let mut candidate = ef7_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
+    fn abort_participant_cleanup_is_durable_and_retryable() {
+        let coordinator_path = path();
+        let kv_path = coordinator_path.with_extension("kv");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            tx = coordinator.begin(1).unwrap();
+            kv.prepare_batch(tx, &[], &[(b"staged".to_vec(), b"value".to_vec())]).unwrap();
+            coordinator.mark_prepared(tx, 1).unwrap();
+            coordinator.rollback(tx).unwrap();
+        }
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            let pending = coordinator.aborted_pending_rollback();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].prepared_participants, vec![1]);
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut kv];
+            coordinator.rollback_prepared_participants(tx, &mut participants).unwrap();
+            assert!(coordinator.aborted_pending_rollback().is_empty());
+            assert!(kv.pending_prepared_transactions().is_empty());
+            kv.put(b"after-abort", b"writable").unwrap();
+        }
+        {
+            let coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            assert!(coordinator.aborted_pending_rollback().is_empty());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"] {
+            let mut candidate = kv_path.as_os_str().to_os_string();
             candidate.push(suffix);
             let _ = fs::remove_file(PathBuf::from(candidate));
         }

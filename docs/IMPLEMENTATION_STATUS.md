@@ -262,3 +262,6 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 
 - [ ] Reachability-based page reclamation across current roots, named snapshots, and active reader pins is not yet implemented.
 - [ ] Snapshot root persistence, reader epochs/pins, crash-safe vacuum progress, and safe page reuse remain required before enabling general page freeing.
+
+
+- [x] Coordinator ABORT recovery now retries each prepared participant's idempotent rollback, syncs a per-participant ROLLED_BACK acknowledgement, and exposes aborted transactions still needing cleanup.
