@@ -106,3 +106,6 @@ Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STA
 - `canary` — raw but implemented features under early testing.
 - `unstable` — implemented and polished, but not release-ready.
 - `stable` — thoroughly validated, reliable, and security-reviewed releases.
+
+
+See [JDBC Driver](docs/JDBC_DRIVER.md) for Maven setup, TLS configuration, connection properties and current JDBC feature limits.

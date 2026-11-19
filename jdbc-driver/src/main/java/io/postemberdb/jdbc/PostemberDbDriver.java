@@ -109,7 +109,7 @@ public final class PostemberDbDriver implements Driver {
     }
     @SuppressWarnings("unchecked")
     private static <T> T proxy(Class<T> type, InvocationHandler handler) {
-        return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, handler);
+        return (T) java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, handler);
     }
     private static Object defaultValue(Class<?> type) {
         if (!type.isPrimitive() || type == void.class) return null;
