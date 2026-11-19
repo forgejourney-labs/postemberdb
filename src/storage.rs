@@ -415,7 +415,7 @@ pub(super) fn persist_pdb6_transition(
     previous: &BTreeMap<String, Table>,
     next: &BTreeMap<String, Table>,
     generation: u64,
-) -> Result<(), DbError> {
+) -> Result<u64, DbError> {
     let mut store = Pdb6Store::open(path, 128)?;
     let mut manifest = store.manifest()?
         .ok_or_else(|| DbError::Storage("PDB6 SQL authority has no completion manifest".into()))?;
