@@ -85,6 +85,25 @@ The server stores UUID and case-insensitive username indexes together with the t
 
 The KSL addon now exposes bounded namespace administration and chunk CRUD in addition to player profiles. Keep namespace IDs stable in plugin configuration; a common layout is a server namespace with one child world namespace per world. Namespace deletion is deliberately non-cascading and succeeds only when the namespace has no children, player records, generic records, or chunks.
 
+## EF7 generic records and TTL
+
+Generic plugin-owned records use a stable namespace and record ID. The optional expiry is an absolute Unix timestamp in milliseconds; the database does not guess the current time.
+
+```kotlin
+val store = postemberDb()
+store.putRecordWithExpiryAsync(
+    namespaceId = worldNamespace.id,
+    recordId = 9001L,
+    expiresAtMs = System.currentTimeMillis() + 60 * 60 * 1000L,
+    payload = byteArrayOf(1, 2, 3)
+).join()
+
+val record = store.getRecordAsync(worldNamespace.id, 9001L).join()
+store.sweepExpiredRecordsAsync(System.currentTimeMillis(), limit = 128).join()
+```
+
+Available methods include `putRecordAsync`, `putRecordWithExpiryAsync`, `getRecordAsync`, `deleteRecordAsync`, and `sweepExpiredRecordsAsync`. Synchronous worker-thread variants also exist and reject calls on Paper's main thread. Sweeps are explicit and bounded to 1..10,000 records per call; schedule them asynchronously and choose a conservative budget. JSONL/1 caps generic record payloads at 24 KiB; the native Rust EF7 API supports up to 64 MiB. See [EF7 Record TTL](../../docs/EF7_TTL.md).
+
 ## EF7 namespace and chunk API
 
 Create a hierarchy with stable numeric IDs:
@@ -122,9 +141,11 @@ The line-oriented JSONL/1 bridge caps chunk payloads at 24 KiB because binary da
 
 ## Protocol and safety limits
 
-- JSONL protocol version: 1, including EF7 player-profile, namespace, and bounded chunk command extensions.
+- JSONL protocol version: 1, including EF7 player-profile, namespace, chunk, generic-record, and TTL command extensions.
+- The Rust server also accepts the initial Binary/1 handshake for framed SQL and single-frame chunk operations; the Kotlin addon still uses JSONL/1.
 - Maximum request line: 64 KiB; EF7 custom profile and chunk payloads are limited to 24 KiB in this bridge.
-- Namespace listing through KSL is capped at 64 metadata entries per request; chunk reads enforce the byte budget before loading payload pages.
+- Namespace listing through KSL is capped at 64 metadata entries per request; chunk and generic-record reads enforce byte budgets before loading payload pages.
+- Generic-record TTL sweeps remove at most the caller-specified number of expired records in one CoW commit.
 - Server client limit and I/O timeouts remain enforced by PostemberDB.
 - Loopback only; do not expose port 7432 to a network.
 - This is a first integration milestone, not a JDBC driver and not a replacement for KSL's existing SQLite/MySQL/MariaDB/PostgreSQL support.
