@@ -6,6 +6,8 @@
 //! update protocol is implemented.
 
 use super::DbError;
+use super::cache::{PageCache, DEFAULT_PAGE_CACHE_CAPACITY};
+use crate::PageCacheStats;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -48,6 +50,7 @@ pub(crate) struct ExtentFile {
     file: File,
     metadata: AllocatorMetadata,
     poisoned: bool,
+    page_cache: PageCache,
 }
 
 impl ExtentFile {
@@ -74,8 +77,18 @@ impl ExtentFile {
         Ok(())
     }
 
-    /// Opens or initializes a page file. A single process must own the file.
+    /// Opens or initializes a page file with the default bounded page cache.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_with_cache_capacity(path, DEFAULT_PAGE_CACHE_CAPACITY)
+    }
+
+    /// Opens or initializes a page file with a caller-selected cache capacity.
+    /// A single process must own the file. Capacity is measured in decoded pages.
+    pub(crate) fn open_with_cache_capacity(
+        path: impl AsRef<Path>,
+        cache_capacity_pages: usize,
+    ) -> Result<Self, DbError> {
+        let page_cache = PageCache::new(cache_capacity_pages)?;
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -102,6 +115,7 @@ impl ExtentFile {
                     free_extents: BTreeMap::new(),
                 },
                 poisoned: false,
+                page_cache,
             };
             let initial = store.metadata.clone();
             store.commit_metadata(initial)?;
@@ -157,7 +171,7 @@ impl ExtentFile {
             ));
         }
 
-        let mut store = Self { file, metadata, poisoned: false };
+        let mut store = Self { file, metadata, poisoned: false, page_cache };
         if repair_needed {
             store.repair_metadata_slots(keep_slot)?;
         }
@@ -216,6 +230,7 @@ impl ExtentFile {
             return Err(storage_error(error));
         }
         self.commit_metadata(next)?;
+        self.page_cache.insert(page_id, payload.to_vec());
         Ok(page_id)
     }
 
@@ -242,20 +257,36 @@ impl ExtentFile {
             self.poisoned = true;
             return Err(storage_error(error));
         }
+        self.page_cache.insert(page_id, payload.to_vec());
         Ok(())
     }
 
-    /// Reads and validates one allocated page.
+    /// Reads and validates one allocated page, using the bounded LRU cache on hits.
     pub(crate) fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>, DbError> {
         self.ensure_healthy()?;
         if !is_allocated(&self.metadata, page_id) {
             return Err(DbError::Storage(format!("page {page_id} is not allocated")));
         }
+        if let Some(payload) = self.page_cache.get(page_id) {
+            return Ok(payload);
+        }
 
         let mut encoded = [0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(page_offset(page_id)?)).map_err(storage_error)?;
         self.file.read_exact(&mut encoded).map_err(storage_error)?;
-        decode_data_page(page_id, &encoded, self.metadata.generation)
+        let payload = decode_data_page(page_id, &encoded, self.metadata.generation)?;
+        self.page_cache.insert(page_id, payload.clone());
+        Ok(payload)
+    }
+
+    /// Returns cache occupancy and cumulative hit/miss/eviction counters.
+    pub(crate) fn page_cache_stats(&self) -> PageCacheStats {
+        self.page_cache.stats()
+    }
+
+    /// Changes the per-handle cache capacity. Shrinking evicts least-recently-used pages.
+    pub(crate) fn set_page_cache_capacity(&mut self, capacity_pages: usize) -> Result<(), DbError> {
+        self.page_cache.set_capacity(capacity_pages)
     }
 
     /// Releases a contiguous range. Adjacent free extents are coalesced before
@@ -277,7 +308,9 @@ impl ExtentFile {
 
         let mut next = self.metadata.clone();
         insert_free_extent(&mut next, start_page_id, page_count)?;
-        self.commit_metadata(next)
+        self.commit_metadata(next)?;
+        self.page_cache.remove_range(start_page_id, end);
+        Ok(())
     }
 
     pub(crate) fn root_page_id(&self) -> Option<u64> {
