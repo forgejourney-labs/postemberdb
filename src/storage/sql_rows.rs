@@ -339,6 +339,52 @@ mod tests {
     }
 
     #[test]
+    fn sql_row_store_applies_mixed_upserts_and_deletes_atomically() {
+        let path = temp_path("mixed-batch");
+        {
+            let mut rows = SqlRowStore::open(&path, 1).unwrap();
+            rows.put_many(vec![
+                (1, vec![Value::Integer(10)]),
+                (2, vec![Value::Integer(20)]),
+                (3, vec![Value::Integer(30)]),
+            ]).unwrap();
+
+            let (inserted, removed) = rows.apply_batch(
+                vec![
+                    (2, vec![Value::Integer(200)]),
+                    (4, vec![Value::Integer(40)]),
+                ],
+                vec![1, 2, 3],
+            ).unwrap();
+            assert_eq!(inserted, 2);
+            assert_eq!(removed, 2);
+            assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![2, 4]);
+            assert_eq!(rows.get(2).unwrap(), Some(vec![Value::Integer(200)]));
+            assert_eq!(rows.get(4).unwrap(), Some(vec![Value::Integer(40)]));
+        }
+        let mut reopened = SqlRowStore::open(&path, 1).unwrap();
+        assert_eq!(reopened.scan_ids(None, 10).unwrap(), vec![2, 4]);
+        assert_eq!(reopened.get(2).unwrap(), Some(vec![Value::Integer(200)]));
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sql_row_store_rejects_mixed_batch_over_limit_before_mutation() {
+        let path = temp_path("mixed-limit");
+        let mut rows = SqlRowStore::open(&path, 1).unwrap();
+        rows.put(1, &[Value::Integer(1)]).unwrap();
+        let upserts = (2..=2_501u64)
+            .map(|id| (id, vec![Value::Integer(id as i64)]))
+            .collect::<Vec<_>>();
+        let deletes = (3_000..=5_000u64).collect::<Vec<_>>();
+        assert!(rows.apply_batch(upserts, deletes).is_err());
+        assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![1]);
+        drop(rows);
+        cleanup(&path);
+    }
+
+    #[test]
     fn sql_row_store_supports_multi_page_text_and_rejects_wrong_width() {
         let path = temp_path("large");
         let mut rows = SqlRowStore::open(&path, 1).unwrap();
