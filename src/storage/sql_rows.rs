@@ -79,6 +79,48 @@ impl SqlRowStore {
         self.records.put_many(encoded)
     }
 
+    /// Applies typed row upserts and deletions with one descriptor-tree WAL
+    /// frame and one atomic root publication. Upserts win for IDs present in
+    /// both collections. The combined mutation count is capped at 5,000.
+    pub fn apply_batch<U, D>(
+        &mut self,
+        rows: U,
+        row_ids_to_delete: D,
+    ) -> Result<(usize, usize), DbError>
+    where
+        U: IntoIterator<Item = (u64, Vec<Value>)>,
+        D: IntoIterator<Item = u64>,
+    {
+        let mut encoded = Vec::new();
+        let mut total_bytes = 0usize;
+        for (row_id, values) in rows {
+            if encoded.len() >= MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds {MAX_BATCH_ROWS} mutations"
+                )));
+            }
+            let bytes = self.encode_row(&values)?;
+            total_bytes = total_bytes.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("SQL row batch byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                )));
+            }
+            encoded.push((row_id, bytes));
+        }
+        let mut deletions = Vec::new();
+        for row_id in row_ids_to_delete {
+            if encoded.len() + deletions.len() >= MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row batch exceeds {MAX_BATCH_ROWS} mutations"
+                )));
+            }
+            deletions.push(row_id);
+        }
+        self.records.apply_batch(encoded, deletions)
+    }
+
     /// Reads one row by stable ID. Missing rows return None.
     pub fn get(&mut self, row_id: u64) -> Result<Option<Vec<Value>>, DbError> {
         self.records.get(row_id)?
@@ -293,6 +335,52 @@ mod tests {
         assert!(reopened.delete(1).unwrap());
         assert_eq!(reopened.scan_ids(None, 10).unwrap(), vec![2, 3]);
         drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sql_row_store_applies_mixed_upserts_and_deletes_atomically() {
+        let path = temp_path("mixed-batch");
+        {
+            let mut rows = SqlRowStore::open(&path, 1).unwrap();
+            rows.put_many(vec![
+                (1, vec![Value::Integer(10)]),
+                (2, vec![Value::Integer(20)]),
+                (3, vec![Value::Integer(30)]),
+            ]).unwrap();
+
+            let (inserted, removed) = rows.apply_batch(
+                vec![
+                    (2, vec![Value::Integer(200)]),
+                    (4, vec![Value::Integer(40)]),
+                ],
+                vec![1, 2, 3],
+            ).unwrap();
+            assert_eq!(inserted, 2);
+            assert_eq!(removed, 3);
+            assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![2, 4]);
+            assert_eq!(rows.get(2).unwrap(), Some(vec![Value::Integer(200)]));
+            assert_eq!(rows.get(4).unwrap(), Some(vec![Value::Integer(40)]));
+        }
+        let mut reopened = SqlRowStore::open(&path, 1).unwrap();
+        assert_eq!(reopened.scan_ids(None, 10).unwrap(), vec![2, 4]);
+        assert_eq!(reopened.get(2).unwrap(), Some(vec![Value::Integer(200)]));
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sql_row_store_rejects_mixed_batch_over_limit_before_mutation() {
+        let path = temp_path("mixed-limit");
+        let mut rows = SqlRowStore::open(&path, 1).unwrap();
+        rows.put(1, &[Value::Integer(1)]).unwrap();
+        let upserts = (2..=2_501u64)
+            .map(|id| (id, vec![Value::Integer(id as i64)]))
+            .collect::<Vec<_>>();
+        let deletes = (3_000..=5_500u64).collect::<Vec<_>>();
+        assert!(rows.apply_batch(upserts, deletes).is_err());
+        assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![1]);
+        drop(rows);
         cleanup(&path);
     }
 
