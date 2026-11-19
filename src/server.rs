@@ -347,7 +347,7 @@ fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
                 let (removed_keys, inserted_keys) = store.apply_player_profile_batch(&upserts, &removals)
                     .map_err(|error| error.to_string())?;
                 Ok(format!(
-                    "{{\\"ok\\":true,\\"message\\":\\"EF7 profile batch committed\\",\\"affected_rows\\":{total},\\"index_entries_removed\\":{removed_keys},\\"index_entries_written\\":{inserted_keys}}}\\n"
+                    "{{\"ok\":true,\"message\":\"EF7 profile batch committed\",\"affected_rows\":{total},\"index_entries_removed\":{removed_keys},\"index_entries_written\":{inserted_keys}}}\n"
                 ))
             }
             "PROFILE_GET" => {
