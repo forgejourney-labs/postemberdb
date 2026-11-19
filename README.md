@@ -15,6 +15,12 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 
 Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. The file-backed extent layer now has a bounded per-handle LRU cache for validated EPG1 page payloads; KeyValueStore and the new variable-length RecordStore can configure capacity and inspect hit/miss/eviction counters. RecordStore uses multi-page extents for records up to 64 MiB and an EmberTree B+ Tree descriptor index. It is an independent sidecar, not yet the canonical SQL row store. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
 
+## EmberForge 7 — Minecraft/KSL storage
+
+**EmberForge 7 (EF7)** is a dedicated persistent record engine for Minecraft servers and KotlinScriptLoader. It uses independent `.ef7.pages`, `.ef7.wal`, and `.ef7.lock` sidecars over the PDB6 extent-page allocator and CoW B+ tree. EF7 currently provides hierarchical server/world/plugin namespaces, typed Minecraft player profiles with UUID and case-insensitive username indexes, bounded player scans, signed-coordinate chunk storage, rectangular chunk reads, and atomic player/chunk batches. Large payloads use checksummed overflow pages up to 64 MiB per record.
+
+EF7 is an independent storage engine at this stage. It does **not** replace the canonical PDB5 SQL snapshot/WAL, does not yet provide cross-domain SQL/KV/Registry transactions, and is not yet exposed as a JDBC/KSL SQL dialect. See [EmberForge 7 documentation](docs/EMBERFORGE7.md) and [implementation gates](docs/IMPLEMENTATION_STATUS.md).
+
 ## Current status
 
 The project is at an early development stage. The first prototype provides:
