@@ -1,1 +1,105 @@
-# EmberForge 7 (EF7)\n\nEmberForge 7 is PostemberDB's dedicated persistent record engine for Minecraft servers and KotlinScriptLoader (KSL). It builds on PDB6's validated EPG1 extent pages, EAM3 allocator metadata, and copy-on-write B+ tree, while using an independent EF7 sidecar and versioned record format.\n\n## Design goals\n\n- Fast player lookup by 16-byte UUID within a namespace.\n- Large player/plugin records stored as checksummed overflow pages rather than oversized B+ tree leaf values.\n- Stable numeric record IDs, namespace isolation, and bounded batch operations.\n- One CoW root publication for a player record plus its UUID mapping, or for a bounded mixed player batch.\n- Reclaim replaced/deleted payload extents only after the new descriptor root is durable.\n- Keep the page cache bounded by a caller-selected page capacity.\n\n## On-disk files\n\nFor a database path `world.pbd`, EF7 owns `world.pbd.ef7.pages`, `world.pbd.ef7.wal`, and `world.pbd.ef7.lock`. The extent file uses the PDB6 EPG1/EAM3 physical page and allocator layer. EF7 logical records use `EF7R` descriptors and `EF7C` chunks, each with a format version and checksums. The descriptor tree and overflow pages are separate from PDB6's `.pdb6.*` files and the older `.efe.*` experimental store.\n\n## API\n\n- `EmberForge7Store::open(path, cache_capacity_pages)`\n- `put_record` / `get_record` / `delete_record`\n- `put_player` / `get_player` / `delete_player`\n- `apply_player_batch(upserts, removals)`\n- `stats`\n\nA batch accepts at most 2,500 player operations and 256 MiB of aggregate upsert payload. Each upsert contains `(namespace_id, row_id, uuid, payload)`; each removal contains `(namespace_id, row_id, uuid)`. Duplicate or overlapping row/UUID operations are rejected before page allocation. Upserts and removals are published through one CoW-tree redo frame and one root publication. UUID collisions are rejected. Replaced/deleted payload extents are released only after publication.\n\nIndividual records are limited to 64 MiB and 16,384 pages. Chunk sequence, page count, declared total length, per-chunk checksum, and whole-record checksum are verified on reads.\n\n## Current limitations\n\nEF7 is currently a standalone record engine, not the canonical SQL backend. It does not yet replace PDB5 SQL snapshots/WAL, coordinate transactions across SQL/KV/Registry, provide general SQL secondary indexes, or expose a JDBC driver. Crash-point fault injection and Minecraft/KSL end-to-end load tests remain release gates. Do not treat EF7 as production-ready until those tests and integrations are complete.\n
+# EmberForge 7 (EF7)
+
+EmberForge 7 is PostemberDB's dedicated persistent record engine for Minecraft servers and KotlinScriptLoader (KSL). It is a separate logical storage engine built on the PDB6 physical extent-page allocator and copy-on-write B+ tree. EF7 owns independent sidecar files and does not overwrite PDB6 or the earlier experimental EFE sidecars.
+
+## Engine layout
+
+For a database path such as `world.pbd`, EF7 uses:
+
+- `world.pbd.ef7.pages` — EPG1 physical pages and mirrored EAM3 allocator metadata.
+- `world.pbd.ef7.wal` — CoW B+ tree redo log for EF7 logical keys.
+- `world.pbd.ef7.lock` — exclusive process lock.
+
+Logical entries share one persistent B+ tree root. Large record payloads live in checksummed contiguous extent-page runs; tree values contain compact descriptors. Payload pages are written before the descriptor tree redo/root publication. Replaced/deleted extents are released only after publication.
+
+### Key families
+
+| Key prefix | Purpose |
+|---|---|
+| `0x50` | Namespace metadata |
+| `0x51` | Generic record descriptors |
+| `0x52` | Player UUID index |
+| `0x53` | Player-name index |
+| `0x54` | Player row identity metadata |
+| `0x55` | Minecraft chunk descriptors |
+| `0x56` | Parent-scoped namespace-name index |
+
+Keys use big-endian numeric components for stable ordering. Signed chunk coordinates flip the sign bit before encoding, so B+ tree order follows signed X then signed Z order.
+
+## Namespace engine
+
+Namespaces form a parent/child hierarchy and can represent servers, worlds, plugins, player-data areas, or custom domains.
+
+Public API:
+
+- `create_namespace(id, parent_id, kind, name)`
+- `get_namespace(id)`
+- `find_namespace(parent_id, name)`
+- `list_namespaces(parent_id, limit)`
+- `delete_namespace(id)`
+
+Names are canonical lowercase ASCII identifiers of 1–128 characters using letters, digits, dot, underscore, or hyphen. Names are unique beneath each parent. A parent must already exist. Namespace deletion is deliberately non-cascading: it is refused while the namespace has child namespaces, player indexes, generic records, player identity metadata, or chunk descriptors.
+
+## Player data engine
+
+EF7 supports raw player records and a typed Minecraft profile model.
+
+Typed profile fields:
+
+- 16-byte UUID.
+- Username (1–16 ASCII letters, digits, or underscore).
+- First-join and last-seen timestamps in Unix milliseconds.
+- Playtime in ticks.
+- Arbitrary plugin-owned custom bytes.
+
+Public API:
+
+- `put_player(namespace_id, row_id, uuid, payload)`
+- `get_player(namespace_id, uuid)`
+- `delete_player(namespace_id, row_id, uuid)`
+- `put_player_profile(namespace_id, row_id, profile)`
+- `get_player_profile(namespace_id, uuid)`
+- `get_player_profile_by_name(namespace_id, username)`
+- `scan_player_profiles(namespace_id, after_uuid, limit)`
+- `search_player_profiles_by_name(namespace_id, prefix, limit)`
+- `apply_player_batch(upserts, removals)`
+
+UUID and name indexes are namespace-scoped. Player row identity metadata remembers the current UUID and optional canonical username. Renaming a player or changing the UUID removes obsolete index entries and writes the new record, identity, and indexes through one B+ tree publication. Duplicate UUIDs and usernames are rejected within a namespace. Reads cross-check the index, identity metadata, and typed profile instead of trusting a stale index entry.
+
+The UUID scan uses an exclusive cursor and a bounded result limit. Name-prefix scans are case-insensitive and bounded. Both cap a single result page at 10,000 entries.
+
+## Minecraft chunk storage
+
+World chunk data can be stored directly by signed chunk coordinates:
+
+- `put_chunk(world_namespace_id, chunk_x, chunk_z, payload)`
+- `get_chunk(world_namespace_id, chunk_x, chunk_z)`
+- `delete_chunk(world_namespace_id, chunk_x, chunk_z)`
+- `scan_chunks(world_namespace_id, min_x, min_z, max_x, max_z, limit)`
+
+Chunk descriptors are their own B+ tree entries and point to the same checked overflow-page format. Updating a chunk publishes one new descriptor root and reclaims the previous extent afterward. Rectangular scans iterate ordered X columns and issue bounded Z-range scans. A query can cover at most 4,096 X columns and return at most 10,000 chunks.
+
+## Bounds and validation
+
+- Maximum generic/player/chunk payload: 64 MiB per record.
+- Maximum extent chain: 16,384 pages.
+- Maximum player batch: 2,500 total operations.
+- Maximum aggregate player upsert payload per batch: 256 MiB.
+- Maximum namespace list page: 10,000.
+- Maximum UUID/name scan page: 10,000.
+- Maximum chunk scan: 4,096 X columns and 10,000 returned chunks.
+- Record descriptors, chunk headers, namespace metadata, player identities, and typed profiles validate lengths, versions, sequence numbers, and checksums.
+
+The current checksum is a non-cryptographic corruption-detection checksum. It is not an authentication code and does not protect against malicious modification.
+
+## Transaction and recovery boundaries
+
+Each player batch, namespace create/delete, single chunk update, and single player identity update uses the EF7 CoW B+ tree redo path and one root publication. Payload pages are durable before the logical descriptor is published. Old payload extents are reclaimed after the root update succeeds.
+
+The EF7 sidecar lock prevents multiple processes from concurrently opening the same EF7 store. Page-tree recovery replays the EF7 redo log and validates the reachable tree on open.
+
+## Compatibility and current limitations
+
+The first EF7 record/chunk format remains version 1. Existing EF7 raw player records without the newer identity metadata can be reverse-resolved by a bounded UUID scan during updates/deletes; this compatibility path is capped at 100,000 UUID index entries per namespace.
+
+EF7 is still a standalone Minecraft/KSL record engine, not the canonical SQL storage backend. It does not yet replace PDB5 SQL snapshots/WAL, coordinate commits with SQL/KV/Registry sidecars, provide general user-defined secondary indexes, or expose a JDBC driver. EF7's redo publication and allocator behavior still need targeted crash-point fault injection, long-running multi-process tests, and realistic Minecraft/KSL end-to-end benchmarks. Do not treat it as production-ready until those gates are complete.
