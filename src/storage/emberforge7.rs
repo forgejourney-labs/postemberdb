@@ -567,6 +567,29 @@ impl EmberForge7Store {
         self.read_payload(RecordDescriptor::decode(&value)?).map(Some)
     }
 
+    /// Reads a chunk only when its stored length fits the caller's explicit
+    /// byte budget. The descriptor is checked before any payload pages are read.
+    pub fn get_chunk_limited(
+        &mut self,
+        world_namespace_id: u64,
+        chunk_x: i32,
+        chunk_z: i32,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        if max_bytes > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 chunk read budget cannot exceed 64 MiB".into()));
+        }
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        let descriptor = RecordDescriptor::decode(&value)?;
+        if descriptor.total_len > max_bytes as u64 {
+            return Err(DbError::Constraint(format!(
+                "EF7 chunk payload exceeds the requested read budget of {max_bytes} bytes"
+            )));
+        }
+        self.read_payload(descriptor).map(Some)
+    }
+
     pub fn delete_chunk(
         &mut self, world_namespace_id: u64, chunk_x: i32, chunk_z: i32,
     ) -> Result<bool, DbError> {
