@@ -878,6 +878,27 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("EF7 chunk deleted"));
 
+        writeln!(client, "EF7 RECORD_PUT_TTL 7 501 500 01020304").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 TTL record stored"));
+        writeln!(client, "EF7 RECORD_GET 7 501").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"payload_hex\":\"01020304\""));
+        writeln!(client, "EF7 RECORD_SWEEP 499 10").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"affected_rows\":0"));
+        writeln!(client, "EF7 RECORD_SWEEP 500 10").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"affected_rows\":1"));
+        writeln!(client, "EF7 RECORD_GET 7 501").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"record\":null"));
+
         let uuid = "11111111111111111111111111111111";
         writeln!(client, "EF7 PROFILE_PUT 7 41 {uuid} Steve 100 200 300 01020304").unwrap();
         line.clear();
