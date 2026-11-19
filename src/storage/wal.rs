@@ -49,6 +49,7 @@ impl Database {
             _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
+            pdb6_mode: false,
             ember_indexes_valid: false,
             ember_index_journal: Vec::new(),
             ember_journal_supported: true,

@@ -619,7 +619,7 @@ impl Database {
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
             let sequence = self.wal_sequence.checked_add(1)
                 .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
-            super::storage::persist_pdb6_transition(path, &self.tables, &session.staged.tables, sequence)?;
+            crate::storage::persist_pdb6_transition(path, &self.tables, &session.staged.tables, sequence)?;
             self.wal_sequence = sequence;
         } else if self.wal_path.is_some() {
             let sequence = self.append_wal_transaction(&session.statements)?;
