@@ -93,7 +93,9 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
 - [ ] General user-defined secondary indexes and index rebuild/verification tooling.
 - [ ] Integrate EF7 transactions with canonical SQL WAL, catalog and SQL executor; PDB5 remains authoritative.
-- [ ] KSL-facing typed adapter and JDBC driver.
+- [x] Narrow KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username and delete; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
+- [ ] Build the addon against the installed KSL API and Paper dependencies; run end-to-end Paper/KSL integration tests.
+- [ ] JDBC driver and KSL SQL dialect/PreparedStatement support.
 - [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
 
 EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent record engine and does not yet provide cross-domain atomicity with SQL, KV, Registry, or other sidecars. FNV-style checksums detect accidental corruption; they are not cryptographic authentication.
