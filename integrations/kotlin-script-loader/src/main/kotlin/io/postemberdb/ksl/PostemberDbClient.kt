@@ -256,8 +256,8 @@ class PostemberDbClient internal constructor(
     fun deleteRecord(namespaceId: Long, recordId: Long): Boolean {
         check(!Bukkit.isPrimaryThread()) { "Use deleteRecordAsync() on Paper's main thread" }
         require(namespaceId > 0 && recordId > 0) { "namespaceId and recordId must be positive" }
-        return protocolRequestLine("EF7 RECORD_DELETE $namespaceId $recordId")
-            ["affected_rows"]?.jsonPrimitive?.longOrNull == 1L
+        return protocolRequestLine("EF7 RECORD_DELETE $namespaceId $recordId")["affected_rows"]
+            ?.jsonPrimitive?.longOrNull == 1L
     }
 
     fun deleteRecordAsync(
@@ -270,8 +270,8 @@ class PostemberDbClient internal constructor(
         check(!Bukkit.isPrimaryThread()) { "Use sweepExpiredRecordsAsync() on Paper's main thread" }
         require(nowMs >= 0) { "nowMs must be non-negative" }
         require(limit in 1..10_000) { "TTL sweep limit must be 1..10000" }
-        return protocolRequestLine("EF7 RECORD_SWEEP $nowMs $limit")
-            ["affected_rows"]?.jsonPrimitive?.longOrNull ?: 0L
+        return protocolRequestLine("EF7 RECORD_SWEEP $nowMs $limit")["affected_rows"]
+            ?.jsonPrimitive?.longOrNull ?: 0L
     }
 
     fun sweepExpiredRecordsAsync(
@@ -579,7 +579,7 @@ class PostemberDbClient internal constructor(
     private fun writeBinaryFrame(output: DataOutputStream, kind: Int, requestId: Long, payload: ByteArray) {
         val crc = CRC32().apply { update(payload) }.value.toInt()
         val header = ByteBuffer.allocate(BINARY_HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
-            .put(byteArrayOf(0x50, 0x44, 0x42, 0x46))
+            .put(byteArrayOf(0x50.toByte(), 0x44.toByte(), 0x42.toByte(), 0x46.toByte()))
             .put(BINARY_PROTOCOL_VERSION.toByte())
             .put(kind.toByte())
             .putShort(0)
@@ -598,7 +598,7 @@ class PostemberDbClient internal constructor(
         val decoded = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
         val magic = ByteArray(4)
         decoded.get(magic)
-        if (!magic.contentEquals(byteArrayOf(0x50, 0x44, 0x42, 0x46))) {
+        if (!magic.contentEquals(byteArrayOf(0x50.toByte(), 0x44.toByte(), 0x42.toByte(), 0x46.toByte()))) {
             throw PostemberDbException("invalid Binary/1 frame magic")
         }
         if ((decoded.get().toInt() and 0xff) != BINARY_PROTOCOL_VERSION) {
