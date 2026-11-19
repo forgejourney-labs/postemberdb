@@ -237,7 +237,7 @@ public final class PostemberDbDriver implements Driver {
         }
     }
 
-    private static final class StatementHandler implements InvocationHandler {
+    private static class StatementHandler implements InvocationHandler {
         final ConnectionHandler connection; boolean closed; Query last=Query.empty(); int updateCount=-1; int queryTimeout; int fetchSize=128; int maxRows;
         StatementHandler(ConnectionHandler connection) { this.connection=connection; }
         Query execute(String sql) throws SQLException {
