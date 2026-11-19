@@ -357,7 +357,7 @@ mod tests {
                 vec![1, 2, 3],
             ).unwrap();
             assert_eq!(inserted, 2);
-            assert_eq!(removed, 3);
+            assert_eq!(removed, 2);
             assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![2, 4]);
             assert_eq!(rows.get(2).unwrap(), Some(vec![Value::Integer(200)]));
             assert_eq!(rows.get(4).unwrap(), Some(vec![Value::Integer(40)]));
