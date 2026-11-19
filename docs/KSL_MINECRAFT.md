@@ -168,7 +168,7 @@ Build and installation instructions for the addon are in integrations/kotlin-scr
 
 ## Binary/1 server transport
 
-The Rust server now supports an opt-in `POSTEMBERDB BINARY/1` handshake after its legacy text greeting. It acknowledges with a framed Pong and then accepts 24-byte-header PDBF frames. The initial dispatcher supports ping/pong, one-statement SQL Query frames, and single-frame EF7 chunk put/get/delete with an 8 MiB frame cap. Transaction-control frames, multi-frame chunk streaming, range scans, chunk batches, and multiplexing are not implemented. The Kotlin addon still uses JSONL/1; it has not yet been switched to Binary/1. See [Binary Protocol v1](BINARY_PROTOCOL.md).
+The Rust server now supports an opt-in `POSTEMBERDB BINARY/1` handshake after its legacy text greeting. It acknowledges with a framed Pong and then accepts 24-byte-header PDBF frames. The initial dispatcher supports ping/pong, one-statement SQL Query frames, and single-frame EF7 chunk put/get/delete with an 8 MiB frame cap. Transaction-control frames, multi-frame chunk streaming, range scans, chunk batches, and multiplexing are not implemented. The Kotlin addon keeps JSONL/1 as its default connection path and now also offers opt-in `queryBinary`, `putChunkBinary`, `getChunkBinary`, and `deleteChunkBinary` methods with asynchronous variants. These methods currently use one frame per chunk operation and are limited to the 8 MiB frame ceiling; they do not yet stream a native 64 MiB chunk. See [Binary Protocol v1](BINARY_PROTOCOL.md).
 
 ## EF7 generic records and TTL
 
