@@ -54,7 +54,7 @@ The optional addon now exposes EF7 profile operations on its existing loopback J
 
 The bridge caps profile custom bytes and chunk payloads at 24 KiB because JSONL/1 hex-encodes binary data inside a 64 KiB line. The Kotlin service now exposes namespace create/get/find/list/delete and chunk put/get/delete. Namespace listing is capped at 64 items per request. Chunk reads check the persistent descriptor's recorded length before loading payload pages and reject payloads above the transport budget. The native Rust EF7 API continues to support records/chunks up to 64 MiB; larger chunk transport, chunk-range streaming, and atomic chunk batches remain pending until a bounded binary/framed protocol is added.
 
-The JSONL extension commands include `EF7 NS_CREATE/NS_GET/NS_FIND/NS_LIST/NS_DELETE`, `EF7 CHUNK_PUT/CHUNK_GET/CHUNK_DELETE`, and `EF7 PROFILE_PUT/PROFILE_GET/PROFILE_GET_NAME/PLAYER_DELETE/PROFILE_BATCH`. `PROFILE_BATCH` carries a namespace ID, upsert/removal counts, typed profile tuples, and removal tuples; the server validates the complete bounded request before calling the single-commit EF7 batch API. Responses are one JSON line. The client rejects embedded newlines, checks the 64 KiB request size, and uses hex encoding for binary custom data.
+The JSONL extension commands include `EF7 NS_CREATE/NS_GET/NS_FIND/NS_LIST/NS_DELETE`, `EF7 CHUNK_PUT/CHUNK_GET/CHUNK_DELETE`, `EF7 RECORD_PUT/RECORD_PUT_TTL/RECORD_GET/RECORD_DELETE/RECORD_SWEEP`, and `EF7 PROFILE_PUT/PROFILE_GET/PROFILE_GET_NAME/PLAYER_DELETE/PROFILE_BATCH`. `PROFILE_BATCH` carries a namespace ID, upsert/removal counts, typed profile tuples, and removal tuples; the server validates the complete bounded request before calling the single-commit EF7 batch API. Responses are one JSON line. The client rejects embedded newlines, checks the 64 KiB request size, and uses hex encoding for binary custom data.
 
 EF7 commands are rejected while a SQL transaction session is open. SQL WAL and EF7 sidecar commits are separate durability domains; the server does not claim a cross-domain atomic transaction. The bridge remains loopback-only, without TLS/authentication, and is not a JDBC driver.
 
@@ -164,3 +164,12 @@ The server keeps the legacy greeting and line protocol. A client opts into JSONL
 The protocol still accepts one SQL statement per line, has no parameter array, and has no transaction session spanning separate client connections. The current addon uses one connection per operation. Keep the database bound to loopback; TLS and authentication are not implemented.
 
 Build and installation instructions for the addon are in integrations/kotlin-script-loader/README.md.
+
+
+## Binary/1 server transport
+
+The Rust server now supports an opt-in `POSTEMBERDB BINARY/1` handshake after its legacy text greeting. It acknowledges with a framed Pong and then accepts 24-byte-header PDBF frames. The initial dispatcher supports ping/pong, one-statement SQL Query frames, and single-frame EF7 chunk put/get/delete with an 8 MiB frame cap. Transaction-control frames, multi-frame chunk streaming, range scans, chunk batches, and multiplexing are not implemented. The Kotlin addon still uses JSONL/1; it has not yet been switched to Binary/1. See [Binary Protocol v1](BINARY_PROTOCOL.md).
+
+## EF7 generic records and TTL
+
+EF7 generic records can now carry an optional absolute Unix-millisecond expiry. `put_record_with_expiry` updates the descriptor and ordered TTL index in one CoW publication; `sweep_expired_records(now_ms, limit)` removes at most 10,000 expired records per commit and reclaims payload extents after publication. The KSL JSONL bridge exposes record put/get/delete and explicit bounded sweeps, with a 24 KiB payload cap. See [EF7 Record TTL](EF7_TTL.md).
