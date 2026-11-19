@@ -720,6 +720,7 @@ fn format_result(result: QueryResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_bounded_line, validate_bind_address};
+    use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
     use postemberdb::{EmberForge7Store, QueryResult, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
@@ -890,6 +891,81 @@ mod tests {
         assert!(line.contains("namespace deleted"));
 
         writeln!(client, "QUIT").unwrap();
+        drop(client);
+        worker.join().unwrap();
+        for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
+            let mut sidecar = ef7_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+    }
+
+    #[test]
+    fn binary_protocol_handshake_query_and_chunk_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = Arc::new(Mutex::new(postemberdb::Database::new()));
+        let ef7_path = std::env::temp_dir().join(format!(
+            "postemberdb-binary-ef7-{}-{}.pbd", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            super::handle_client(stream, database, ef7).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let reader_stream = client.try_clone().unwrap();
+        let mut reader = BufReader::new(reader_stream);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).unwrap();
+        assert!(greeting.contains("PostemberDB/0.1 ready"));
+        writeln!(client, "POSTEMBERDB BINARY/1").unwrap();
+        let ready = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(ready.kind, FrameKind::Pong);
+        assert_eq!(ready.payload, b"postemberdb-binary/1-ready");
+
+        Frame::new(FrameKind::Ping, 1, b"ping".to_vec())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let pong = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(pong.kind, FrameKind::Pong);
+        assert_eq!(pong.request_id, 1);
+        assert_eq!(pong.payload, b"ping");
+
+        Frame::new(FrameKind::Query, 2, b"CREATE TABLE binary_test (id INTEGER)".to_vec())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let created = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(created.kind, FrameKind::QueryResult);
+        assert!(String::from_utf8(created.payload).unwrap().contains("\\"ok\\":true"));
+
+        let mut put = Vec::new();
+        put.extend_from_slice(&1u64.to_le_bytes());
+        put.extend_from_slice(&(-20i32).to_le_bytes());
+        put.extend_from_slice(&35i32.to_le_bytes());
+        put.extend_from_slice(&[0, 1, 0xff, 0x7f]);
+        Frame::new(FrameKind::ChunkPut, 3, put)
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let stored = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(stored.kind, FrameKind::QueryResult);
+
+        let mut get = Vec::new();
+        get.extend_from_slice(&1u64.to_le_bytes());
+        get.extend_from_slice(&(-20i32).to_le_bytes());
+        get.extend_from_slice(&35i32.to_le_bytes());
+        Frame::new(FrameKind::ChunkGet, 4, get.clone())
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let chunk = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(chunk.kind, FrameKind::ChunkData);
+        assert_eq!(&chunk.payload[..16], &get[..]);
+        assert_eq!(&chunk.payload[16..], &[0, 1, 0xff, 0x7f]);
+
+        Frame::new(FrameKind::ChunkDelete, 5, get)
+            .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
+        let deleted = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert_eq!(deleted.kind, FrameKind::QueryResult);
+        assert!(String::from_utf8(deleted.payload).unwrap().contains("\\"affected_rows\\":1"));
+
         drop(client);
         worker.join().unwrap();
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
