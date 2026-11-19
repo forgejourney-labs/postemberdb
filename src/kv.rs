@@ -1,6 +1,6 @@
 //! Standalone persistent key/value storage and a typed, registry-like hierarchy.
 
-use crate::storage::{cache::DEFAULT_PAGE_CACHE_CAPACITY, extent::ExtentFile, page_tree};
+use crate::storage::{cache::DEFAULT_PAGE_CACHE_CAPACITY, extent::ExtentFile, page_tree, participant::{self, PreparedBatch}};
 use crate::{DbError, PageCacheStats};
 use fs2::FileExt;
 use std::collections::BTreeSet;
@@ -22,6 +22,7 @@ pub struct KeyValueStore {
     store: ExtentFile,
     wal_path: PathBuf,
     _lock_file: File,
+    prepared_transactions: BTreeSet<u64>,
 }
 
 impl KeyValueStore {
@@ -57,7 +58,63 @@ impl KeyValueStore {
         let mut store = ExtentFile::open_with_cache_capacity(&pages_path, cache_capacity_pages)?;
         page_tree::recover(&mut store, &wal_path)?;
         page_tree::validate_tree(&mut store)?;
-        Ok(Self { store, wal_path, _lock_file: lock_file })
+        let prepared_transactions = participant::list_prepared(&wal_path)?;
+        Ok(Self { store, wal_path, _lock_file: lock_file, prepared_transactions })
+    }
+
+    /// Durably stages a bounded mutation batch for a coordinator transaction.
+    /// The batch is not visible until the coordinator has recorded COMMIT and
+    /// calls commit_prepared; the prepared marker survives process restart.
+    pub fn prepare_batch(
+        &mut self,
+        transaction_id: u64,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        if !self.prepared_transactions.is_empty() && !self.prepared_transactions.contains(&transaction_id) {
+            return Err(DbError::Storage("KV store has another unresolved prepared transaction".into()));
+        }
+        for key in removals { Self::validate_key(key)?; }
+        for (key, _) in upserts { Self::validate_key(key)?; }
+        let batch = PreparedBatch { removals: removals.to_vec(), upserts: upserts.to_vec() };
+        participant::write_prepared(&self.wal_path, transaction_id, &batch)?;
+        self.prepared_transactions.insert(transaction_id);
+        Ok(())
+    }
+
+    /// Applies a previously prepared batch. Safe to retry after a crash because
+    /// the underlying operations are deterministic upserts/removals.
+    pub fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        let batch = participant::read_prepared(&self.wal_path, transaction_id)?;
+        page_tree::apply_mutations(&mut self.store, &self.wal_path, &batch.removals, &batch.upserts)?;
+        Ok(())
+    }
+
+    /// Removes the prepared marker after the coordinator has durably recorded
+    /// this participant's APPLIED acknowledgement.
+    pub fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)?;
+        self.prepared_transactions.remove(&transaction_id);
+        Ok(())
+    }
+
+    /// Discards a prepared batch after the coordinator has durably recorded ABORT.
+    pub fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)?;
+        self.prepared_transactions.remove(&transaction_id);
+        Ok(())
+    }
+
+    pub fn pending_prepared_transactions(&self) -> Vec<u64> {
+        self.prepared_transactions.iter().copied().collect()
+    }
+
+    fn ensure_no_prepared_transactions(&self) -> Result<(), DbError> {
+        if self.prepared_transactions.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Storage("KV writes are blocked while a coordinator transaction is unresolved".into()))
+        }
     }
 
     /// Returns the cache occupancy and cumulative hit/miss/eviction counters.
@@ -91,6 +148,7 @@ impl KeyValueStore {
     /// Applies multiple inserts/replacements in one CoW publication.
     /// If a key occurs more than once, the last supplied value wins.
     pub fn put_many(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DbError> {
+        self.ensure_no_prepared_transactions()?;
         for (key, _) in entries {
             Self::validate_key(key)?;
         }
@@ -99,6 +157,7 @@ impl KeyValueStore {
 
     /// Removes one key. Returns false when it did not exist.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, DbError> {
+        self.ensure_no_prepared_transactions()?;
         Self::validate_key(key)?;
         let (removed, _) = page_tree::apply_mutations(
             &mut self.store,
@@ -115,6 +174,7 @@ impl KeyValueStore {
         removals: &[Vec<u8>],
         upserts: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(usize, usize), DbError> {
+        self.ensure_no_prepared_transactions()?;
         for key in removals {
             Self::validate_key(key)?;
         }
@@ -142,6 +202,7 @@ impl KeyValueStore {
     /// zero to drain a larger prefix without materializing the entire range.
     /// Each call is atomic, but a sequence of calls is not one global transaction.
     pub fn delete_prefix_bounded(&mut self, prefix: &[u8], max_items: usize) -> Result<usize, DbError> {
+        self.ensure_no_prepared_transactions()?;
         if prefix.len() > MAX_KEY_BYTES {
             return Err(DbError::Constraint("prefix cannot exceed 1024 bytes".into()));
         }
@@ -169,6 +230,7 @@ impl KeyValueStore {
     /// This convenience method may materialize the complete matching key set.
     /// Use `delete_prefix_bounded` when the prefix may contain a large range.
     pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<usize, DbError> {
+        self.ensure_no_prepared_transactions()?;
         let entries = self.scan_prefix(prefix, None)?;
         let removals = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
         let (removed, _) = page_tree::apply_mutations(&mut self.store, &self.wal_path, &removals, &[])?;
@@ -260,6 +322,54 @@ pub struct Registry {
 impl Registry {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Ok(Self { store: KeyValueStore::open(path)? })
+    }
+    pub fn pending_prepared_transactions(&self) -> Vec<u64> {
+        self.store.pending_prepared_transactions()
+    }
+
+    pub fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.commit_prepared(transaction_id)
+    }
+
+    pub fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.finalize_prepared(transaction_id)
+    }
+
+    pub fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        self.store.rollback_prepared(transaction_id)
+    }
+
+    /// Stages a registry value update for a coordinator transaction.
+    pub fn prepare_set_value(
+        &mut self,
+        transaction_id: u64,
+        path: &str,
+        name: &str,
+        value: RegistryValue,
+    ) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.prepare_batch(transaction_id, &[], &[(key, value.encode())])
+    }
+
+    /// Stages a registry value deletion for a coordinator transaction.
+    pub fn prepare_delete_value(
+        &mut self,
+        transaction_id: u64,
+        path: &str,
+        name: &str,
+    ) -> Result<(), DbError> {
+        let normalized = normalize_path(path)?;
+        if name.contains('\0') {
+            return Err(DbError::Constraint("registry value name cannot contain NUL".into()));
+        }
+        let mut key = value_record_prefix(&normalized);
+        key.extend_from_slice(name.to_lowercase().as_bytes());
+        self.store.prepare_batch(transaction_id, &[key], &[])
     }
 
     /// Creates a top-level hive, for example `SYSTEM` or `USERS`.
