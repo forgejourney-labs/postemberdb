@@ -472,7 +472,7 @@ fn validate_key(key: &[u8]) -> Result<(), DbError> {
         return Err(DbError::Constraint("PDB6 key must contain 1..=1024 bytes".into()));
     }
     let valid = match key[0] {
-        KEY_TABLE | KEY_COUNTERS => key.len() == 9,
+        KEY_TABLE | KEY_COUNTERS | super::pdb6::KEY_COORDINATOR => key.len() == 9,
         KEY_ROW => key.len() == 17,
         KEY_INDEX => key.len() >= 17,
         KEY_DATABASE_ROOT => key == [KEY_DATABASE_ROOT, 1],

@@ -16,6 +16,7 @@ pub(crate) const KEY_TABLE: u8 = 0x10;
 pub(crate) const KEY_ROW: u8 = 0x20;
 pub(crate) const KEY_INDEX: u8 = 0x30;
 pub(crate) const KEY_COUNTERS: u8 = 0x40;
+pub(crate) const KEY_COORDINATOR: u8 = 0x50;
 pub(crate) const KEY_DATABASE_ROOT: u8 = 0x7f;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,7 +410,5 @@ mod tests {
 /// Stable PDB6 key recording that a coordinator SQL participant transaction
 /// was published in the same root as its row/catalog/index mutations.
 pub(crate) fn coordinator_tx_key(transaction_id: u64) -> Vec<u8> {
-    let mut key = b"COORDINATOR/COMMIT/".to_vec();
-    key.extend_from_slice(&transaction_id.to_be_bytes());
-    key
+    prefixed_id(KEY_COORDINATOR, transaction_id)
 }
