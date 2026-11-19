@@ -96,7 +96,11 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username, delete, and atomic profile batches; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
 - [x] KSL JSONL/1 namespace administration: create/get/find/list/delete with parent-scoped hierarchy; bridge listing is capped at 64 entries per call.
 - [x] KSL JSONL/1 chunk CRUD with signed coordinates and a pre-read descriptor-size check; the bridge caps chunk payloads at 24 KiB.
-- [ ] Binary/framed KSL chunk streaming, bounded chunk-range scans, and atomic chunk batches; the JSONL line protocol is intentionally not used for large world payloads.
+- [x] KSL JSONL/1 generic record CRUD and explicit TTL record expiry/sweep methods; record payloads are capped at 24 KiB.
+- [x] Initial Binary/1 24-byte frame codec with version/kind/flags/request ID/length/CRC32, bounded 8 MiB frames, strict validation, and clean-EOF versus truncated-frame handling.
+- [x] Loopback server Binary/1 handshake, ping/pong, SQL statement frames, and single-frame EF7 chunk put/get/delete (8 MiB per-frame ceiling).
+- [ ] Multi-frame chunk streaming, aggregate in-flight byte budgets, backpressure, cancellation, range scans, atomic chunk batches, and Kotlin binary client.
+- [ ] Binary/1 transaction-control frames and cross-domain transaction coordination.
 - [ ] Build the addon against the installed KSL API and Paper dependencies; run end-to-end Paper/KSL integration tests.
 - [ ] JDBC driver and KSL SQL dialect/PreparedStatement support.
 - [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
@@ -108,7 +112,9 @@ EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent re
 - [x] Typed positional SQL parameters in the Rust API.
 - [x] Typed positional parameters inside transaction sessions.
 - [x] SQL LIMIT clause applied during index lookup and table scans.
-- [ ] TTL expiry index and explicitly budgeted expiration sweeps.
+- [x] EF7 generic-record TTL index ordered by expiry/namespace/record, atomic expiry rekeying, bounded 1..=10,000 cleanup batches, descriptor-limited reads, and post-publication extent reclamation.
+- [x] KSL JSONL/1 record put/get/delete and explicit TTL sweep methods with a 24 KiB payload cap.
+- [ ] TTL expiry index for SQL/KV/Registry and automatic scheduler integration.
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
 - [x] Versioned JSONL/1 request/response protocol with typed JSON values and legacy line-protocol compatibility.
