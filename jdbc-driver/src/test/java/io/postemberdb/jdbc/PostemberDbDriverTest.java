@@ -7,7 +7,7 @@ import java.util.TreeMap;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PostemberDbDriverTest {
-    @Test void acceptsOnlyPostemberDbUrls() {
+    @Test void acceptsOnlyPostemberDbUrls() throws Exception {
         Driver driver = new PostemberDbDriver();
         assertTrue(driver.acceptsURL("jdbc:postemberdb://127.0.0.1:7432"));
         assertFalse(driver.acceptsURL("jdbc:postgresql://127.0.0.1/test"));
