@@ -534,44 +534,30 @@ impl EmberForge7Store {
         Ok(true)
     }
 
-    /// Stores a player record and its UUID lookup entry in one B+ tree root
-    /// publication. A UUID already assigned to another record is rejected.
+
+    /// Stores raw plugin/player bytes and atomically maintains UUID + row identity.
     pub fn put_player(
+        &mut self, namespace_id: u64, row_id: u64, uuid: [u8; 16], payload: &[u8],
+    ) -> Result<(), DbError> {
+        self.put_player_with_identity(namespace_id, row_id, uuid, None, payload)
+    }
+
+    /// Stores a typed Minecraft profile and indexes it by UUID and normalized name.
+    pub fn put_player_profile(
         &mut self,
         namespace_id: u64,
         row_id: u64,
-        uuid: [u8; 16],
-        payload: &[u8],
+        profile: &EmberForge7PlayerProfile,
     ) -> Result<(), DbError> {
-        let row_key = record_key(namespace_id, row_id)?;
-        let lookup_key = uuid_key(namespace_id, &uuid)?;
-        if let Some(existing) = page_tree::get(&mut self.pages, &lookup_key)? {
-            if existing.len() != 8 {
-                return Err(DbError::Storage("malformed EF7 UUID index value".into()));
-            }
-            let existing_id = u64::from_be_bytes(existing[..8].try_into().unwrap());
-            if existing_id != row_id {
-                return Err(DbError::Constraint("player UUID is already assigned to another record".into()));
-            }
-        }
-        let old = self.pages_descriptor(&row_key)?;
-        let descriptor = self.write_payload(payload)?;
-        page_tree::apply_mutations(
-            &mut self.pages,
-            &self.wal_path,
-            &[],
-            &[(row_key, descriptor.encode()?), (lookup_key, row_id.to_be_bytes().to_vec())],
-        )?;
-        if let Some(previous) = old {
-            if previous.start_page != descriptor.start_page {
-                self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
-            }
-        }
-        Ok(())
+        let encoded = profile.encode()?;
+        self.put_player_with_identity(namespace_id, row_id, profile.uuid,
+            Some(&profile.username), &encoded)
     }
 
-    /// Resolves a Minecraft player UUID to its row ID and verifies the record.
-    pub fn get_player(&mut self, namespace_id: u64, uuid: [u8; 16]) -> Result<Option<(u64, Vec<u8>)>, DbError> {
+    /// UUID lookup verifies the player identity metadata before returning payload.
+    pub fn get_player(
+        &mut self, namespace_id: u64, uuid: [u8; 16],
+    ) -> Result<Option<(u64, Vec<u8>)>, DbError> {
         let lookup_key = uuid_key(namespace_id, &uuid)?;
         let Some(value) = page_tree::get(&mut self.pages, &lookup_key)? else { return Ok(None); };
         if value.len() != 8 {
@@ -581,56 +567,244 @@ impl EmberForge7Store {
         if row_id == 0 {
             return Err(DbError::Storage("EF7 UUID index contains reserved row ID zero".into()));
         }
+        let identity = self.player_identity_for_row(namespace_id, row_id)?
+            .ok_or_else(|| DbError::Storage("EF7 UUID index points to a row without player identity".into()))?;
+        if identity.uuid != uuid {
+            return Err(DbError::Storage("EF7 UUID index disagrees with row identity metadata".into()));
+        }
         let Some(payload) = self.get_record(namespace_id, row_id)? else {
             return Err(DbError::Storage("EF7 UUID index points to a missing player record".into()));
         };
         Ok(Some((row_id, payload)))
     }
 
-    /// Deletes a player row and UUID mapping in one root publication.
-    pub fn delete_player(&mut self, namespace_id: u64, row_id: u64, uuid: [u8; 16]) -> Result<bool, DbError> {
-        let row_key = record_key(namespace_id, row_id)?;
-        let lookup_key = uuid_key(namespace_id, &uuid)?;
-        let Some(descriptor) = self.pages_descriptor(&row_key)? else { return Ok(false); };
-        let lookup = page_tree::get(&mut self.pages, &lookup_key)?;
-        if let Some(value) = &lookup {
-            if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != row_id {
-                return Err(DbError::Constraint("UUID mapping does not belong to the requested player row".into()));
-            }
+    pub fn get_player_profile(
+        &mut self, namespace_id: u64, uuid: [u8; 16],
+    ) -> Result<Option<(u64, EmberForge7PlayerProfile)>, DbError> {
+        let Some((row_id, payload)) = self.get_player(namespace_id, uuid)? else { return Ok(None); };
+        let profile = EmberForge7PlayerProfile::decode(&payload)?;
+        if profile.uuid != uuid {
+            return Err(DbError::Storage("EF7 profile UUID does not match its index".into()));
         }
-        let removals = if lookup.is_some() { vec![row_key, lookup_key] } else { vec![row_key] };
+        let identity = self.player_identity_for_row(namespace_id, row_id)?
+            .ok_or_else(|| DbError::Storage("EF7 player profile identity is missing".into()))?;
+        if identity.username.as_deref() != Some(normalize_player_name(&profile.username)?.as_str()) {
+            return Err(DbError::Storage("EF7 profile username does not match its name index metadata".into()));
+        }
+        Ok(Some((row_id, profile)))
+    }
+
+    /// Case-insensitive name lookup; profile and identity checks guard stale indexes.
+    pub fn get_player_profile_by_name(
+        &mut self, namespace_id: u64, username: &str,
+    ) -> Result<Option<(u64, EmberForge7PlayerProfile)>, DbError> {
+        let normalized = normalize_player_name(username)?;
+        let key = player_name_key(namespace_id, &normalized)?;
+        let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(None); };
+        if value.len() != 8 {
+            return Err(DbError::Storage("malformed EF7 player-name index value".into()));
+        }
+        let row_id = u64::from_be_bytes(value[..8].try_into().unwrap());
+        let identity = self.player_identity_for_row(namespace_id, row_id)?
+            .ok_or_else(|| DbError::Storage("EF7 player-name index points to missing identity".into()))?;
+        if identity.username.as_deref() != Some(normalized.as_str()) {
+            return Err(DbError::Storage("EF7 player-name index disagrees with row identity".into()));
+        }
+        let payload = self.get_record(namespace_id, row_id)?
+            .ok_or_else(|| DbError::Storage("EF7 player-name index points to missing payload".into()))?;
+        let profile = EmberForge7PlayerProfile::decode(&payload)?;
+        if profile.uuid != identity.uuid || normalize_player_name(&profile.username)? != normalized {
+            return Err(DbError::Storage("EF7 profile disagrees with its player indexes".into()));
+        }
+        Ok(Some((row_id, profile)))
+    }
+
+    /// Deletes a player row, UUID mapping, optional name mapping and identity
+    /// metadata in one root publication.
+    pub fn delete_player(
+        &mut self, namespace_id: u64, row_id: u64, uuid: [u8; 16],
+    ) -> Result<bool, DbError> {
+        let row_key = record_key(namespace_id, row_id)?;
+        let Some(descriptor) = self.pages_descriptor(&row_key)? else { return Ok(false); };
+        let identity = self.player_identity_for_row(namespace_id, row_id)?
+            .ok_or_else(|| DbError::Storage("EF7 player record has no UUID identity".into()))?;
+        if identity.uuid != uuid {
+            return Err(DbError::Constraint("supplied UUID does not identify the requested player row".into()));
+        }
+        let lookup_key = uuid_key(namespace_id, &uuid)?;
+        let lookup = page_tree::get(&mut self.pages, &lookup_key)?
+            .ok_or_else(|| DbError::Storage("EF7 player identity has no UUID index entry".into()))?;
+        if lookup.len() != 8 || u64::from_be_bytes(lookup[..8].try_into().unwrap()) != row_id {
+            return Err(DbError::Storage("EF7 UUID mapping does not point to the requested row".into()));
+        }
+        let mut removals = vec![row_key, lookup_key];
+        let identity_key = player_identity_key(namespace_id, row_id)?;
+        if page_tree::get(&mut self.pages, &identity_key)?.is_some() {
+            removals.push(identity_key);
+        }
+        if let Some(name) = identity.username {
+            removals.push(player_name_key(namespace_id, &name)?);
+        }
         let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
         if removed != removals.len() {
-            return Err(DbError::Storage("EF7 player deletion did not remove the expected keys".into()));
+            return Err(DbError::Storage("EF7 player deletion did not remove all identity keys".into()));
         }
         self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
         Ok(true)
     }
 
+    fn put_player_with_identity(
+        &mut self,
+        namespace_id: u64,
+        row_id: u64,
+        uuid: [u8; 16],
+        username: Option<&str>,
+        payload: &[u8],
+    ) -> Result<(), DbError> {
+        if payload.len() > MAX_RECORD_BYTES {
+            return Err(DbError::Constraint("EF7 player record exceeds 64 MiB".into()));
+        }
+        let canonical_name = username.map(normalize_player_name).transpose()?;
+        let row_key = record_key(namespace_id, row_id)?;
+        let lookup_key = uuid_key(namespace_id, &uuid)?;
+        let identity_key = player_identity_key(namespace_id, row_id)?;
+        let name_key = canonical_name.as_deref()
+            .map(|name| player_name_key(namespace_id, name)).transpose()?;
+        let previous_descriptor = self.pages_descriptor(&row_key)?;
+        let previous_identity = self.player_identity_for_row(namespace_id, row_id)?;
 
-    /// Applies player upserts and removals through one CoW-tree commit.
-    /// New payload pages are durable before root publication; old extents are
-    /// released only after the new root is durable.
+        if previous_descriptor.is_some() && previous_identity.is_none() {
+            return Err(DbError::Constraint("EF7 row ID is already used by a non-player record".into()));
+        }
+        if let Some(value) = page_tree::get(&mut self.pages, &lookup_key)? {
+            if value.len() != 8 {
+                return Err(DbError::Storage("malformed EF7 UUID index value".into()));
+            }
+            if u64::from_be_bytes(value[..8].try_into().unwrap()) != row_id {
+                return Err(DbError::Constraint("player UUID is already assigned to another record".into()));
+            }
+        }
+        if let Some(key) = &name_key {
+            if let Some(value) = page_tree::get(&mut self.pages, key)? {
+                if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != row_id {
+                    return Err(DbError::Constraint("Minecraft player name is already assigned in this namespace".into()));
+                }
+            }
+        }
+
+        let next_identity = PlayerIdentity { uuid, username: canonical_name.clone() };
+        let mut removals = Vec::with_capacity(2);
+        if let Some(previous) = &previous_identity {
+            if previous.uuid != uuid {
+                let old_key = uuid_key(namespace_id, &previous.uuid)?;
+                let old_value = page_tree::get(&mut self.pages, &old_key)?
+                    .ok_or_else(|| DbError::Storage("previous EF7 player UUID index is missing".into()))?;
+                if old_value.len() != 8 || u64::from_be_bytes(old_value[..8].try_into().unwrap()) != row_id {
+                    return Err(DbError::Storage("previous EF7 player UUID index is inconsistent".into()));
+                }
+                removals.push(old_key);
+            }
+            if previous.username != canonical_name {
+                if let Some(old_name) = &previous.username {
+                    let old_key = player_name_key(namespace_id, old_name)?;
+                    let old_value = page_tree::get(&mut self.pages, &old_key)?
+                        .ok_or_else(|| DbError::Storage("previous EF7 player-name index is missing".into()))?;
+                    if old_value.len() != 8 || u64::from_be_bytes(old_value[..8].try_into().unwrap()) != row_id {
+                        return Err(DbError::Storage("previous EF7 player-name index is inconsistent".into()));
+                    }
+                    removals.push(old_key);
+                }
+            }
+        }
+
+        let next_descriptor = self.write_payload(payload)?;
+        let mut upserts = vec![
+            (row_key, next_descriptor.encode()?),
+            (lookup_key, row_id.to_be_bytes().to_vec()),
+            (identity_key, next_identity.encode()?),
+        ];
+        if let Some(key) = name_key {
+            upserts.push((key, row_id.to_be_bytes().to_vec()));
+        }
+        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)?;
+        if let Some(previous) = previous_descriptor {
+            if previous.start_page != next_descriptor.start_page {
+                self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the identity sidecar. If an older EF7 file predates row metadata,
+    /// the method performs a bounded one-time reverse UUID scan for compatibility.
+    fn player_identity_for_row(
+        &mut self, namespace_id: u64, row_id: u64,
+    ) -> Result<Option<PlayerIdentity>, DbError> {
+        let key = player_identity_key(namespace_id, row_id)?;
+        if let Some(value) = page_tree::get(&mut self.pages, &key)? {
+            return PlayerIdentity::decode(&value).map(Some);
+        }
+        if self.pages_descriptor(&record_key(namespace_id, row_id)?)?.is_none() {
+            return Ok(None);
+        }
+        let mut prefix = vec![KEY_PLAYER_UUID];
+        prefix.extend_from_slice(&namespace_id.to_be_bytes());
+        let entries = page_tree::scan_range_limited(
+            &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(100_001),
+        )?;
+        if entries.len() > 100_000 {
+            return Err(DbError::Constraint("legacy EF7 UUID reverse lookup exceeded 100,000 entries; run the EF7 identity migration".into()));
+        }
+        let mut found = None;
+        for (_, value) in entries {
+            if value.len() != 8 {
+                return Err(DbError::Storage("malformed legacy EF7 UUID index value".into()));
+            }
+            if u64::from_be_bytes(value[..8].try_into().unwrap()) == row_id {
+                // The UUID is encoded in the key after its type and namespace.
+                // The caller's scan result key is retained below in the migration branch.
+            }
+        }
+        let entries = page_tree::scan_range_limited(
+            &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(100_001),
+        )?;
+        for (key, value) in entries {
+            if value.len() != 8 {
+                return Err(DbError::Storage("malformed legacy EF7 UUID index value".into()));
+            }
+            if u64::from_be_bytes(value[..8].try_into().unwrap()) == row_id {
+                if key.len() != 25 {
+                    return Err(DbError::Storage("malformed legacy EF7 UUID index key".into()));
+                }
+                if found.is_some() {
+                    return Err(DbError::Storage("legacy EF7 row has multiple UUID index entries".into()));
+                }
+                found = Some(PlayerIdentity { uuid: key[9..25].try_into().unwrap(), username: None });
+            }
+        }
+        Ok(found)
+    }
+
+    /// Applies a bounded player batch using a single CoW redo record/root publication.
     pub fn apply_player_batch(
         &mut self,
         upserts: &[(u64, u64, [u8; 16], Vec<u8>)],
         removals: &[(u64, u64, [u8; 16])],
     ) -> Result<(usize, usize), DbError> {
-        if upserts.is_empty() && removals.is_empty() {
-            return Ok((0, 0));
-        }
+        if upserts.is_empty() && removals.is_empty() { return Ok((0, 0)); }
         const MAX_BATCH_PLAYERS: usize = 2_500;
         const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
         if upserts.len().saturating_add(removals.len()) > MAX_BATCH_PLAYERS {
             return Err(DbError::Constraint(format!("EF7 player batch exceeds {MAX_BATCH_PLAYERS} operations")));
         }
+
         let mut upsert_rows = BTreeSet::new();
         let mut upsert_uuids = BTreeSet::new();
         let mut total_bytes = 0usize;
         for (namespace_id, row_id, uuid, payload) in upserts {
-            let row_key = record_key(*namespace_id, *row_id)?;
-            let lookup_key = uuid_key(*namespace_id, uuid)?;
-            if !upsert_rows.insert(row_key) || !upsert_uuids.insert(lookup_key) {
+            let row = record_key(*namespace_id, *row_id)?;
+            let lookup = uuid_key(*namespace_id, uuid)?;
+            if !upsert_rows.insert(row) || !upsert_uuids.insert(lookup) {
                 return Err(DbError::Constraint("EF7 batch contains duplicate player row IDs or UUIDs".into()));
             }
             if payload.len() > MAX_RECORD_BYTES {
@@ -642,48 +816,96 @@ impl EmberForge7Store {
                 return Err(DbError::Constraint("EF7 batch exceeds 256 MiB of payload data".into()));
             }
         }
+
         let mut removal_rows = BTreeSet::new();
         let mut removal_uuids = BTreeSet::new();
-        let mut removal_keys = Vec::with_capacity(removals.len() * 2);
+        let mut removal_keys = Vec::with_capacity(removals.len() * 3);
         let mut removed_extents = Vec::with_capacity(removals.len());
         for (namespace_id, row_id, uuid) in removals {
             let row_key = record_key(*namespace_id, *row_id)?;
             let lookup_key = uuid_key(*namespace_id, uuid)?;
             if !removal_rows.insert(row_key.clone()) || !removal_uuids.insert(lookup_key.clone())
-                || upsert_rows.contains(&row_key) || upsert_uuids.contains(&lookup_key)
-            {
+                || upsert_rows.contains(&row_key) || upsert_uuids.contains(&lookup_key) {
                 return Err(DbError::Constraint("EF7 batch contains duplicate or overlapping player operations".into()));
             }
-            if let Some(descriptor) = self.pages_descriptor(&row_key)? {
-                removed_extents.push(descriptor);
-                removal_keys.push(row_key);
+            let Some(descriptor) = self.pages_descriptor(&row_key)? else {
                 if let Some(value) = page_tree::get(&mut self.pages, &lookup_key)? {
-                    if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != *row_id {
-                        return Err(DbError::Constraint("EF7 UUID mapping belongs to a different player row".into()));
+                    if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) == *row_id {
+                        return Err(DbError::Storage("EF7 UUID index references a missing player record".into()));
                     }
-                    removal_keys.push(lookup_key);
                 }
+                continue;
+            };
+            let identity = self.player_identity_for_row(*namespace_id, *row_id)?
+                .ok_or_else(|| DbError::Storage("EF7 player row has no identity metadata".into()))?;
+            if identity.uuid != *uuid {
+                return Err(DbError::Constraint("EF7 batch removal UUID does not match row identity".into()));
+            }
+            let value = page_tree::get(&mut self.pages, &lookup_key)?
+                .ok_or_else(|| DbError::Storage("EF7 player UUID index is missing".into()))?;
+            if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != *row_id {
+                return Err(DbError::Storage("EF7 player UUID mapping is inconsistent".into()));
+            }
+            removed_extents.push(descriptor);
+            removal_keys.push(row_key);
+            removal_keys.push(lookup_key);
+            let identity_key = player_identity_key(*namespace_id, *row_id)?;
+            if page_tree::get(&mut self.pages, &identity_key)?.is_some() {
+                removal_keys.push(identity_key);
+            }
+            if let Some(name) = identity.username {
+                removal_keys.push(player_name_key(*namespace_id, &name)?);
             }
         }
-        let mut upsert_entries = Vec::with_capacity(upserts.len() * 2);
+
+        let mut upsert_entries = Vec::with_capacity(upserts.len() * 3);
         let mut replaced_extents = Vec::with_capacity(upserts.len());
         for (namespace_id, row_id, uuid, payload) in upserts {
             let row_key = record_key(*namespace_id, *row_id)?;
             let lookup_key = uuid_key(*namespace_id, uuid)?;
+            let identity_key = player_identity_key(*namespace_id, *row_id)?;
             if let Some(value) = page_tree::get(&mut self.pages, &lookup_key)? {
-                if value.len() != 8 {
-                    return Err(DbError::Storage("malformed EF7 UUID index value".into()));
-                }
-                if u64::from_be_bytes(value[..8].try_into().unwrap()) != *row_id {
+                if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != *row_id {
                     return Err(DbError::Constraint("player UUID is already assigned to another record".into()));
                 }
             }
             let previous = self.pages_descriptor(&row_key)?;
+            let old_identity = self.player_identity_for_row(*namespace_id, *row_id)?;
+            if previous.is_some() && old_identity.is_none() {
+                return Err(DbError::Constraint("EF7 row ID is already used by a non-player record".into()));
+            }
+            if let Some(old) = &old_identity {
+                if old.uuid != *uuid {
+                    let old_key = uuid_key(*namespace_id, &old.uuid)?;
+                    let old_value = page_tree::get(&mut self.pages, &old_key)?
+                        .ok_or_else(|| DbError::Storage("previous EF7 player UUID index is missing".into()))?;
+                    if old_value.len() != 8 || u64::from_be_bytes(old_value[..8].try_into().unwrap()) != *row_id {
+                        return Err(DbError::Storage("previous EF7 player UUID index is inconsistent".into()));
+                    }
+                    removal_keys.push(old_key);
+                }
+                if let Some(name) = &old.username {
+                    removal_keys.push(player_name_key(*namespace_id, name)?);
+                }
+            }
             let next = self.write_payload(payload)?;
             upsert_entries.push((row_key, next.encode()?));
             upsert_entries.push((lookup_key, row_id.to_be_bytes().to_vec()));
+            upsert_entries.push((identity_key, PlayerIdentity { uuid: *uuid, username: None }.encode()?));
             replaced_extents.push((previous, next));
         }
+
+        let mut unique_removals = BTreeSet::new();
+        for key in &removal_keys {
+            if !unique_removals.insert(key.clone()) {
+                return Err(DbError::Constraint("EF7 batch produced duplicate index removals".into()));
+            }
+        }
+        let upsert_key_set = upsert_entries.iter().map(|(key, _)| key.clone()).collect::<BTreeSet<_>>();
+        if removal_keys.iter().any(|key| upsert_key_set.contains(key)) {
+            return Err(DbError::Constraint("EF7 batch attempts to remove and replace the same index key".into()));
+        }
+
         let counts = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removal_keys, &upsert_entries)?;
         for descriptor in removed_extents {
             self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
