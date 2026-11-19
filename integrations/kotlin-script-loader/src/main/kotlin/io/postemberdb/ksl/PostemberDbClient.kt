@@ -111,7 +111,7 @@ class PostemberDbClient internal constructor(
         rowId: Long,
         profile: PostemberPlayerProfile
     ): CompletableFuture<Unit> =
-        CompletableFuture.runAsync({ putPlayerProfile(namespaceId, rowId, profile) }, executor)
+        CompletableFuture.supplyAsync({ putPlayerProfile(namespaceId, rowId, profile); Unit }, executor)
 
     fun getPlayerProfile(
         namespaceId: Long,
@@ -226,6 +226,9 @@ class PostemberDbClient internal constructor(
         val profile = element.jsonObject
         val uuidHex = profile["uuid"]?.jsonPrimitive?.content
             ?: throw PostemberDbException("EF7 response omitted player UUID")
+        if (uuidHex.length != 32 || uuidHex.any { it !in "0123456789abcdefABCDEF" }) {
+            throw PostemberDbException("EF7 response contains an invalid player UUID")
+        }
         val uuid = UUID.fromString(
             uuidHex.substring(0, 8) + "-" + uuidHex.substring(8, 12) + "-" +
                 uuidHex.substring(12, 16) + "-" + uuidHex.substring(16, 20) + "-" + uuidHex.substring(20)
@@ -239,9 +242,9 @@ class PostemberDbClient internal constructor(
             profile = PostemberPlayerProfile(
                 uuid = uuid,
                 username = username,
-                firstJoinedMs = profile["first_joined_ms"]?.jsonPrimitive?.longOrNull ?: 0L,
-                lastSeenMs = profile["last_seen_ms"]?.jsonPrimitive?.longOrNull ?: 0L,
-                playtimeTicks = profile["playtime_ticks"]?.jsonPrimitive?.longOrNull ?: 0L,
+                firstJoinedMs = profile["first_joined_ms"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted first_joined_ms"),
+                lastSeenMs = profile["last_seen_ms"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted last_seen_ms"),
+                playtimeTicks = profile["playtime_ticks"]?.jsonPrimitive?.longOrNull ?: throw PostemberDbException("EF7 response omitted playtime_ticks"),
                 customData = customHex.decodeHex()
             )
         )
