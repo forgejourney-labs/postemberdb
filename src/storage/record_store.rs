@@ -138,10 +138,29 @@ impl RecordStore {
     /// aggregate batch budget are checked before any page is allocated. Every
     /// data extent is synced before the descriptor batch is published; a crash
     /// before publication can leak unreachable extents but cannot expose a
-    /// partial batch.
+    /// partial descriptor update.
     pub fn put_many<I>(&mut self, records: I) -> Result<usize, DbError>
     where
         I: IntoIterator<Item = (u64, Vec<u8>)>,
+    {
+        self.apply_batch(records, std::iter::empty::<u64>())
+            .map(|(inserted, _)| inserted)
+    }
+
+    /// Applies record upserts and deletions with one descriptor-tree WAL frame
+    /// and one atomic root publication. Upserts win when an ID is in both sets.
+    ///
+    /// Data pages are written and synced before the descriptor root is
+    /// published. A crash before publication may leave unreachable extents,
+    /// but readers never observe only part of the descriptor mutation batch.
+    pub fn apply_batch<U, D>(
+        &mut self,
+        records: U,
+        record_ids_to_delete: D,
+    ) -> Result<(usize, usize), DbError>
+    where
+        U: IntoIterator<Item = (u64, Vec<u8>)>,
+        D: IntoIterator<Item = u64>,
     {
         let batch = records.into_iter().take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
         if batch.len() > MAX_BATCH_RECORDS {
@@ -149,8 +168,12 @@ impl RecordStore {
                 "record batch exceeds the maximum of {MAX_BATCH_RECORDS} records"
             )));
         }
-        if batch.is_empty() {
-            return Ok(0);
+        let deletions = record_ids_to_delete.into_iter()
+            .take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
+        if deletions.len() > MAX_BATCH_RECORDS {
+            return Err(DbError::Constraint(format!(
+                "record delete batch exceeds the maximum of {MAX_BATCH_RECORDS} IDs"
+            )));
         }
 
         let mut unique = BTreeMap::<u64, Vec<u8>>::new();
@@ -163,7 +186,6 @@ impl RecordStore {
             }
             unique.insert(record_id, bytes);
         }
-
         let total_batch_bytes = unique.values().try_fold(0usize, |total, bytes| {
             total.checked_add(bytes.len())
                 .ok_or_else(|| DbError::Constraint("record batch byte count overflow".into()))
@@ -172,6 +194,12 @@ impl RecordStore {
             return Err(DbError::Constraint(format!(
                 "record batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
             )));
+        }
+
+        let mut delete_ids = BTreeSet::new();
+        for record_id in deletions {
+            Self::validate_record_id(record_id)?;
+            delete_ids.insert(record_id);
         }
 
         let mut descriptors = Vec::with_capacity(unique.len());
@@ -186,7 +214,6 @@ impl RecordStore {
                 let start = page_index * RECORD_CHUNK_BYTES;
                 let end = bytes.len().min(start + RECORD_CHUNK_BYTES);
                 let chunk = &bytes[start..end];
-
                 let mut payload = Vec::with_capacity(RECORD_PAGE_HEADER_BYTES + chunk.len());
                 payload.extend_from_slice(RECORD_PAGE_MAGIC);
                 payload.extend_from_slice(&record_id.to_le_bytes());
@@ -198,7 +225,6 @@ impl RecordStore {
                 payload.extend_from_slice(chunk);
                 self.store.write_page(first_page_id + page_index as u64, &payload)?;
             }
-
             let descriptor = RecordDescriptor {
                 first_page_id,
                 page_count: page_count as u32,
@@ -208,8 +234,14 @@ impl RecordStore {
             descriptors.push((Self::record_key(*record_id), descriptor.encode().to_vec()));
         }
 
-        page_tree::insert_many(&mut self.store, &self.wal_path, &descriptors)?;
-        Ok(unique.len())
+        let removals = delete_ids.into_iter().map(Self::record_key).collect::<Vec<_>>();
+        let (removed, inserted) = page_tree::apply_mutations(
+            &mut self.store,
+            &self.wal_path,
+            &removals,
+            &descriptors,
+        )?;
+        Ok((inserted, removed))
     }
 
     /// Reads and validates a complete record. Missing IDs return None.
@@ -272,19 +304,10 @@ impl RecordStore {
     where
         I: IntoIterator<Item = u64>,
     {
-        let batch = record_ids.into_iter().take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
-        if batch.len() > MAX_BATCH_RECORDS {
-            return Err(DbError::Constraint(format!(
-                "record delete batch exceeds the maximum of {MAX_BATCH_RECORDS} IDs"
-            )));
-        }
-        let mut unique = BTreeSet::new();
-        for record_id in batch {
-            Self::validate_record_id(record_id)?;
-            unique.insert(record_id);
-        }
-        let keys = unique.into_iter().map(Self::record_key).collect::<Vec<_>>();
-        page_tree::remove_many(&mut self.store, &self.wal_path, &keys)
+        self.apply_batch(
+            std::iter::empty::<(u64, Vec<u8>)>(),
+            record_ids,
+        ).map(|(_, removed)| removed)
     }
 
     /// Checks whether a record descriptor exists.
