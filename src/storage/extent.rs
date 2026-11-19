@@ -799,6 +799,68 @@ mod tests {
     }
 
     #[test]
+    fn page_cache_serves_hits_and_evicts_least_recently_used_pages() {
+        let path = temp_path();
+        let mut store = ExtentFile::open_with_cache_capacity(&path, 0).unwrap();
+        let first = store.allocate_page(b"first").unwrap();
+        let second = store.allocate_page(b"second").unwrap();
+        let third = store.allocate_page(b"third").unwrap();
+
+        store.set_page_cache_capacity(2).unwrap();
+        assert_eq!(store.read_page(first).unwrap(), b"first");
+        assert_eq!(store.read_page(first).unwrap(), b"first");
+        assert_eq!(store.read_page(second).unwrap(), b"second");
+        assert_eq!(store.read_page(first).unwrap(), b"first");
+        assert_eq!(store.read_page(third).unwrap(), b"third");
+        assert_eq!(store.read_page(second).unwrap(), b"second");
+
+        let stats = store.page_cache_stats();
+        assert_eq!(stats.capacity_pages, 2);
+        assert_eq!(stats.resident_pages, 2);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.evictions, 2);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn page_cache_is_updated_after_writes_and_invalidated_when_pages_are_released() {
+        let path = temp_path();
+        let mut store = ExtentFile::open_with_cache_capacity(&path, 2).unwrap();
+        let page_id = store.allocate_page(b"before").unwrap();
+        assert_eq!(store.read_page(page_id).unwrap(), b"before");
+        store.write_page(page_id, b"after").unwrap();
+        assert_eq!(store.read_page(page_id).unwrap(), b"after");
+
+        store.release_extent(page_id, 1).unwrap();
+        assert_eq!(store.page_cache_stats().resident_pages, 0);
+        let reused = store.allocate_page(b"reused").unwrap();
+        assert_eq!(reused, page_id);
+        assert_eq!(store.read_page(reused).unwrap(), b"reused");
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn page_cache_capacity_is_bounded_and_zero_disables_residency() {
+        let path = temp_path();
+        assert!(ExtentFile::open_with_cache_capacity(&path, 65_537).is_err());
+
+        let mut store = ExtentFile::open_with_cache_capacity(&path, 0).unwrap();
+        let page_id = store.allocate_page(b"uncached").unwrap();
+        assert_eq!(store.read_page(page_id).unwrap(), b"uncached");
+        assert_eq!(store.read_page(page_id).unwrap(), b"uncached");
+        let stats = store.page_cache_stats();
+        assert_eq!(stats.capacity_pages, 0);
+        assert_eq!(stats.resident_pages, 0);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn checksums_reject_corrupt_page_payloads() {
         let path = temp_path();
         let mut store = ExtentFile::open(&path).unwrap();
