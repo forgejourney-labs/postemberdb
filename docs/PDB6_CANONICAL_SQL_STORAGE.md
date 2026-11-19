@@ -2,7 +2,26 @@
 
 ## Status
 
-Design contract for the next storage generation. This is not a claim that PDB6 is implemented. The current PDB5 snapshot plus SQL statement WAL remains authoritative, and SqlRowStore remains an independent page-backed prototype.
+Design contract for the next storage generation. This is not a claim that PDB6 is implemented. The current PDB5 snapshot plus SQL statement WAL remains authoritative. The PDB6 shared tree now has a bounded overflow-row payload primitive, but Database SQL execution has not yet been migrated to it.
+
+## Implemented PDB6 row-payload primitive
+
+The shared PDB6 store now supports versioned P6R1 row pages and P6D1 row descriptors
+under the existing table/row keyspace. A row may span multiple checksummed 4 KiB
+extent pages up to 64 MiB. Batches are bounded to 5,000 logical mutations and
+256 MiB of aggregate row/logical data.
+
+Row payload pages are allocated and synced before their descriptors become
+reachable. The row descriptors can then be published in the same copy-on-write
+root update as catalog and index key mutations. A crash before publication can
+leave unreachable pages, but cannot expose only part of the logical mutation.
+Reads validate page identity, sequence, lengths, and whole-row checksum. Row IDs
+can be scanned in bounded keyset pages.
+
+This is **not yet the live SQL row store**. Database still loads PDB5 rows into
+memory and commits through the PDB5 SQL WAL. PDB6 row payload pages are not yet
+automatically enlisted in Database transactions, and replaced/deleted extents
+remain allocated until vacuum is implemented.
 
 ## Non-negotiable invariants
 
@@ -51,8 +70,9 @@ PDB5 migration must use a side-by-side target file or a new versioned sidecar, p
 
 ## Implementation gates
 
-- [ ] Binary catalog/schema codec and corruption tests.
-- [ ] Shared keyspace and root-manifest codec.
+- [x] Binary catalog/schema codec and corruption tests.
+- [x] Shared keyspace and root-manifest codec.
+- [x] Bounded overflow row payload pages and descriptors with checksum validation and shared-root batch publication.
 - [ ] Transaction redo format and crash-point fault injection.
 - [ ] Atomic multi-table root publication and recovery.
 - [ ] PDB5 read-only compatibility and restartable migration.

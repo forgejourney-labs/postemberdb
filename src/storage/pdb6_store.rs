@@ -14,6 +14,57 @@ use std::path::{Path, PathBuf};
 const MAX_MUTATIONS: usize = 5_000;
 const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 1024;
+const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ROW_BATCH_BYTES: usize = 256 * 1024 * 1024;
+const ROW_PAGE_MAGIC: &[u8; 4] = b"P6R1";
+const ROW_DESCRIPTOR_MAGIC: &[u8; 4] = b"P6D1";
+const ROW_PAGE_HEADER_BYTES: usize = 48;
+const ROW_CHUNK_BYTES: usize = extent::page_payload_size() - ROW_PAGE_HEADER_BYTES;
+const MAX_ROW_PAGES: usize = (MAX_ROW_BYTES + ROW_CHUNK_BYTES - 1) / ROW_CHUNK_BYTES;
+
+#[derive(Debug, Clone, Copy)]
+struct RowPayloadDescriptor {
+    first_page_id: u64,
+    page_count: u32,
+    total_len: u64,
+    checksum: u64,
+}
+
+impl RowPayloadDescriptor {
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(ROW_DESCRIPTOR_MAGIC);
+        bytes.extend_from_slice(&self.first_page_id.to_le_bytes());
+        bytes.extend_from_slice(&self.page_count.to_le_bytes());
+        bytes.extend_from_slice(&self.total_len.to_le_bytes());
+        bytes.extend_from_slice(&self.checksum.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() != 32 || &bytes[..4] != ROW_DESCRIPTOR_MAGIC {
+            return Err(DbError::Storage("invalid PDB6 row payload descriptor".into()));
+        }
+        let descriptor = Self {
+            first_page_id: u64::from_le_bytes(bytes[4..12].try_into().unwrap()),
+            page_count: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            total_len: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            checksum: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        };
+        let total_len = usize::try_from(descriptor.total_len)
+            .map_err(|_| DbError::Storage("PDB6 row length does not fit this platform".into()))?;
+        let expected_pages = total_len.max(1).div_ceil(ROW_CHUNK_BYTES);
+        if total_len > MAX_ROW_BYTES
+            || descriptor.page_count == 0
+            || descriptor.page_count as usize != expected_pages
+            || descriptor.page_count as usize > MAX_ROW_PAGES
+            || descriptor.first_page_id.checked_add(u64::from(descriptor.page_count)).is_none()
+        {
+            return Err(DbError::Storage("invalid PDB6 row payload extent".into()));
+        }
+        Ok(descriptor)
+    }
+}
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
@@ -93,6 +144,216 @@ impl Pdb6Store {
         let upserts = unique_upserts.into_iter().collect::<Vec<_>>();
         let removals = unique_removals.into_iter().collect::<Vec<_>>();
         page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)
+    }
+
+    /// Applies row payloads and other logical mutations through one PDB6 root.
+    ///
+    /// Row overflow pages are written and synced first. Their descriptors, catalog
+    /// changes, and index mutations are then published together by one CoW root.
+    /// A crash before publication can leave unreachable row pages, but cannot
+    /// expose a partial logical transaction. Old payload pages are reclaimed by
+    /// the future reachability-aware vacuum.
+    pub(crate) fn apply_row_batch<U, I, R>(
+        &mut self,
+        rows: U,
+        other_upserts: I,
+        other_removals: R,
+    ) -> Result<(usize, usize), DbError>
+    where
+        U: IntoIterator<Item = (u64, u64, Vec<u8>)>,
+        I: IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        R: IntoIterator<Item = Vec<u8>>,
+    {
+        let mut unique_rows = BTreeMap::<(u64, u64), Vec<u8>>::new();
+        for (table_id, row_id, payload) in rows {
+            let _ = crate::storage::pdb6::row_key(table_id, row_id)?;
+            if payload.len() > MAX_ROW_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "PDB6 SQL row exceeds the {MAX_ROW_BYTES}-byte limit"
+                )));
+            }
+            unique_rows.insert((table_id, row_id), payload);
+            if unique_rows.len() > MAX_MUTATIONS {
+                return Err(DbError::Constraint(format!(
+                    "PDB6 row batch exceeds {MAX_MUTATIONS} rows"
+                )));
+            }
+        }
+
+        let mut unique_upserts = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        for (key, value) in other_upserts {
+            validate_key(&key)?;
+            if value.len() > extent::page_payload_size() {
+                return Err(DbError::Constraint("PDB6 inline value exceeds one page; use overflow records".into()));
+            }
+            unique_upserts.insert(key, value);
+        }
+        let mut unique_removals = BTreeSet::new();
+        for key in other_removals {
+            validate_key(&key)?;
+            unique_removals.insert(key);
+        }
+
+        let row_keys = unique_rows.keys()
+            .map(|(table_id, row_id)| crate::storage::pdb6::row_key(*table_id, *row_id))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if row_keys.iter().any(|key| unique_upserts.contains_key(key)) {
+            return Err(DbError::Constraint("PDB6 row key overlaps another batch upsert".into()));
+        }
+        for key in unique_upserts.keys().chain(row_keys.iter()) {
+            unique_removals.remove(key);
+        }
+
+        let mutation_count = row_keys.len() + unique_upserts.len() + unique_removals.len();
+        if mutation_count > MAX_MUTATIONS {
+            return Err(DbError::Constraint(format!(
+                "PDB6 row transaction exceeds {MAX_MUTATIONS} total mutations"
+            )));
+        }
+        let row_bytes = unique_rows.values().try_fold(0usize, |total, payload| {
+            total.checked_add(payload.len())
+                .ok_or_else(|| DbError::Constraint("PDB6 row batch byte count overflow".into()))
+        })?;
+        let logical_bytes = unique_upserts.iter().try_fold(row_bytes, |total, (key, value)| {
+            total.checked_add(key.len()).and_then(|n| n.checked_add(value.len()))
+                .ok_or_else(|| DbError::Constraint("PDB6 row transaction byte count overflow".into()))
+        })?;
+        let logical_bytes = unique_removals.iter().try_fold(logical_bytes, |total, key| {
+            total.checked_add(key.len())
+                .ok_or_else(|| DbError::Constraint("PDB6 row transaction byte count overflow".into()))
+        })?;
+        let logical_bytes = row_keys.iter().try_fold(logical_bytes, |total, key| {
+            total.checked_add(key.len())
+                .ok_or_else(|| DbError::Constraint("PDB6 row transaction byte count overflow".into()))
+        })?;
+        if logical_bytes > MAX_ROW_BATCH_BYTES {
+            return Err(DbError::Constraint(format!(
+                "PDB6 row transaction exceeds the {MAX_ROW_BATCH_BYTES}-byte aggregate limit"
+            )));
+        }
+
+        // Payload pages are durable before their descriptors become reachable.
+        let mut row_upserts = Vec::with_capacity(row_keys.len());
+        for ((table_id, row_id), payload) in unique_rows {
+            let key = crate::storage::pdb6::row_key(table_id, row_id)?;
+            let descriptor = self.write_row_payload(table_id, row_id, &payload)?;
+            row_upserts.push((key, descriptor));
+        }
+        let upserts = unique_upserts.into_iter().chain(row_upserts).collect::<Vec<_>>();
+        let removals = unique_removals.into_iter().collect::<Vec<_>>();
+        self.apply_batch(upserts, removals)
+    }
+
+    /// Reads and verifies a PDB6 row payload by stable table and row IDs.
+    pub(crate) fn get_row_payload(
+        &mut self,
+        table_id: u64,
+        row_id: u64,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let key = crate::storage::pdb6::row_key(table_id, row_id)?;
+        let Some(encoded) = self.get(&key)? else { return Ok(None); };
+        let descriptor = RowPayloadDescriptor::decode(&encoded)?;
+        let total_len = usize::try_from(descriptor.total_len)
+            .map_err(|_| DbError::Storage("PDB6 row length does not fit this platform".into()))?;
+        let mut output = Vec::with_capacity(total_len);
+
+        for page_index in 0..descriptor.page_count {
+            let page_id = descriptor.first_page_id.checked_add(u64::from(page_index))
+                .ok_or_else(|| DbError::Storage("PDB6 row page ID overflow".into()))?;
+            let page = self.pages.read_page(page_id)?;
+            if page.len() < ROW_PAGE_HEADER_BYTES || &page[..4] != ROW_PAGE_MAGIC {
+                return Err(DbError::Storage(format!("invalid PDB6 row page {page_id}")));
+            }
+            let stored_table_id = u64::from_le_bytes(page[4..12].try_into().unwrap());
+            let stored_row_id = u64::from_le_bytes(page[12..20].try_into().unwrap());
+            let stored_index = u32::from_le_bytes(page[20..24].try_into().unwrap());
+            let stored_count = u32::from_le_bytes(page[24..28].try_into().unwrap());
+            let stored_total_len = u64::from_le_bytes(page[28..36].try_into().unwrap());
+            let stored_checksum = u64::from_le_bytes(page[36..44].try_into().unwrap());
+            let chunk_len = u32::from_le_bytes(page[44..48].try_into().unwrap()) as usize;
+            if stored_table_id != table_id
+                || stored_row_id != row_id
+                || stored_index != page_index
+                || stored_count != descriptor.page_count
+                || stored_total_len != descriptor.total_len
+                || stored_checksum != descriptor.checksum
+                || chunk_len != page.len() - ROW_PAGE_HEADER_BYTES
+                || chunk_len > ROW_CHUNK_BYTES
+                || chunk_len != total_len.saturating_sub(output.len()).min(ROW_CHUNK_BYTES)
+            {
+                return Err(DbError::Storage(format!("PDB6 row page metadata mismatch at page {page_id}")));
+            }
+            if output.len().checked_add(chunk_len).is_none_or(|length| length > total_len) {
+                return Err(DbError::Storage("PDB6 row chunks exceed the declared row length".into()));
+            }
+            output.extend_from_slice(&page[ROW_PAGE_HEADER_BYTES..]);
+        }
+        if output.len() != total_len || super::checksum(&output) != descriptor.checksum {
+            return Err(DbError::Storage("PDB6 row length or checksum mismatch".into()));
+        }
+        Ok(Some(output))
+    }
+
+    /// Returns a bounded page of stable row IDs in ascending order.
+    pub(crate) fn scan_row_ids(
+        &mut self,
+        table_id: u64,
+        after_exclusive: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<u64>, DbError> {
+        let _ = crate::storage::pdb6::table_key(table_id)?;
+        let mut prefix = vec![KEY_ROW];
+        prefix.extend_from_slice(&table_id.to_be_bytes());
+        let cursor = after_exclusive
+            .map(|row_id| crate::storage::pdb6::row_key(table_id, row_id))
+            .transpose()?;
+        self.scan_prefix_after(&prefix, cursor.as_deref(), limit)?
+            .into_iter()
+            .map(|(key, _)| {
+                if key.len() != 17 {
+                    return Err(DbError::Storage("invalid PDB6 row key length during scan".into()));
+                }
+                Ok(u64::from_be_bytes(key[9..17].try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    fn write_row_payload(
+        &mut self,
+        table_id: u64,
+        row_id: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DbError> {
+        let page_count = payload.len().max(1).div_ceil(ROW_CHUNK_BYTES);
+        if page_count > MAX_ROW_PAGES {
+            return Err(DbError::Constraint("PDB6 row requires too many pages".into()));
+        }
+        let checksum = super::checksum(payload);
+        let first_page_id = self.pages.allocate_extent(page_count as u64)?;
+        let mut pages = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let start = page_index * ROW_CHUNK_BYTES;
+            let end = payload.len().min(start + ROW_CHUNK_BYTES);
+            let chunk = &payload[start..end];
+            let mut page = Vec::with_capacity(ROW_PAGE_HEADER_BYTES + chunk.len());
+            page.extend_from_slice(ROW_PAGE_MAGIC);
+            page.extend_from_slice(&table_id.to_le_bytes());
+            page.extend_from_slice(&row_id.to_le_bytes());
+            page.extend_from_slice(&(page_index as u32).to_le_bytes());
+            page.extend_from_slice(&(page_count as u32).to_le_bytes());
+            page.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            page.extend_from_slice(&checksum.to_le_bytes());
+            page.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            page.extend_from_slice(chunk);
+            pages.push(page);
+        }
+        self.pages.write_pages(first_page_id, &pages)?;
+        Ok(RowPayloadDescriptor {
+            first_page_id,
+            page_count: page_count as u32,
+            total_len: payload.len() as u64,
+            checksum,
+        }.encode())
     }
 
     /// Scans a keyspace prefix in bytewise order, capped at 5,000 entries.
@@ -289,6 +550,43 @@ mod tests {
             assert_eq!(second, vec![(key_b.clone(), vec![2])]);
             let third = store.scan_prefix_after(&index_prefix, Some(&second[0].0), 1).unwrap();
             assert_eq!(third, vec![(key_c, vec![3])]);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn pdb6_row_payloads_share_one_root_with_catalog_and_index_mutations() {
+        let path = temp_path();
+        let payload = (0..20_000usize).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let index_key = crate::storage::pdb6::index_key(12, 3, b"player-uuid").unwrap();
+        {
+            let mut store = Pdb6Store::open(&path, 16).unwrap();
+            let (removed, inserted) = store.apply_row_batch(
+                vec![(12, 41, payload.clone()), (12, 42, Vec::new())],
+                vec![(index_key.clone(), 41u64.to_le_bytes().to_vec())],
+                Vec::<Vec<u8>>::new(),
+            ).unwrap();
+            assert_eq!((removed, inserted), (0, 3));
+            assert_eq!(store.get_row_payload(12, 41).unwrap(), Some(payload.clone()));
+            assert_eq!(store.get_row_payload(12, 42).unwrap(), Some(Vec::new()));
+            assert_eq!(store.get_row_payload(12, 99).unwrap(), None);
+            assert_eq!(store.scan_row_ids(12, None, 10).unwrap(), vec![41, 42]);
+            assert_eq!(store.scan_row_ids(12, Some(41), 10).unwrap(), vec![42]);
+            assert_eq!(store.get(&index_key).unwrap(), Some(41u64.to_le_bytes().to_vec()));
+        }
+        {
+            let mut reopened = Pdb6Store::open(&path, 16).unwrap();
+            assert_eq!(reopened.get_row_payload(12, 41).unwrap(), Some(payload));
+            let (removed, inserted) = reopened.apply_row_batch(
+                vec![(12, 41, b"replacement".to_vec())],
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+                vec![crate::storage::pdb6::row_key(12, 42).unwrap(), index_key.clone()],
+            ).unwrap();
+            assert_eq!((removed, inserted), (2, 1));
+            assert_eq!(reopened.get_row_payload(12, 41).unwrap(), Some(b"replacement".to_vec()));
+            assert_eq!(reopened.get_row_payload(12, 42).unwrap(), None);
+            assert_eq!(reopened.get(&index_key).unwrap(), None);
+            assert_eq!(reopened.scan_row_ids(12, None, 10).unwrap(), vec![41]);
         }
         cleanup(&path);
     }
