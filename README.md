@@ -13,7 +13,7 @@ KSL remains optional. The Rust core now includes an atomic, bounded bulk-insert 
 
 ## Storage architecture
 
-Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
+Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. The file-backed extent layer now has a bounded per-handle LRU cache for validated EPG1 page payloads; KeyValueStore and the new variable-length RecordStore can configure capacity and inspect hit/miss/eviction counters. RecordStore uses multi-page extents for records up to 64 MiB and an EmberTree B+ Tree descriptor index. It is an independent sidecar, not yet the canonical SQL row store. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
 
 ## Current status
 
@@ -30,7 +30,8 @@ The project is at an early development stage. The first prototype provides:
 - secondary indexes backed by the native in-memory B+ tree and stable table-local row IDs;
 - incremental index-key maintenance for INSERT, UPDATE, DELETE, and UPSERT; DELETE compacts table rows without rebuilding index trees;
 - direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;
-- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, and bounded per-call prefix cleanup;
+- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, bounded per-call cleanup, and a configurable page cache with runtime statistics;
+- an independent page-backed `RecordStore` for variable-length records up to 64 MiB, indexed by stable caller-supplied IDs; bounded multi-record batches use one descriptor-tree publication, but it is not yet wired as SQL's canonical row store;
 - a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
@@ -79,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Roadmap
 
-Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). See also [Native Key-Value and Registry](docs/KEY_VALUE_AND_REGISTRY.md) and [EmberTree](docs/EMBER_TREE.md).
+Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). See also [Native Key-Value and Registry](docs/KEY_VALUE_AND_REGISTRY.md), [RecordStore](docs/RECORD_STORE.md), and [EmberTree](docs/EMBER_TREE.md).
 
 1. Replace the prototype parser with a tokenizer and structured SQL AST.
 2. Add a bounded page cache and lazy page reads over the fixed-size page file.
