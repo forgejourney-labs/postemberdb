@@ -1,7 +1,7 @@
 //! Standalone persistent key/value storage and a typed, registry-like hierarchy.
 
-use crate::storage::{extent::ExtentFile, page_tree};
-use crate::DbError;
+use crate::storage::{cache::DEFAULT_PAGE_CACHE_CAPACITY, extent::ExtentFile, page_tree};
+use crate::{DbError, PageCacheStats};
 use fs2::FileExt;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -25,9 +25,17 @@ pub struct KeyValueStore {
 }
 
 impl KeyValueStore {
-    /// Opens (or creates) a KV store at the supplied logical path.
-    /// The implementation uses `.pages`, `.pages.wal`, and `.lock` sidecars.
+    /// Opens a KV store with a bounded 128-page cache by default.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_with_cache_capacity(path, DEFAULT_PAGE_CACHE_CAPACITY)
+    }
+
+    /// Opens a KV store with a caller-selected decoded-page cache capacity.
+    /// Use zero to disable caching; capacities above 65,536 pages are rejected.
+    pub fn open_with_cache_capacity(
+        path: impl AsRef<Path>,
+        cache_capacity_pages: usize,
+    ) -> Result<Self, DbError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -46,10 +54,20 @@ impl KeyValueStore {
 
         let pages_path = with_suffix(path, ".pages");
         let wal_path = with_suffix(path, ".pages.wal");
-        let mut store = ExtentFile::open(&pages_path)?;
+        let mut store = ExtentFile::open_with_cache_capacity(&pages_path, cache_capacity_pages)?;
         page_tree::recover(&mut store, &wal_path)?;
         page_tree::validate_tree(&mut store)?;
         Ok(Self { store, wal_path, _lock_file: lock_file })
+    }
+
+    /// Returns the cache occupancy and cumulative hit/miss/eviction counters.
+    pub fn page_cache_stats(&self) -> PageCacheStats {
+        self.store.page_cache_stats()
+    }
+
+    /// Changes this handle's page-cache capacity; shrinking evicts least-recently-used pages.
+    pub fn set_page_cache_capacity(&mut self, capacity_pages: usize) -> Result<(), DbError> {
+        self.store.set_page_cache_capacity(capacity_pages)
     }
 
     fn validate_key(key: &[u8]) -> Result<(), DbError> {
