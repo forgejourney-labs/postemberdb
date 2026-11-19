@@ -82,8 +82,19 @@ impl Frame {
     }
 
     pub fn read_from<R: Read>(reader: &mut R, max_payload: usize) -> io::Result<Self> {
+        Self::read_from_or_eof(reader, max_payload)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "end of stream"))
+    }
+
+    /// Reads one frame, returning None only when the stream ends before any
+    /// byte of the next header. A partial header or payload is always an error.
+    pub fn read_from_or_eof<R: Read>(reader: &mut R, max_payload: usize) -> io::Result<Option<Self>> {
         let mut header = [0u8; HEADER_LEN];
-        reader.read_exact(&mut header)?;
+        let first = reader.read(&mut header[..1])?;
+        if first == 0 {
+            return Ok(None);
+        }
+        reader.read_exact(&mut header[1..])?;
         if header[..4] != MAGIC {
             return Err(invalid_data("invalid binary frame magic"));
         }
@@ -105,7 +116,7 @@ impl Frame {
         if crc32(&payload) != expected_crc {
             return Err(invalid_data("binary frame payload checksum mismatch"));
         }
-        Ok(Self { kind, request_id, payload })
+        Ok(Some(Self { kind, request_id, payload }))
     }
 }
 
