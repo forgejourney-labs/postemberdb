@@ -379,7 +379,7 @@ fn handle_binary_client(
                     let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
                     match ef7.lock() {
                         Ok(mut store) => match store.put_chunk(namespace, x, z, &frame.payload[16..]) {
-                            Ok(()) => Frame::new(FrameKind::QueryResult, request_id, b"{\\"ok\\":true,\\"message\\":\\"chunk stored\\"}".to_vec()),
+                            Ok(()) => Frame::new(FrameKind::QueryResult, request_id, b"{\"ok\":true,\"message\":\"chunk stored\"}".to_vec()),
                             Err(error) => binary_error(request_id, &error.to_string()),
                         },
                         Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
@@ -421,7 +421,7 @@ fn handle_binary_client(
                         Ok(mut store) => match store.delete_chunk(namespace, x, z) {
                             Ok(deleted) => Frame::new(
                                 FrameKind::QueryResult, request_id,
-                                format!("{{\\"ok\\":true,\\"affected_rows\\":{}}}", u8::from(deleted)).into_bytes()
+                                format!("{{\"ok\":true,\"affected_rows\":{}}}", u8::from(deleted)).into_bytes()
                             ),
                             Err(error) => binary_error(request_id, &error.to_string()),
                         },
@@ -718,8 +718,8 @@ fn json_escape(value: &str) -> String {
     output.push('"');
     for character in value.chars() {
         match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\""),
+            '\\' => output.push_str("\\\"),
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
@@ -798,7 +798,7 @@ mod tests {
         let encoded = super::format_result_json(result);
         assert!(encoded.contains("\"count\""));
         assert!(encoded.contains(",42,true,null]"));
-        assert!(encoded.contains("a\\n\\\"b"));
+        assert!(encoded.contains("a\\n\\"b"));
         assert!(super::json_error("bad").contains("\"ok\":false"));
     }
 
@@ -1015,7 +1015,7 @@ mod tests {
             .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
         let created = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(created.kind, FrameKind::QueryResult);
-        assert!(String::from_utf8(created.payload).unwrap().contains("\\"ok\\":true"));
+        assert!(String::from_utf8(created.payload).unwrap().contains("\"ok\":true"));
 
         let mut put = Vec::new();
         put.extend_from_slice(&1u64.to_le_bytes());
@@ -1042,7 +1042,7 @@ mod tests {
             .write_to(&mut client, DEFAULT_MAX_PAYLOAD).unwrap();
         let deleted = Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(deleted.kind, FrameKind::QueryResult);
-        assert!(String::from_utf8(deleted.payload).unwrap().contains("\\"affected_rows\\":1"));
+        assert!(String::from_utf8(deleted.payload).unwrap().contains("\"affected_rows\":1"));
 
         drop(client);
         worker.join().unwrap();
