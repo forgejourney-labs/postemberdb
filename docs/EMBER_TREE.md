@@ -181,3 +181,21 @@ In-memory SQL index values are ordered lists of stable table-local `u64` row IDs
 INSERT adds the new ID to each relevant index. UPDATE and UPSERT compare old and new index keys and remove/reinsert the row ID only for indexes whose key changed; modifying a non-indexed column leaves every index tree untouched. DELETE removes the deleted IDs from their exact index keys before compacting the row vector. Compaction rebuilds only the ID-to-position map, not the B+ tree indexes. Empty index buckets are removed so unique-key checks cannot mistake deleted keys for live entries.
 
 A multi-row UPDATE checks all affected unique indexes as a set before applying its staged mutations, preventing two matching rows from being assigned the same unique key. The SQL transaction layer still provides rollback if validation fails. Persistent EmberTree mirror updates continue to use their own direct mutation journal after the canonical SQL WAL commit.
+
+
+## Bounded extent-page cache
+
+`ExtentFile` now maintains a per-handle LRU cache of decoded EPG1 page payloads. The default capacity is 128 pages; zero disables residency, and capacities above 65,536 pages are rejected. A cache hit still checks that the page ID is currently allocated. A miss reads the complete fixed-size page, validates page identity, generation, checksum, payload length, and zero padding, then caches only the validated payload.
+
+The cache is write-through: successful page allocation and writes refresh the cached copy only after the page bytes are synced. Releasing an extent invalidates every cached page in that range before page IDs can be reused. Shrinking the cache evicts least-recently-used entries. Hit, miss, eviction, capacity, resident-page, and resident-byte counters are exposed in `PageCacheStats`; `KeyValueStore` lets callers configure capacity when opening a store or change it on an active handle.
+
+This is the first bounded cache for the existing EPG1 page-file layer, not yet the final database-wide buffer pool. The SQL table snapshot is still eagerly decoded into memory, so SQL row reads do not yet use lazy page fetches or a shared row-page cache. Page pinning, dirty-page scheduling, shared cache budgets across SQL/EmberTree/KV, and eviction coordination with active readers remain future work.
+
+
+## Variable-length RecordStore
+
+The RecordStore prototype adds overflow-page support without changing the canonical SQL snapshot format. It stores caller-supplied non-zero u64 IDs in an EmberTree B+ Tree descriptor index. Each descriptor (RDX1) records the first page ID, page count, total byte length, and whole-record checksum. Record payloads are split into fixed-size chunks stored in EPG1 pages with RPG1 headers containing the record ID, chunk ordinal/count, total length, checksum, and chunk length.
+
+A put operation reserves a contiguous extent, writes and syncs every RPG1 page, then publishes or replaces the RDX1 descriptor using the page-tree redo WAL and root publication. Thus a reader sees either the previous descriptor or the complete new record; a crash before descriptor publication can leave unreachable allocated pages but cannot publish a partial record. Reads validate each EPG1 page, RPG1 header, chunk order, declared length, and whole-record checksum before returning bytes. Records are limited to 64 MiB and the current get API materializes the complete record in memory; streaming reads/writes are not yet implemented.
+
+RecordStore is exposed as an independent storage sidecar (Database::open_record_store) and is not yet used as the canonical backing store for SQL tables. It does not join SQL transactions. Replaced/deleted record extents are not reclaimed yet; a reachability-aware vacuum must be implemented before long-running workloads can safely reuse that space. The whole-record FNV checksum detects accidental corruption but is not a cryptographic integrity or authentication primitive.
