@@ -100,7 +100,7 @@ class PostemberDbClient internal constructor(
         namespaceId: Long,
         rowId: Long,
         profile: PostemberPlayerProfile
-    ) {
+    ): Unit {
         check(!Bukkit.isPrimaryThread()) { "Use putPlayerProfileAsync() on Paper's main thread" }
         require(namespaceId > 0 && rowId > 0) { "namespaceId and rowId must be positive" }
         require(profile.customData.size <= MAX_EF7_WIRE_CUSTOM_BYTES) {
