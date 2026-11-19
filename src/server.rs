@@ -1045,6 +1045,7 @@ mod tests {
         assert_eq!(deleted.kind, FrameKind::QueryResult);
         assert!(String::from_utf8(deleted.payload).unwrap().contains("\"affected_rows\":1"));
 
+        drop(reader);
         drop(client);
         worker.join().unwrap();
         for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal"] {
