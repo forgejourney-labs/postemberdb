@@ -14,6 +14,7 @@ mod sql;
 mod kv;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
+pub use storage::record_store::RecordStore;
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
@@ -504,6 +505,23 @@ impl Database {
         let mut path = path.as_os_str().to_os_string();
         path.push(".kv");
         KeyValueStore::open_with_cache_capacity(PathBuf::from(path), capacity_pages)
+    }
+
+    /// Opens the database's independent variable-length record sidecar.
+    ///
+    /// Records use caller-supplied stable IDs and are not automatically enlisted
+    /// in SQL transactions or maintained as a mirror of SQL table rows.
+    pub fn open_record_store(&self) -> Result<RecordStore, DbError> {
+        self.open_record_store_with_cache_capacity(128)
+    }
+
+    /// Opens the record sidecar with a configurable decoded-page cache capacity.
+    pub fn open_record_store_with_cache_capacity(&self, capacity_pages: usize) -> Result<RecordStore, DbError> {
+        let path = self.storage_path.as_ref()
+            .ok_or_else(|| DbError::Storage("in-memory databases do not have a persistent record sidecar".into()))?;
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".rows");
+        RecordStore::open_with_cache_capacity(PathBuf::from(path), capacity_pages)
     }
 
     /// Opens the database's registry-like hierarchical configuration sidecar.
