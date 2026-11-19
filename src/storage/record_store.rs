@@ -293,6 +293,78 @@ impl RecordStore {
         Ok(page_tree::get(&mut self.store, &Self::record_key(record_id))?.is_some())
     }
 
+    /// Returns record IDs in ascending order without loading record payloads.
+    ///
+    /// The scan is inclusive of the first ID after `after`, and returns at
+    /// most 5,000 IDs. Callers can pass the last returned ID to the next call
+    /// to paginate through a large store while keeping memory bounded.
+    pub fn scan_ids(&mut self, after: Option<u64>, limit: usize) -> Result<Vec<u64>, DbError> {
+        if limit > MAX_BATCH_RECORDS {
+            return Err(DbError::Constraint(format!(
+                "record scan limit cannot exceed {MAX_BATCH_RECORDS} IDs"
+            )));
+        }
+        if limit == 0 || after == Some(u64::MAX) {
+            return Ok(Vec::new());
+        }
+
+        let first_id = match after {
+            Some(previous) => previous.checked_add(1)
+                .ok_or_else(|| DbError::Constraint("record scan cursor overflow".into()))?,
+            None => 1,
+        };
+        let lower = first_id.to_be_bytes();
+        let upper = u64::MAX.to_be_bytes();
+        let entries = page_tree::scan_range_limited(
+            &mut self.store,
+            &lower,
+            &upper,
+            Some(limit),
+        )?;
+
+        let mut ids = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            if key.len() != 8 {
+                return Err(DbError::Storage("record index contains an invalid ID key".into()));
+            }
+            let record_id = u64::from_be_bytes(key.as_slice().try_into().unwrap());
+            if record_id == 0 || ids.last().is_some_and(|previous| *previous >= record_id) {
+                return Err(DbError::Storage("record index IDs are zero or not strictly ordered".into()));
+            }
+            ids.push(record_id);
+        }
+        Ok(ids)
+    }
+
+    /// Reads a bounded, ordered page of records without scanning the entire store.
+    ///
+    /// The cursor is the last ID from the previous page. At most 5,000 records
+    /// and 256 MiB of record payloads are returned in one call.
+    pub fn scan_records(
+        &mut self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, DbError> {
+        let ids = self.scan_ids(after, limit)?;
+        let mut records = Vec::with_capacity(ids.len());
+        let mut total_bytes = 0usize;
+        for record_id in ids {
+            let bytes = self.get(record_id)?
+                .ok_or_else(|| DbError::Storage(format!(
+                    "record {record_id} disappeared during a locked scan"
+                )))?;
+            total_bytes = total_bytes.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("record scan byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "record scan exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                )));
+            }
+            records.push((record_id, bytes));
+        }
+        Ok(records)
+    }
+
     /// Returns the underlying extent-page cache metrics.
     pub fn page_cache_stats(&self) -> PageCacheStats {
         self.store.page_cache_stats()
@@ -404,6 +476,39 @@ mod tests {
         assert!(store.delete(0).is_err());
         assert!(store.put(1, &vec![0u8; MAX_RECORD_BYTES + 1]).is_err());
         drop(store);
+        remove_store_files(&path);
+    }
+
+    #[test]
+    fn record_store_scans_ids_in_bounded_stable_pages() {
+        let path = temp_path("scan-ids");
+        {
+            let mut store = RecordStore::open(&path).unwrap();
+            store.put_many(vec![
+                (40, b"four".to_vec()),
+                (10, b"one".to_vec()),
+                (30, b"three".to_vec()),
+                (20, b"two".to_vec()),
+            ]).unwrap();
+
+            assert_eq!(store.scan_ids(None, 2).unwrap(), vec![10, 20]);
+            assert_eq!(store.scan_ids(Some(20), 2).unwrap(), vec![30, 40]);
+            assert_eq!(
+                store.scan_records(Some(10), 1).unwrap(),
+                vec![(20, b"two".to_vec())]
+            );
+            assert!(store.scan_ids(Some(40), 2).unwrap().is_empty());
+            assert!(store.scan_ids(None, 0).unwrap().is_empty());
+            assert!(store.scan_ids(None, 5_001).is_err());
+
+            store.delete(20).unwrap();
+            assert_eq!(store.scan_ids(Some(10), 10).unwrap(), vec![30, 40]);
+        }
+
+        let mut reopened = RecordStore::open(&path).unwrap();
+        assert_eq!(reopened.scan_ids(None, 10).unwrap(), vec![10, 30, 40]);
+        assert_eq!(reopened.get(30).unwrap(), Some(b"three".to_vec()));
+        drop(reopened);
         remove_store_files(&path);
     }
 
