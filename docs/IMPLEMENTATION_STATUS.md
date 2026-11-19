@@ -51,6 +51,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] SqlRowStore bounded multi-get by stable row ID, preserving first-seen order, deduplicating IDs, and enforcing 5,000-ID / 256 MiB read limits; this remains a row-store API, not SQL executor integration.
 - [x] PDB6 canonical SQL storage design is documented in `docs/PDB6_CANONICAL_SQL_STORAGE.md`; implementation gates remain open and PDB5 remains authoritative.
 - [x] Initial PDB6 PCT1 binary catalog codec and versioned shared key constructors (table, row, index, counters, database root), with strict validation tests; not yet wired into Database.
+- [x] PDB6 PDM1 database manifest codec for logical generation, last transaction ID, next table ID, and table count, with strict header/counter tests; not yet published by the live SQL engine.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
