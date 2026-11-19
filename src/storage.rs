@@ -17,6 +17,7 @@ mod pages;
 mod pdb6;
 mod pdb6_store;
 pub mod emberforge;
+pub mod emberforge7;
 mod wal;
 
 use pages::{decode_pages, encode_pages};
