@@ -724,10 +724,11 @@ impl EmberForge7Store {
             }
             None => removals.push(meta_key),
         }
-        if let Err(error) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts) {
-            let _ = self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64);
-            return Err(error);
-        }
+        // On an uncertain publication error, keep the newly allocated extent.
+        // Releasing it here could free pages if the root became durable just
+        // before the error was reported; unreachable pages are reclaimed by
+        // future recovery/vacuum work instead of risking a live-record alias.
+        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)?;
         if let Some(previous) = old {
             if previous.start_page != descriptor.start_page {
                 self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
