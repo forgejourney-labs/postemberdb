@@ -729,6 +729,102 @@ impl EmberForge7Store {
         Ok(Some((row_id, profile)))
     }
 
+
+    /// Scans player profiles by UUID in bytewise order. The optional cursor is
+    /// exclusive, making bounded pagination stable across calls.
+    pub fn scan_player_profiles(
+        &mut self,
+        namespace_id: u64,
+        after_uuid: Option<[u8; 16]>,
+        limit: usize,
+    ) -> Result<Vec<(u64, EmberForge7PlayerProfile)>, DbError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(DbError::Constraint("EF7 player scan limit must be 1..=10000".into()));
+        }
+        let mut prefix = vec![KEY_PLAYER_UUID];
+        prefix.extend_from_slice(&namespace_id.to_be_bytes());
+        if namespace_id == 0 {
+            return Err(DbError::Constraint("EF7 namespace ID must be non-zero".into()));
+        }
+        let mut lower = prefix.clone();
+        if let Some(cursor) = after_uuid {
+            let mut cursor_key = uuid_key(namespace_id, &cursor)?;
+            let mut advanced = false;
+            for index in (9..25).rev() {
+                if cursor_key[index] != 0xff {
+                    cursor_key[index] += 1;
+                    cursor_key.truncate(index + 1);
+                    lower = cursor_key;
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced { return Ok(Vec::new()); }
+        }
+        let entries = page_tree::scan_range_limited(
+            &mut self.pages, &lower, &prefix_upper_key(&prefix), Some(limit),
+        )?;
+        let mut result = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.len() != 25 || value.len() != 8 {
+                return Err(DbError::Storage("malformed EF7 UUID index entry during scan".into()));
+            }
+            let uuid: [u8; 16] = key[9..25].try_into().unwrap();
+            let row_id = u64::from_be_bytes(value[..8].try_into().unwrap());
+            let Some((verified_row, profile)) = self.get_player_profile(namespace_id, uuid)? else {
+                return Err(DbError::Storage("EF7 UUID index entry disappeared during scan".into()));
+            };
+            if verified_row != row_id {
+                return Err(DbError::Storage("EF7 UUID scan row ID disagrees with profile lookup".into()));
+            }
+            result.push((row_id, profile));
+        }
+        Ok(result)
+    }
+
+    /// Prefix search over the persistent, case-insensitive player-name index.
+    pub fn search_player_profiles_by_name(
+        &mut self,
+        namespace_id: u64,
+        name_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, EmberForge7PlayerProfile)>, DbError> {
+        if namespace_id == 0 || limit == 0 || limit > 10_000
+            || name_prefix.len() > 16 || !name_prefix.is_ascii()
+            || !name_prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(DbError::Constraint("invalid EF7 player-name prefix or limit".into()));
+        }
+        let normalized = name_prefix.to_ascii_lowercase();
+        let mut prefix = vec![KEY_PLAYER_NAME];
+        prefix.extend_from_slice(&namespace_id.to_be_bytes());
+        prefix.extend_from_slice(normalized.as_bytes());
+        let entries = page_tree::scan_range_limited(
+            &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(limit),
+        )?;
+        let mut result = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.len() < 10 || key.len() > 25 || value.len() != 8 {
+                return Err(DbError::Storage("malformed EF7 player-name index entry during scan".into()));
+            }
+            let name = std::str::from_utf8(&key[9..])
+                .map_err(|_| DbError::Storage("EF7 player-name index contains invalid UTF-8".into()))?;
+            let row_id = u64::from_be_bytes(value[..8].try_into().unwrap());
+            let identity = self.player_identity_for_row(namespace_id, row_id)?
+                .ok_or_else(|| DbError::Storage("EF7 player-name index points to missing identity".into()))?;
+            if identity.username.as_deref() != Some(name) || !name.starts_with(&normalized) {
+                return Err(DbError::Storage("EF7 player-name prefix index does not match row identity".into()));
+            }
+            let payload = self.get_record(namespace_id, row_id)?
+                .ok_or_else(|| DbError::Storage("EF7 player-name index points to missing payload".into()))?;
+            let profile = EmberForge7PlayerProfile::decode(&payload)?;
+            if profile.uuid != identity.uuid || normalize_player_name(&profile.username)? != name {
+                return Err(DbError::Storage("EF7 player profile is inconsistent with its name index".into()));
+            }
+            result.push((row_id, profile));
+        }
+        Ok(result)
+    }
+
     /// Deletes a player row, UUID mapping, optional name mapping and identity
     /// metadata in one root publication.
     pub fn delete_player(
@@ -1350,6 +1446,32 @@ mod tests {
         assert!(store.delete_namespace(88).is_err());
         assert!(store.delete_chunk(88, -1, 2).unwrap());
         assert!(store.delete_namespace(88).unwrap());
+        drop(store);
+        cleanup(&path);
+    }
+
+
+    #[test]
+    fn player_profile_scans_support_bounded_uuid_pages_and_name_prefixes() {
+        let path = path("player-scans");
+        let mut store = EmberForge7Store::open(&path, 24).unwrap();
+        for (n, name) in [(1u8, "AlexOne"), (2, "AlexTwo"), (3, "Steve"), (4, "AlexThree")] {
+            let profile = EmberForge7PlayerProfile {
+                uuid: [n; 16], username: name.into(), first_joined_ms: 1,
+                last_seen_ms: 2, playtime_ticks: 3, custom_data: Vec::new(),
+            };
+            store.put_player_profile(12, u64::from(n), &profile).unwrap();
+        }
+        let first = store.scan_player_profiles(12, None, 2).unwrap();
+        assert_eq!(first.iter().map(|(_, p)| p.uuid[0]).collect::<Vec<_>>(), vec![1, 2]);
+        let second = store.scan_player_profiles(12, Some(first.last().unwrap().1.uuid), 2).unwrap();
+        assert_eq!(second.iter().map(|(_, p)| p.uuid[0]).collect::<Vec<_>>(), vec![3, 4]);
+        assert!(store.scan_player_profiles(12, Some([0xff; 16]), 2).unwrap().is_empty());
+        let matches = store.search_player_profiles_by_name(12, "aLeX", 10).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches.iter().map(|(_, p)| p.username.as_str()).collect::<Vec<_>>(),
+            vec!["AlexOne", "AlexThree", "AlexTwo"]);
+        assert!(store.search_player_profiles_by_name(12, "", 0).is_err());
         drop(store);
         cleanup(&path);
     }
