@@ -1,4 +1,5 @@
 use postemberdb::{Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
+use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +12,7 @@ const CLIENT_IO_TIMEOUT_SECS: u64 = 30;
 const MAX_EF7_WIRE_CUSTOM_BYTES: usize = 24 * 1024;
 const MAX_EF7_WIRE_CHUNK_BYTES: usize = 24 * 1024;
 const MAX_EF7_NAMESPACE_LIST: usize = 64;
+const MAX_BINARY_CHUNK_BYTES: usize = DEFAULT_MAX_PAYLOAD - 16;
 
 struct ConnectionGuard(Arc<AtomicUsize>);
 
@@ -146,6 +148,12 @@ fn handle_client(
         };
         let command = sql.trim();
         if command.eq_ignore_ascii_case("QUIT") { break; }
+        if command.eq_ignore_ascii_case("POSTEMBERDB BINARY/1") {
+            let ready = Frame::new(FrameKind::Pong, 0, b"postemberdb-binary/1-ready".to_vec());
+            ready.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+            return handle_binary_client(stream, reader, database, ef7);
+        }
+
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
             stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
@@ -317,6 +325,117 @@ fn json_profile(row_id: u64, profile: &EmberForge7PlayerProfile) -> Result<Strin
         profile.playtime_ticks,
         json_escape(&encode_hex(&profile.custom_data)),
     ))
+}
+
+fn binary_error(request_id: u64, message: &str) -> Frame {
+    Frame::new(FrameKind::Error, request_id, message.as_bytes().to_vec())
+}
+
+fn handle_binary_client(
+    mut stream: TcpStream,
+    mut reader: io::BufReader<TcpStream>,
+    database: Arc<std::sync::Mutex<Database>>,
+    ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
+) -> io::Result<()> {
+    loop {
+        let frame = match Frame::read_from(&mut reader, DEFAULT_MAX_PAYLOAD) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let request_id = frame.request_id;
+        let response = match frame.kind {
+            FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
+            FrameKind::Query => {
+                let sql = match std::str::from_utf8(&frame.payload) {
+                    Ok(sql) if !sql.trim().is_empty() => sql,
+                    _ => {
+                        binary_error(request_id, "query payload must be non-empty UTF-8 SQL")
+                            .write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+                        continue;
+                    }
+                };
+                let command = sql.trim();
+                if ["BEGIN", "COMMIT", "ROLLBACK"].iter().any(|word| command.eq_ignore_ascii_case(word)) {
+                    binary_error(request_id, "binary/1 query frames do not support transaction control yet")
+                } else {
+                    match database.lock() {
+                        Ok(mut db) => match db.execute(sql) {
+                            Ok(result) => Frame::new(FrameKind::QueryResult, request_id, format_result_json(result).into_bytes()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "database lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkPut => {
+                if frame.payload.len() < 16 {
+                    binary_error(request_id, "chunk put payload requires namespace:u64, x:i32, z:i32 and bytes")
+                } else if frame.payload.len() - 16 > MAX_BINARY_CHUNK_BYTES {
+                    binary_error(request_id, "chunk payload exceeds binary/1 single-frame limit")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.put_chunk(namespace, x, z, &frame.payload[16..]) {
+                            Ok(()) => Frame::new(FrameKind::QueryResult, request_id, b"{\\"ok\\":true,\\"message\\":\\"chunk stored\\"}".to_vec()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkGet => {
+                if frame.payload.len() != 16 {
+                    binary_error(request_id, "chunk get payload must contain namespace:u64, x:i32 and z:i32")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.get_chunk_limited(namespace, x, z, MAX_BINARY_CHUNK_BYTES) {
+                            Ok(Some(payload)) => {
+                                let mut response = Vec::with_capacity(16 + payload.len());
+                                response.extend_from_slice(&namespace.to_le_bytes());
+                                response.extend_from_slice(&x.to_le_bytes());
+                                response.extend_from_slice(&z.to_le_bytes());
+                                response.extend_from_slice(&payload);
+                                Frame::new(FrameKind::ChunkData, request_id, response)
+                            }
+                            Ok(None) => Frame::new(FrameKind::ChunkData, request_id, Vec::new()),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::ChunkDelete => {
+                if frame.payload.len() != 16 {
+                    binary_error(request_id, "chunk delete payload must contain namespace:u64, x:i32 and z:i32")
+                } else {
+                    let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
+                    let x = i32::from_le_bytes(frame.payload[8..12].try_into().unwrap());
+                    let z = i32::from_le_bytes(frame.payload[12..16].try_into().unwrap());
+                    match ef7.lock() {
+                        Ok(mut store) => match store.delete_chunk(namespace, x, z) {
+                            Ok(deleted) => Frame::new(
+                                FrameKind::QueryResult, request_id,
+                                format!("{{\\"ok\\":true,\\"affected_rows\\":{}}}", u8::from(deleted)).into_bytes()
+                            ),
+                            Err(error) => binary_error(request_id, &error.to_string()),
+                        },
+                        Err(_) => binary_error(request_id, "EF7 storage lock poisoned"),
+                    }
+                }
+            }
+            FrameKind::QueryResult | FrameKind::Error | FrameKind::Pong
+            | FrameKind::ChunkData | FrameKind::ChunkScan | FrameKind::ChunkScanResult => {
+                binary_error(request_id, "frame kind is response-only or not implemented by this server version")
+            }
+        };
+        response.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+    }
 }
 
 fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
