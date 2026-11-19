@@ -282,6 +282,38 @@ impl TransactionCoordinator {
     }
 }
 
+impl CoordinatorParticipant for crate::KeyValueStore {
+    fn participant_id(&self) -> u8 { 1 }
+    fn has_prepared(&self, transaction_id: u64) -> bool {
+        self.pending_prepared_transactions().contains(&transaction_id)
+    }
+    fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::KeyValueStore::commit_prepared(self, transaction_id)
+    }
+    fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::KeyValueStore::finalize_prepared(self, transaction_id)
+    }
+    fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::KeyValueStore::rollback_prepared(self, transaction_id)
+    }
+}
+
+impl CoordinatorParticipant for crate::Registry {
+    fn participant_id(&self) -> u8 { 2 }
+    fn has_prepared(&self, transaction_id: u64) -> bool {
+        self.pending_prepared_transactions().contains(&transaction_id)
+    }
+    fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Registry::commit_prepared(self, transaction_id)
+    }
+    fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Registry::finalize_prepared(self, transaction_id)
+    }
+    fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::Registry::rollback_prepared(self, transaction_id)
+    }
+}
+
 fn encode_record(kind: u8, participant: u8, txid: u64, count: u8) -> [u8; RECORD_BYTES] {
     let mut record = [0u8; RECORD_BYTES];
     record[..4].copy_from_slice(RECORD_MAGIC);

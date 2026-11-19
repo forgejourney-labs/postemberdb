@@ -20,7 +20,6 @@ pub mod emberforge;
 pub mod emberforge7;
 mod wal;
 pub mod transaction_coordinator;
-pub(crate) mod participant;
 
 use pages::{decode_pages, encode_pages};
 use wal::wal_file_path;
