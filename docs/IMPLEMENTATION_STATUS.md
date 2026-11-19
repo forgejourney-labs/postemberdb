@@ -82,14 +82,20 @@ SQL transaction commits no longer diff complete previous/current index snapshots
 Startup and redo recovery validate the complete reachable persistent tree, including separators, child ranges, cycles, and duplicate references; redo records reject duplicate page IDs and malformed page images before replay. A durable SQL commit remains successful if only the derived EmberTree mirror fails; the database disables that mirror and falls back to in-memory indexes until a successful rebuild. Incremental page-tree insertion/deletion uses path copying; deletion merges adjacent same-level siblings when their combined contents fit and collapses unary roots. Redistribution of underfull siblings, cross-log crash fault injection, reachability-aware page reclamation, and vacuum remain pending. The persistent tree does not yet use leaf sibling pointers. The PPG1 snapshot remains a physical snapshot layout, not a lazy page store. RecordStore provides a reusable multi-page record primitive, but SQL rows are not yet migrated into it. The initial LRU cache applies to EPG1 extent files (including EmberTree/KV/RecordStore page operations); it is not yet a shared cache for canonical SQL rows. Database startup still reconstructs the snapshot and loads all SQL rows into memory.
 ## 3.1 EmberForge 7 (EF7) — Minecraft/KSL record engine
 
-- [x] Separate EF7 sidecar and versioned EF7C chunk / EF7R descriptor formats; PDB6 page allocator and CoW B+ tree are reused without sharing files.
+- [x] Independent EF7 sidecar and versioned EF7C overflow chunks / EF7R record descriptors over the PDB6 page allocator and CoW B+ tree.
 - [x] Checksummed multi-page records up to 64 MiB with bounded page counts and whole-record verification.
-- [x] Player UUID mapping and record descriptor publish together through one CoW root update.
-- [x] Bounded mixed player batch API: up to 2,500 player operations and 256 MiB aggregate payload, one tree redo/root publication, post-publication extent reclamation.
-- [ ] SQL executor integration, KSL-facing typed API, persistent secondary indexes beyond UUID, and transaction coordination with canonical SQL WAL.
-- [ ] Crash-point fault injection for EF7 payload allocation, redo sync, root publication, and extent reclamation.
+- [x] Hierarchical namespace metadata, parent-scoped unique names, bounded listing, and non-cascading empty-only deletion.
+- [x] Raw player records with persistent UUID and row-identity indexes; stale UUID mappings are removed when a row changes UUID.
+- [x] Typed Minecraft player profiles with username, first/last-seen timestamps, playtime ticks, and plugin-owned custom bytes.
+- [x] Namespace-scoped, case-insensitive player-name index; bounded UUID pagination and name-prefix search.
+- [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding, bounded rectangular scans, and atomic region chunk batches.
+- [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
+- [ ] General user-defined secondary indexes and index rebuild/verification tooling.
+- [ ] Integrate EF7 transactions with canonical SQL WAL, catalog and SQL executor; PDB5 remains authoritative.
+- [ ] KSL-facing typed adapter and JDBC driver.
+- [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
 
-EF7 is an independent Minecraft/KSL-oriented record engine, not yet the canonical SQL storage backend. Existing PDB5 SQL snapshots/WAL remain authoritative. EF7 batches are atomic within the EF7 tree, but they are not yet atomic with SQL, KV, Registry, or other sidecars.
+EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent record engine and does not yet provide cross-domain atomicity with SQL, KV, Registry, or other sidecars. FNV-style checksums detect accidental corruption; they are not cryptographic authentication.
 
 ## 4. KSL/JVM adapter
 
