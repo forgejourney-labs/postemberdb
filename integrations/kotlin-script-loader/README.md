@@ -68,7 +68,7 @@ postemberDb().getPlayerProfileByNameAsync(7L, player.name)
 postemberDb().deletePlayerAsync(7L, stableRowId, player.uniqueId)
 ```
 
-Available operations are `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, and `deletePlayerAsync`. Synchronous variants exist for worker threads and reject calls from Paper's main thread. Profile custom data is capped at 24 KiB by this text/hex JSONL bridge; the native Rust EF7 API supports records up to 64 MiB.
+Available operations are `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, `deletePlayerAsync`, and `applyPlayerProfileBatchAsync`. The batch method accepts `PostemberPlayerProfileUpsert` and `PostemberPlayerRemoval` items and applies all profile/index changes through one EF7 commit. Prefer it for groups of player updates rather than issuing one connection per player. Synchronous variants exist for worker threads and reject calls from Paper's main thread. Profile custom data is capped at 24 KiB by this text/hex JSONL bridge; the native Rust EF7 API supports records up to 64 MiB.
 
 The server stores UUID and case-insensitive username indexes together with the typed profile in EF7. Each profile update is one EF7 CoW-tree publication. These commands are rejected while the connection has an open SQL transaction: SQL and EF7 are separate durability domains and do not yet share a cross-domain commit.
 
