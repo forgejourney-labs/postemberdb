@@ -134,22 +134,22 @@ fn main() {
         let player_lookup_elapsed = player_lookup_start.elapsed();
 
         const EF7_PROFILE_COUNT: usize = 128;
-        let profile_start = Instant::now();
-        for id in 0..EF7_PROFILE_COUNT {
+        let profile_batch = (0..EF7_PROFILE_COUNT).map(|id| {
             let mut uuid = [0u8; 16];
             uuid[..8].copy_from_slice(&((10_000 + id) as u64).to_be_bytes());
             uuid[8..].copy_from_slice(&((20_000 + id) as u64).to_be_bytes());
-            let profile = EmberForge7PlayerProfile {
+            (1u64, 10_000 + id as u64, EmberForge7PlayerProfile {
                 uuid,
                 username: format!("Player_{id}"),
                 first_joined_ms: 1_700_000_000_000,
                 last_seen_ms: 1_700_000_100_000,
                 playtime_ticks: (id as u64) * 20,
                 custom_data: vec![(id % 251) as u8; 1_024],
-            };
-            ef7.put_player_profile(1, 10_000 + id as u64, &profile)
-                .expect("write typed EF7 player profile");
-        }
+            })
+        }).collect::<Vec<_>>();
+        let profile_start = Instant::now();
+        ef7.apply_player_profile_batch(&profile_batch, &[])
+            .expect("atomic EF7 typed player profile batch");
         let profile_write_elapsed = profile_start.elapsed();
         let name_search_start = Instant::now();
         let matches = ef7.search_player_profiles_by_name(1, "player_1", 100)
