@@ -13,9 +13,11 @@ mod storage;
 mod sql;
 mod kv;
 pub mod protocol;
+pub mod auth;
 pub mod version;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
+pub use auth::{AuthStore, Permission, Permissions, Principal};
 pub use storage::record_store::RecordStore;
 pub use storage::sql_rows::SqlRowStore;
 pub use storage::transaction_coordinator::{CoordinatorParticipant, RecoveredTransaction, TransactionCoordinator, TransactionState};
