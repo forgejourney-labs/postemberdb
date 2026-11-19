@@ -299,6 +299,22 @@ impl CoordinatorParticipant for crate::KeyValueStore {
     }
 }
 
+impl CoordinatorParticipant for crate::storage::emberforge7::EmberForge7Store {
+    fn participant_id(&self) -> u8 { 3 }
+    fn has_prepared(&self, transaction_id: u64) -> bool {
+        self.pending_prepared_transactions().contains(&transaction_id)
+    }
+    fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::storage::emberforge7::EmberForge7Store::commit_prepared(self, transaction_id)
+    }
+    fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::storage::emberforge7::EmberForge7Store::finalize_prepared(self, transaction_id)
+    }
+    fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        crate::storage::emberforge7::EmberForge7Store::rollback_prepared(self, transaction_id)
+    }
+}
+
 impl CoordinatorParticipant for crate::Registry {
     fn participant_id(&self) -> u8 { 2 }
     fn has_prepared(&self, transaction_id: u64) -> bool {
@@ -446,6 +462,36 @@ mod tests {
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"] {
             let mut candidate = kv_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
+    fn coordinator_applies_prepared_ef7_chunk_after_reopen() {
+        let coordinator_path = path();
+        let ef7_path = coordinator_path.with_extension("ef7");
+        {
+            let mut store = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
+            store.create_namespace(1, None, crate::storage::emberforge7::EmberForge7NamespaceKind::World, "world").unwrap();
+            store.put_chunk(1, 4, -8, b"old").unwrap();
+            store.prepare_put_chunk(9, 1, 4, -8, b"new payload").unwrap();
+        }
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut store = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
+            assert_eq!(store.pending_prepared_transactions(), vec![9]);
+            let tx = coordinator.begin(1).unwrap();
+            coordinator.mark_prepared(tx, 3).unwrap();
+            coordinator.commit(tx).unwrap();
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut store];
+            coordinator.apply_committed(tx, &mut participants).unwrap();
+            assert_eq!(store.get_chunk(1, 4, -8).unwrap(), Some(b"new payload".to_vec()));
+            assert!(store.pending_prepared_transactions().is_empty());
+        }
+        for suffix in [".ef7.lock", ".ef7.pages", ".ef7.wal", ".ef7.wal.prepared.9"] {
+            let mut candidate = ef7_path.as_os_str().to_os_string();
             candidate.push(suffix);
             let _ = fs::remove_file(PathBuf::from(candidate));
         }

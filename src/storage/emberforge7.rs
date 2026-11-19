@@ -4,7 +4,7 @@
 //! sidecar and a record format designed for large game records and UUID lookups.
 //! Payload pages are synced before the descriptor/index root is published.
 
-use super::{extent::{self, ExtentFile}, page_tree};
+use super::{extent::{self, ExtentFile}, page_tree, participant::{self, PreparedBatch}};
 use crate::DbError;
 use fs2::FileExt;
 use std::collections::BTreeSet;
@@ -428,6 +428,7 @@ pub struct EmberForge7Store {
     pages: ExtentFile,
     wal_path: PathBuf,
     _lock_file: File,
+    prepared_transactions: BTreeSet<u64>,
 }
 
 impl EmberForge7Store {
@@ -448,9 +449,97 @@ impl EmberForge7Store {
         let mut pages = ExtentFile::open_with_cache_capacity(pages_path, cache_capacity_pages)?;
         page_tree::recover(&mut pages, &wal_path)?;
         page_tree::validate_tree(&mut pages)?;
-        Ok(Self { pages, wal_path, _lock_file: lock_file })
+        let prepared_transactions = participant::list_prepared(&wal_path)?;
+        Ok(Self { pages, wal_path, _lock_file: lock_file, prepared_transactions })
     }
 
+
+    /// Stages raw EF7 keyspace mutations for a coordinator transaction.
+    /// Payload extents must be synced before they are referenced by this batch.
+    pub fn prepare_batch(
+        &mut self,
+        transaction_id: u64,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        self.ensure_no_prepared_transactions()?;
+        let batch = PreparedBatch { removals: removals.to_vec(), upserts: upserts.to_vec() };
+        participant::write_prepared(&self.wal_path, transaction_id, &batch)?;
+        self.prepared_transactions.insert(transaction_id);
+        Ok(())
+    }
+
+    /// Stages a chunk replacement. New payload pages are synced before the
+    /// descriptor is placed in the durable participant prepare file.
+    pub fn prepare_put_chunk(
+        &mut self,
+        transaction_id: u64,
+        world_namespace_id: u64,
+        chunk_x: i32,
+        chunk_z: i32,
+        payload: &[u8],
+    ) -> Result<(), DbError> {
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        let descriptor = self.write_payload(payload)?;
+        self.prepare_batch(transaction_id, &[], &[(key, descriptor.encode()?)])
+    }
+
+    /// Stages deletion of a chunk without releasing its old payload extent.
+    /// Reclamation is deferred to a later reachability-aware vacuum.
+    pub fn prepare_delete_chunk(
+        &mut self,
+        transaction_id: u64,
+        world_namespace_id: u64,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Result<bool, DbError> {
+        self.ensure_no_prepared_transactions()?;
+        let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
+        if page_tree::get(&mut self.pages, &key)?.is_none() { return Ok(false); }
+        self.prepare_batch(transaction_id, &[key], &[])?;
+        Ok(true)
+    }
+
+    /// Replays a prepared EF7 batch. Reapplying the same key mutations is safe
+    /// if the process crashes before the coordinator's APPLIED acknowledgement.
+    pub fn commit_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        let batch = participant::read_prepared(&self.wal_path, transaction_id)?;
+        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &batch.removals, &batch.upserts)?;
+        Ok(())
+    }
+
+    pub fn finalize_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)?;
+        self.prepared_transactions.remove(&transaction_id);
+        Ok(())
+    }
+
+    pub fn rollback_prepared(&mut self, transaction_id: u64) -> Result<(), DbError> {
+        participant::remove_prepared(&self.wal_path, transaction_id)?;
+        self.prepared_transactions.remove(&transaction_id);
+        Ok(())
+    }
+
+    pub fn pending_prepared_transactions(&self) -> Vec<u64> {
+        self.prepared_transactions.iter().copied().collect()
+    }
+
+    fn ensure_no_prepared_transactions(&self) -> Result<(), DbError> {
+        if self.prepared_transactions.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Storage("EF7 writes are blocked while a coordinator transaction is unresolved".into()))
+        }
+    }
+
+    fn apply_mutations(
+        &mut self,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(usize, usize), DbError> {
+        self.ensure_no_prepared_transactions()?;
+        page_tree::apply_mutations(&mut self.pages, &self.wal_path, removals, upserts)
+    }
 
     /// Creates a namespace and its parent-scoped name index atomically.
     pub fn create_namespace(
@@ -475,8 +564,7 @@ impl EmberForge7Store {
         if page_tree::get(&mut self.pages, &name_key)?.is_some() {
             return Err(DbError::Constraint("EF7 namespace name already exists under this parent".into()));
         }
-        page_tree::apply_mutations(
-            &mut self.pages, &self.wal_path, &[],
+        self.apply_mutations(&[],
             &[(metadata_key, namespace.encode()?), (name_key, id.to_be_bytes().to_vec())],
         )?;
         Ok(namespace)
@@ -569,8 +657,7 @@ impl EmberForge7Store {
         }
         let metadata_key = namespace_key(id)?;
         let name_key = namespace_name_key(namespace.parent_id, &namespace.name)?;
-        let (removed, _) = page_tree::apply_mutations(
-            &mut self.pages, &self.wal_path, &[metadata_key, name_key], &[],
+        let (removed, _) = self.apply_mutations(&[metadata_key, name_key], &[],
         )?;
         if removed != 2 {
             return Err(DbError::Storage("EF7 namespace deletion did not remove both metadata keys".into()));
@@ -589,8 +676,7 @@ impl EmberForge7Store {
         let previous = page_tree::get(&mut self.pages, &key)?
             .map(|value| RecordDescriptor::decode(&value)).transpose()?;
         let next = self.write_payload(payload)?;
-        page_tree::apply_mutations(
-            &mut self.pages, &self.wal_path, &[], &[(key, next.encode()?)],
+        self.apply_mutations(&[], &[(key, next.encode()?)],
         )?;
         if let Some(old) = previous {
             if old.start_page != next.start_page {
@@ -637,7 +723,7 @@ impl EmberForge7Store {
         let key = chunk_key(world_namespace_id, chunk_x, chunk_z)?;
         let Some(value) = page_tree::get(&mut self.pages, &key)? else { return Ok(false); };
         let descriptor = RecordDescriptor::decode(&value)?;
-        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &[key], &[])?;
+        let (removed, _) = self.apply_mutations(&[key], &[])?;
         if removed != 1 {
             return Err(DbError::Storage("EF7 chunk deletion did not remove its index entry".into()));
         }
@@ -730,7 +816,7 @@ impl EmberForge7Store {
         // Releasing it here could free pages if the root became durable just
         // before the error was reported; unreachable pages are reclaimed by
         // future recovery/vacuum work instead of risking a live-record alias.
-        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)?;
+        self.apply_mutations(&removals, &upserts)?;
         if let Some(previous) = old {
             if previous.start_page != descriptor.start_page {
                 self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
@@ -775,7 +861,7 @@ impl EmberForge7Store {
             }
         }
         let expected_removed = removals.len();
-        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
+        let (removed, _) = self.apply_mutations(&removals, &[])?;
         if removed != expected_removed {
             return Err(DbError::Storage("EF7 TTL sweep did not remove every indexed key".into()));
         }
@@ -831,7 +917,7 @@ impl EmberForge7Store {
             removals.push(record_ttl_key(expiry, namespace_id, record_id)?);
         }
         let expected_removed = removals.len();
-        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
+        let (removed, _) = self.apply_mutations(&removals, &[])?;
         if removed != expected_removed {
             return Err(DbError::Storage("EF7 record deletion did not remove all descriptor and TTL keys".into()));
         }
@@ -1052,7 +1138,7 @@ impl EmberForge7Store {
             }
             removals.push(name_key);
         }
-        let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
+        let (removed, _) = self.apply_mutations(&removals, &[])?;
         if removed != removals.len() {
             return Err(DbError::Storage("EF7 player deletion did not remove all identity keys".into()));
         }
@@ -1133,7 +1219,7 @@ impl EmberForge7Store {
         if let Some(key) = name_key {
             upserts.push((key, row_id.to_be_bytes().to_vec()));
         }
-        page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &upserts)?;
+        self.apply_mutations(&removals, &upserts)?;
         if let Some(previous) = previous_descriptor {
             if previous.start_page != next_descriptor.start_page {
                 self.pages.release_extent(previous.start_page, previous.page_count as u64)?;
@@ -1400,7 +1486,7 @@ impl EmberForge7Store {
             }
         }
 
-        let counts = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removal_keys, &upsert_entries)?;
+        let counts = self.apply_mutations(&removal_keys, &upsert_entries)?;
         for descriptor in removed_extents {
             self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
         }
@@ -1468,8 +1554,7 @@ impl EmberForge7Store {
             upsert_entries.push((key, next.encode()?));
             replaced_extents.push((previous, next));
         }
-        let counts = page_tree::apply_mutations(
-            &mut self.pages, &self.wal_path, &removal_keys, &upsert_entries,
+        let counts = self.apply_mutations(&removal_keys, &upsert_entries,
         )?;
         for descriptor in removed_extents {
             self.pages.release_extent(descriptor.start_page, descriptor.page_count as u64)?;
@@ -1501,6 +1586,7 @@ impl EmberForge7Store {
     }
 
     fn write_payload(&mut self, payload: &[u8]) -> Result<RecordDescriptor, DbError> {
+        self.ensure_no_prepared_transactions()?;
         if payload.len() > MAX_RECORD_BYTES {
             return Err(DbError::Constraint("EF7 record exceeds the 64 MiB limit".into()));
         }
