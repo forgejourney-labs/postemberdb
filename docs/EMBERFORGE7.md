@@ -81,6 +81,18 @@ World chunk data can be stored directly by signed chunk coordinates:
 
 Chunk descriptors are their own B+ tree entries and point to the same checked overflow-page format. Updating a chunk publishes one new descriptor root and reclaims the previous extent afterward. Region-level batches accept up to 2,500 upserts/removals and 256 MiB of aggregate payload, publishing all chunk-index changes through one redo/root update. Duplicate and overlapping coordinates are rejected before page allocation. Rectangular scans iterate ordered X columns and issue bounded Z-range scans. A query can cover at most 4,096 X columns and return at most 10,000 chunks.
 
+## KSL JSONL/1 adapter
+
+The optional KotlinScriptLoader addon exposes these EF7 operations through the loopback-only JSONL/1 bridge:
+
+- Namespace administration: `NS_CREATE`, `NS_GET`, `NS_FIND`, `NS_LIST`, and `NS_DELETE`.
+- Typed player profiles: `PROFILE_PUT`, `PROFILE_GET`, `PROFILE_GET_NAME`, `PLAYER_DELETE`, and `PROFILE_BATCH`.
+- Chunk CRUD: `CHUNK_PUT`, `CHUNK_GET`, and `CHUNK_DELETE`.
+
+The adapter caps namespace listing at 64 entries per request. Since chunk bytes are hex-encoded inside a 64 KiB line, the KSL bridge accepts at most 24 KiB per profile custom-data payload and 24 KiB per chunk payload. Chunk reads inspect the persistent descriptor's recorded length before loading payload pages; a larger native chunk is rejected before its bytes are materialized for the response. The native Rust API remains capable of 64 MiB records/chunks.
+
+Chunk-range streaming, atomic chunk batches, and large binary payload transfer are not exposed through JSONL/1. They require a separate length-framed binary protocol with explicit per-frame and aggregate budgets rather than increasing the current line limit. All bridge calls remain loopback-only, and EF7 operations cannot join a SQL transaction.
+
 ## Bounds and validation
 
 - Maximum generic/player/chunk payload: 64 MiB per record.
