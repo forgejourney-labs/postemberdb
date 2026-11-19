@@ -34,7 +34,7 @@ pub enum FrameKind {
 impl TryFrom<u8> for FrameKind {
     type Error = io::Error;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self, io::Error> {
         match value {
             1 => Ok(Self::Query),
             2 => Ok(Self::QueryResult),
