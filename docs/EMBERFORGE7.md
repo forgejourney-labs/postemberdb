@@ -23,6 +23,8 @@ Logical entries share one persistent B+ tree root. Large record payloads live in
 | `0x54` | Player row identity metadata |
 | `0x55` | Minecraft chunk descriptors |
 | `0x56` | Parent-scoped namespace-name index |
+| `0x57` | Generic-record TTL index ordered by expiry, namespace, and record ID |
+| `0x58` | Per-record TTL metadata used to replace/delete expiry entries |
 
 Keys use big-endian numeric components for stable ordering. Signed chunk coordinates flip the sign bit before encoding, so B+ tree order follows signed X then signed Z order.
 
@@ -69,6 +71,18 @@ UUID and name indexes are namespace-scoped. Player row identity metadata remembe
 
 The UUID scan uses an exclusive cursor and a bounded result limit. Name-prefix scans are case-insensitive and bounded. Both cap a single result page at 10,000 entries.
 
+## Generic records and TTL
+
+Generic plugin records support an optional absolute Unix-millisecond expiry:
+
+- `put_record(namespace_id, record_id, payload)` stores a non-expiring record and clears any prior TTL association.
+- `put_record_with_expiry(namespace_id, record_id, expires_at_ms, payload)` publishes the descriptor and expiry indexes together.
+- `get_record_limited(namespace_id, record_id, max_bytes)` checks the descriptor length before reading overflow pages.
+- `delete_record(namespace_id, record_id)` removes the descriptor and its optional TTL keys in one publication.
+- `sweep_expired_records(now_ms, limit)` removes up to 10,000 records per call whose expiry is at or before the supplied timestamp.
+
+Expiry keys use big-endian components so the tree orders them by deadline. A metadata key per record identifies its current deadline, allowing a replacement to remove the old index entry. The sweep validates index/metadata agreement, publishes all removals in one CoW redo/root update, then reclaims payload extents. The caller supplies time and cleanup budget; EF7 does not start a background timer.
+
 ## Minecraft chunk storage
 
 World chunk data can be stored directly by signed chunk coordinates:
@@ -83,7 +97,7 @@ Chunk descriptors are their own B+ tree entries and point to the same checked ov
 
 ## KSL JSONL/1 adapter
 
-The optional KotlinScriptLoader addon exposes these EF7 operations through the loopback-only JSONL/1 bridge:
+The optional KotlinScriptLoader addon exposes EF7 namespace, profile, chunk, and generic-record operations through the loopback-only JSONL/1 bridge. The Rust server additionally exposes the initial Binary/1 transport, and the Kotlin client now has opt-in framed SQL and single-frame chunk methods:
 
 - Namespace administration: `NS_CREATE`, `NS_GET`, `NS_FIND`, `NS_LIST`, and `NS_DELETE`.
 - Typed player profiles: `PROFILE_PUT`, `PROFILE_GET`, `PROFILE_GET_NAME`, `PLAYER_DELETE`, and `PROFILE_BATCH`.
@@ -91,7 +105,7 @@ The optional KotlinScriptLoader addon exposes these EF7 operations through the l
 
 The adapter caps namespace listing at 64 entries per request. Since chunk bytes are hex-encoded inside a 64 KiB line, the KSL bridge accepts at most 24 KiB per profile custom-data payload and 24 KiB per chunk payload. Chunk reads inspect the persistent descriptor's recorded length before loading payload pages; a larger native chunk is rejected before its bytes are materialized for the response. The native Rust API remains capable of 64 MiB records/chunks.
 
-Chunk-range streaming, atomic chunk batches, and large binary payload transfer are not exposed through JSONL/1. They require a separate length-framed binary protocol with explicit per-frame and aggregate budgets rather than increasing the current line limit. All bridge calls remain loopback-only, and EF7 operations cannot join a SQL transaction.
+The initial Binary/1 transport and Kotlin client support single-frame chunk transfers up to 8 MiB. Multi-frame chunk streaming, atomic chunk batches, range scans over the wire, flow control, and aggregate in-flight budgets remain pending. JSONL/1 remains capped at 24 KiB for hex-encoded chunk and record payloads. All bridge calls remain loopback-only, and EF7 operations cannot join a SQL transaction.
 
 ## Bounds and validation
 
