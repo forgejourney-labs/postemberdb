@@ -3,6 +3,7 @@
 use super::{extent::ExtentFile, page_tree};
 use crate::{DbError, PageCacheStats};
 use fs2::FileExt;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,8 @@ const RECORD_PAGE_HEADER_BYTES: usize = 40;
 const RECORD_CHUNK_BYTES: usize = super::extent::page_payload_size() - RECORD_PAGE_HEADER_BYTES;
 const DESCRIPTOR_BYTES: usize = 32;
 const MAX_RECORD_PAGES: usize = (MAX_RECORD_BYTES + RECORD_CHUNK_BYTES - 1) / RECORD_CHUNK_BYTES;
+const MAX_BATCH_RECORDS: usize = 5_000;
+const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
@@ -124,54 +127,89 @@ impl RecordStore {
         record_id.to_be_bytes().to_vec()
     }
 
-    /// Inserts or atomically replaces a record, including records larger than one page.
-    ///
-    /// Record pages are synced before the descriptor is published through the
-    /// page-tree redo WAL. A crash before publication can leak unreachable pages,
-    /// but cannot expose a partial record.
+    /// Inserts or atomically replaces one record, including multi-page records.
     pub fn put(&mut self, record_id: u64, bytes: &[u8]) -> Result<(), DbError> {
-        Self::validate_record_id(record_id)?;
-        if bytes.len() > MAX_RECORD_BYTES {
+        self.put_many([(record_id, bytes.to_vec())]).map(|_| ())
+    }
+
+    /// Writes up to 5,000 records with one B+ Tree redo record and root publication.
+    ///
+    /// Duplicate IDs use last-write-wins semantics. All IDs, sizes, and the
+    /// aggregate batch budget are checked before any page is allocated. Every
+    /// data extent is synced before the descriptor batch is published; a crash
+    /// before publication can leak unreachable extents but cannot expose a
+    /// partial batch.
+    pub fn put_many<I>(&mut self, records: I) -> Result<usize, DbError>
+    where
+        I: IntoIterator<Item = (u64, Vec<u8>)>,
+    {
+        let batch = records.into_iter().take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
+        if batch.len() > MAX_BATCH_RECORDS {
             return Err(DbError::Constraint(format!(
-                "record exceeds the {MAX_RECORD_BYTES}-byte limit"
+                "record batch exceeds the maximum of {MAX_BATCH_RECORDS} records"
+            )));
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unique = BTreeMap::<u64, Vec<u8>>::new();
+        for (record_id, bytes) in batch {
+            Self::validate_record_id(record_id)?;
+            if bytes.len() > MAX_RECORD_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "record exceeds the {MAX_RECORD_BYTES}-byte limit"
+                )));
+            }
+            unique.insert(record_id, bytes);
+        }
+
+        let total_batch_bytes = unique.values().try_fold(0usize, |total, bytes| {
+            total.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("record batch byte count overflow".into()))
+        })?;
+        if total_batch_bytes > MAX_BATCH_BYTES {
+            return Err(DbError::Constraint(format!(
+                "record batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
             )));
         }
 
-        let page_count = bytes.len().max(1).div_ceil(RECORD_CHUNK_BYTES);
-        if page_count > MAX_RECORD_PAGES {
-            return Err(DbError::Constraint("record requires too many pages".into()));
-        }
-        let checksum = super::checksum(bytes);
-        let first_page_id = self.store.allocate_extent(page_count as u64)?;
-        for page_index in 0..page_count {
-            let start = page_index * RECORD_CHUNK_BYTES;
-            let end = bytes.len().min(start + RECORD_CHUNK_BYTES);
-            let chunk = &bytes[start..end];
+        let mut descriptors = Vec::with_capacity(unique.len());
+        for (record_id, bytes) in &unique {
+            let page_count = bytes.len().max(1).div_ceil(RECORD_CHUNK_BYTES);
+            if page_count > MAX_RECORD_PAGES {
+                return Err(DbError::Constraint("record requires too many pages".into()));
+            }
+            let checksum = super::checksum(bytes);
+            let first_page_id = self.store.allocate_extent(page_count as u64)?;
+            for page_index in 0..page_count {
+                let start = page_index * RECORD_CHUNK_BYTES;
+                let end = bytes.len().min(start + RECORD_CHUNK_BYTES);
+                let chunk = &bytes[start..end];
 
-            let mut payload = Vec::with_capacity(RECORD_PAGE_HEADER_BYTES + chunk.len());
-            payload.extend_from_slice(RECORD_PAGE_MAGIC);
-            payload.extend_from_slice(&record_id.to_le_bytes());
-            payload.extend_from_slice(&(page_index as u32).to_le_bytes());
-            payload.extend_from_slice(&(page_count as u32).to_le_bytes());
-            payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            payload.extend_from_slice(&checksum.to_le_bytes());
-            payload.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-            payload.extend_from_slice(chunk);
-            self.store.write_page(first_page_id + page_index as u64, &payload)?;
+                let mut payload = Vec::with_capacity(RECORD_PAGE_HEADER_BYTES + chunk.len());
+                payload.extend_from_slice(RECORD_PAGE_MAGIC);
+                payload.extend_from_slice(&record_id.to_le_bytes());
+                payload.extend_from_slice(&(page_index as u32).to_le_bytes());
+                payload.extend_from_slice(&(page_count as u32).to_le_bytes());
+                payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                payload.extend_from_slice(&checksum.to_le_bytes());
+                payload.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+                payload.extend_from_slice(chunk);
+                self.store.write_page(first_page_id + page_index as u64, &payload)?;
+            }
+
+            let descriptor = RecordDescriptor {
+                first_page_id,
+                page_count: page_count as u32,
+                total_len: bytes.len() as u64,
+                checksum,
+            };
+            descriptors.push((Self::record_key(*record_id), descriptor.encode().to_vec()));
         }
 
-        let descriptor = RecordDescriptor {
-            first_page_id,
-            page_count: page_count as u32,
-            total_len: bytes.len() as u64,
-            checksum,
-        };
-        page_tree::insert_or_replace(
-            &mut self.store,
-            &self.wal_path,
-            &Self::record_key(record_id),
-            &descriptor.encode(),
-        )
+        page_tree::insert_many(&mut self.store, &self.wal_path, &descriptors)?;
+        Ok(unique.len())
     }
 
     /// Reads and validates a complete record. Missing IDs return None.
@@ -223,15 +261,30 @@ impl RecordStore {
         Ok(Some(output))
     }
 
-    /// Removes a record reference. Its old data pages remain allocated until vacuum.
+    /// Removes one record reference. Its old data pages remain allocated until vacuum.
     pub fn delete(&mut self, record_id: u64) -> Result<bool, DbError> {
-        Self::validate_record_id(record_id)?;
-        let key = Self::record_key(record_id);
-        if page_tree::get(&mut self.store, &key)?.is_none() {
-            return Ok(false);
+        Ok(self.delete_many([record_id])? != 0)
+    }
+
+    /// Removes up to 5,000 record descriptors through one CoW root publication.
+    /// Duplicate IDs are coalesced; missing IDs are ignored.
+    pub fn delete_many<I>(&mut self, record_ids: I) -> Result<usize, DbError>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let batch = record_ids.into_iter().take(MAX_BATCH_RECORDS + 1).collect::<Vec<_>>();
+        if batch.len() > MAX_BATCH_RECORDS {
+            return Err(DbError::Constraint(format!(
+                "record delete batch exceeds the maximum of {MAX_BATCH_RECORDS} IDs"
+            )));
         }
-        let removed = page_tree::remove_many(&mut self.store, &self.wal_path, &[key])?;
-        Ok(removed != 0)
+        let mut unique = BTreeSet::new();
+        for record_id in batch {
+            Self::validate_record_id(record_id)?;
+            unique.insert(record_id);
+        }
+        let keys = unique.into_iter().map(Self::record_key).collect::<Vec<_>>();
+        page_tree::remove_many(&mut self.store, &self.wal_path, &keys)
     }
 
     /// Checks whether a record descriptor exists.
@@ -302,6 +355,43 @@ mod tests {
         assert!(!reopened.delete(7).unwrap());
         assert_eq!(reopened.get(7).unwrap(), None);
         drop(reopened);
+        remove_store_files(&path);
+    }
+
+    #[test]
+    fn record_store_batches_multiple_ids_with_last_write_wins() {
+        let path = temp_path("batch");
+        let mut store = RecordStore::open(&path).unwrap();
+        assert_eq!(store.put_many(vec![
+            (10, b"old".to_vec()),
+            (11, vec![0xA5; 25_000]),
+            (10, b"new".to_vec()),
+            (12, Vec::new()),
+        ]).unwrap(), 3);
+
+        assert_eq!(store.get(10).unwrap(), Some(b"new".to_vec()));
+        assert_eq!(store.get(11).unwrap(), Some(vec![0xA5; 25_000]));
+        assert_eq!(store.get(12).unwrap(), Some(Vec::new()));
+        assert_eq!(store.delete_many([10, 10, 404, 11]).unwrap(), 2);
+        assert_eq!(store.get(10).unwrap(), None);
+        assert_eq!(store.get(11).unwrap(), None);
+        assert_eq!(store.get(12).unwrap(), Some(Vec::new()));
+        drop(store);
+        remove_store_files(&path);
+    }
+
+    #[test]
+    fn record_store_validates_batch_before_reserving_any_pages() {
+        let path = temp_path("batch-validation");
+        let mut store = RecordStore::open(&path).unwrap();
+        let initial_pages = store.store.stats().allocated_pages;
+        assert!(store.put_many(vec![
+            (1, b"valid".to_vec()),
+            (0, b"invalid id".to_vec()),
+        ]).is_err());
+        assert_eq!(store.store.stats().allocated_pages, initial_pages);
+        assert_eq!(store.get(1).unwrap(), None);
+        drop(store);
         remove_store_files(&path);
     }
 
