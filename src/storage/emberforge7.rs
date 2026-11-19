@@ -64,6 +64,14 @@ struct PlayerIdentity {
     username: Option<String>,
 }
 
+struct PlayerBatchUpsert<'a> {
+    namespace_id: u64,
+    row_id: u64,
+    uuid: [u8; 16],
+    username: Option<String>,
+    payload: &'a [u8],
+}
+
 fn normalize_namespace_name(name: &str) -> Result<String, DbError> {
     if name.is_empty() || name.len() > 128 || !name.is_ascii() {
         return Err(DbError::Constraint("EF7 namespace names must contain 1..=128 ASCII characters".into()));
@@ -985,10 +993,62 @@ impl EmberForge7Store {
         Ok(found)
     }
 
-    /// Applies a bounded player batch using a single CoW redo record/root publication.
+
+    /// Raw player batch with one CoW redo record/root publication.
+    /// Raw writes intentionally clear any prior username association for that row.
     pub fn apply_player_batch(
         &mut self,
         upserts: &[(u64, u64, [u8; 16], Vec<u8>)],
+        removals: &[(u64, u64, [u8; 16])],
+    ) -> Result<(usize, usize), DbError> {
+        let prepared = upserts.iter().map(|(namespace_id, row_id, uuid, payload)| PlayerBatchUpsert {
+            namespace_id: *namespace_id,
+            row_id: *row_id,
+            uuid: *uuid,
+            username: None,
+            payload,
+        }).collect::<Vec<_>>();
+        self.apply_player_batch_internal(&prepared, removals)
+    }
+
+    /// Typed player profile batch. Profiles, UUID mappings, username mappings,
+    /// and row identities are committed in one descriptor-tree publication.
+    pub fn apply_player_profile_batch(
+        &mut self,
+        upserts: &[(u64, u64, EmberForge7PlayerProfile)],
+        removals: &[(u64, u64, [u8; 16])],
+    ) -> Result<(usize, usize), DbError> {
+        const MAX_BATCH_PLAYERS: usize = 2_500;
+        const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
+        if upserts.len().saturating_add(removals.len()) > MAX_BATCH_PLAYERS {
+            return Err(DbError::Constraint(format!("EF7 profile batch exceeds {MAX_BATCH_PLAYERS} operations")));
+        }
+        let mut payloads = Vec::with_capacity(upserts.len());
+        let mut total_bytes = 0usize;
+        for (_, _, profile) in upserts {
+            let encoded = profile.encode()?;
+            total_bytes = total_bytes.checked_add(encoded.len())
+                .ok_or_else(|| DbError::Constraint("EF7 profile batch byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint("EF7 profile batch exceeds 256 MiB of payload data".into()));
+            }
+            payloads.push(encoded);
+        }
+        let prepared = upserts.iter().zip(payloads.iter()).map(|((namespace_id, row_id, profile), payload)| {
+            PlayerBatchUpsert {
+                namespace_id: *namespace_id,
+                row_id: *row_id,
+                uuid: profile.uuid,
+                username: Some(profile.username.clone()),
+                payload,
+            }
+        }).collect::<Vec<_>>();
+        self.apply_player_batch_internal(&prepared, removals)
+    }
+
+    fn apply_player_batch_internal(
+        &mut self,
+        upserts: &[PlayerBatchUpsert<'_>],
         removals: &[(u64, u64, [u8; 16])],
     ) -> Result<(usize, usize), DbError> {
         if upserts.is_empty() && removals.is_empty() { return Ok((0, 0)); }
@@ -1000,17 +1060,25 @@ impl EmberForge7Store {
 
         let mut upsert_rows = BTreeSet::new();
         let mut upsert_uuids = BTreeSet::new();
+        let mut upsert_names = BTreeSet::new();
         let mut total_bytes = 0usize;
-        for (namespace_id, row_id, uuid, payload) in upserts {
-            let row = record_key(*namespace_id, *row_id)?;
-            let lookup = uuid_key(*namespace_id, uuid)?;
+        for item in upserts {
+            let row = record_key(item.namespace_id, item.row_id)?;
+            let lookup = uuid_key(item.namespace_id, &item.uuid)?;
             if !upsert_rows.insert(row) || !upsert_uuids.insert(lookup) {
                 return Err(DbError::Constraint("EF7 batch contains duplicate player row IDs or UUIDs".into()));
             }
-            if payload.len() > MAX_RECORD_BYTES {
+            if let Some(name) = &item.username {
+                let canonical = normalize_player_name(name)?;
+                let name_key = player_name_key(item.namespace_id, &canonical)?;
+                if !upsert_names.insert(name_key) {
+                    return Err(DbError::Constraint("EF7 profile batch contains duplicate player names".into()));
+                }
+            }
+            if item.payload.len() > MAX_RECORD_BYTES {
                 return Err(DbError::Constraint("EF7 player record exceeds 64 MiB".into()));
             }
-            total_bytes = total_bytes.checked_add(payload.len())
+            total_bytes = total_bytes.checked_add(item.payload.len())
                 .ok_or_else(|| DbError::Constraint("EF7 batch byte count overflow".into()))?;
             if total_bytes > MAX_BATCH_BYTES {
                 return Err(DbError::Constraint("EF7 batch exceeds 256 MiB of payload data".into()));
@@ -1064,46 +1132,67 @@ impl EmberForge7Store {
             }
         }
 
-        let mut upsert_entries = Vec::with_capacity(upserts.len() * 3);
+        let mut upsert_entries = Vec::with_capacity(upserts.len() * 4);
         let mut replaced_extents = Vec::with_capacity(upserts.len());
-        for (namespace_id, row_id, uuid, payload) in upserts {
-            let row_key = record_key(*namespace_id, *row_id)?;
-            let lookup_key = uuid_key(*namespace_id, uuid)?;
-            let identity_key = player_identity_key(*namespace_id, *row_id)?;
+        for item in upserts {
+            let row_key = record_key(item.namespace_id, item.row_id)?;
+            let lookup_key = uuid_key(item.namespace_id, &item.uuid)?;
+            let identity_key = player_identity_key(item.namespace_id, item.row_id)?;
+            let normalized_name = item.username.as_deref().map(normalize_player_name).transpose()?;
+            let next_name_key = normalized_name.as_deref()
+                .map(|name| player_name_key(item.namespace_id, name)).transpose()?;
+
             if let Some(value) = page_tree::get(&mut self.pages, &lookup_key)? {
-                if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != *row_id {
+                if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != item.row_id {
                     return Err(DbError::Constraint("player UUID is already assigned to another record".into()));
                 }
             }
+            if let Some(name_key) = &next_name_key {
+                if let Some(value) = page_tree::get(&mut self.pages, name_key)? {
+                    if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != item.row_id {
+                        return Err(DbError::Constraint("Minecraft player name is already assigned in this namespace".into()));
+                    }
+                }
+            }
+
             let previous = self.pages_descriptor(&row_key)?;
-            let old_identity = self.player_identity_for_row(*namespace_id, *row_id)?;
+            let old_identity = self.player_identity_for_row(item.namespace_id, item.row_id)?;
             if previous.is_some() && old_identity.is_none() {
                 return Err(DbError::Constraint("EF7 row ID is already used by a non-player record".into()));
             }
             if let Some(old) = &old_identity {
-                if old.uuid != *uuid {
-                    let old_key = uuid_key(*namespace_id, &old.uuid)?;
+                if old.uuid != item.uuid {
+                    let old_key = uuid_key(item.namespace_id, &old.uuid)?;
                     let old_value = page_tree::get(&mut self.pages, &old_key)?
                         .ok_or_else(|| DbError::Storage("previous EF7 player UUID index is missing".into()))?;
-                    if old_value.len() != 8 || u64::from_be_bytes(old_value[..8].try_into().unwrap()) != *row_id {
+                    if old_value.len() != 8 || u64::from_be_bytes(old_value[..8].try_into().unwrap()) != item.row_id {
                         return Err(DbError::Storage("previous EF7 player UUID index is inconsistent".into()));
                     }
                     removal_keys.push(old_key);
                 }
-                if let Some(name) = &old.username {
-                    let old_name_key = player_name_key(*namespace_id, name)?;
-                    let old_name_value = page_tree::get(&mut self.pages, &old_name_key)?
-                        .ok_or_else(|| DbError::Storage("previous EF7 player-name index is missing".into()))?;
-                    if old_name_value.len() != 8 || u64::from_be_bytes(old_name_value[..8].try_into().unwrap()) != *row_id {
-                        return Err(DbError::Storage("previous EF7 player-name index is inconsistent".into()));
+                if old.username != normalized_name {
+                    if let Some(name) = &old.username {
+                        let old_name_key = player_name_key(item.namespace_id, name)?;
+                        let old_name_value = page_tree::get(&mut self.pages, &old_name_key)?
+                            .ok_or_else(|| DbError::Storage("previous EF7 player-name index is missing".into()))?;
+                        if old_name_value.len() != 8 || u64::from_be_bytes(old_name_value[..8].try_into().unwrap()) != item.row_id {
+                            return Err(DbError::Storage("previous EF7 player-name index is inconsistent".into()));
+                        }
+                        removal_keys.push(old_name_key);
                     }
-                    removal_keys.push(old_name_key);
                 }
             }
-            let next = self.write_payload(payload)?;
+
+            let next = self.write_payload(item.payload)?;
             upsert_entries.push((row_key, next.encode()?));
-            upsert_entries.push((lookup_key, row_id.to_be_bytes().to_vec()));
-            upsert_entries.push((identity_key, PlayerIdentity { uuid: *uuid, username: None }.encode()?));
+            upsert_entries.push((lookup_key, item.row_id.to_be_bytes().to_vec()));
+            upsert_entries.push((identity_key, PlayerIdentity {
+                uuid: item.uuid,
+                username: normalized_name.clone(),
+            }.encode()?));
+            if let Some(name_key) = next_name_key {
+                upsert_entries.push((name_key, item.row_id.to_be_bytes().to_vec()));
+            }
             replaced_extents.push((previous, next));
         }
 
@@ -1116,6 +1205,12 @@ impl EmberForge7Store {
         let upsert_key_set = upsert_entries.iter().map(|(key, _)| key.clone()).collect::<BTreeSet<_>>();
         if removal_keys.iter().any(|key| upsert_key_set.contains(key)) {
             return Err(DbError::Constraint("EF7 batch attempts to remove and replace the same index key".into()));
+        }
+        let mut unique_upserts = BTreeSet::new();
+        for (key, _) in &upsert_entries {
+            if !unique_upserts.insert(key.clone()) {
+                return Err(DbError::Constraint("EF7 batch produced duplicate index upserts".into()));
+            }
         }
 
         let counts = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removal_keys, &upsert_entries)?;
@@ -1131,7 +1226,6 @@ impl EmberForge7Store {
         }
         Ok(counts)
     }
-
 
     /// Atomically upserts/removes a bounded set of world chunks through one
     /// CoW redo/root publication. Payload extents are reclaimed after commit.
@@ -1573,6 +1667,62 @@ mod tests {
             assert_eq!(reopened.get_chunk(77, -1, 2).unwrap(), None);
             assert_eq!(reopened.get_chunk(77, 0, 0).unwrap(), Some(b"replacement".to_vec()));
             assert_eq!(reopened.get_chunk(77, 1, -2).unwrap(), Some(b"three".to_vec()));
+        }
+        cleanup(&path);
+    }
+
+
+    #[test]
+    fn typed_player_profile_batches_keep_uuid_and_name_indexes_atomic() {
+        let path = path("typed-profile-batch");
+        let ids = [[0x61; 16], [0x62; 16], [0x63; 16]];
+        {
+            let mut store = EmberForge7Store::open(&path, 32).unwrap();
+            let initial = vec![
+                (9, 1, EmberForge7PlayerProfile {
+                    uuid: ids[0], username: "BatchOne".into(), first_joined_ms: 10,
+                    last_seen_ms: 20, playtime_ticks: 30, custom_data: vec![1; 512],
+                }),
+                (9, 2, EmberForge7PlayerProfile {
+                    uuid: ids[1], username: "BatchTwo".into(), first_joined_ms: 11,
+                    last_seen_ms: 21, playtime_ticks: 31, custom_data: vec![2; 512],
+                }),
+            ];
+            store.apply_player_profile_batch(&initial, &[]).unwrap();
+            assert_eq!(store.get_player_profile_by_name(9, "BATCHONE").unwrap().unwrap().0, 1);
+            assert_eq!(store.get_player_profile(9, ids[1]).unwrap().unwrap().0, 2);
+
+            let updated = vec![(9, 1, EmberForge7PlayerProfile {
+                uuid: ids[2], username: "RenamedBatch".into(), first_joined_ms: 10,
+                last_seen_ms: 99, playtime_ticks: 600, custom_data: vec![3; 1_024],
+            })];
+            store.apply_player_profile_batch(&updated, &[(9, 2, ids[1])]).unwrap();
+            assert!(store.get_player_profile(9, ids[0]).unwrap().is_none());
+            assert!(store.get_player_profile_by_name(9, "BatchOne").unwrap().is_none());
+            assert!(store.get_player_profile(9, ids[1]).unwrap().is_none());
+            let current = store.get_player_profile_by_name(9, "RENAMEDBATCH").unwrap().unwrap();
+            assert_eq!(current.0, 1);
+            assert_eq!(current.1.uuid, ids[2]);
+
+            let before = store.stats();
+            let duplicate_names = vec![
+                (9, 3, EmberForge7PlayerProfile {
+                    uuid: [0x70; 16], username: "SameName".into(), first_joined_ms: 1,
+                    last_seen_ms: 2, playtime_ticks: 3, custom_data: Vec::new(),
+                }),
+                (9, 4, EmberForge7PlayerProfile {
+                    uuid: [0x71; 16], username: "samename".into(), first_joined_ms: 1,
+                    last_seen_ms: 2, playtime_ticks: 3, custom_data: Vec::new(),
+                }),
+            ];
+            assert!(store.apply_player_profile_batch(&duplicate_names, &[]).is_err());
+            assert_eq!(store.stats(), before);
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 32).unwrap();
+            assert_eq!(reopened.get_player_profile(9, ids[2]).unwrap().unwrap().0, 1);
+            assert!(reopened.get_player_profile(9, ids[1]).unwrap().is_none());
+            assert_eq!(reopened.search_player_profiles_by_name(9, "renamed", 10).unwrap().len(), 1);
         }
         cleanup(&path);
     }
