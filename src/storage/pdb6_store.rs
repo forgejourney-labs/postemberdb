@@ -97,6 +97,19 @@ impl Pdb6Store {
 
     /// Scans a keyspace prefix in bytewise order, capped at 5,000 entries.
     pub(crate) fn scan_prefix(&mut self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
+        self.scan_prefix_after(prefix, None, limit)
+    }
+
+    /// Reads one bounded keyset page after an exclusive key cursor.
+    ///
+    /// Supply the final returned key as the next cursor. The cursor must belong
+    /// to the prefix. This avoids offset scans and bounds memory per page.
+    pub(crate) fn scan_prefix_after(
+        &mut self,
+        prefix: &[u8],
+        after_exclusive: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
         if prefix.is_empty() || prefix.len() > MAX_KEY_BYTES {
             return Err(DbError::Constraint("PDB6 scan prefix must contain 1..=1024 bytes".into()));
         }
@@ -104,21 +117,28 @@ impl Pdb6Store {
             return Err(DbError::Constraint(format!("PDB6 prefix scan limit exceeds {MAX_MUTATIONS}")));
         }
         if limit == 0 { return Ok(Vec::new()); }
-        let mut upper = prefix.to_vec();
-        let mut pivot = None;
-        for index in (0..upper.len()).rev() {
-            if upper[index] != u8::MAX {
-                upper[index] += 1;
-                upper.truncate(index + 1);
-                pivot = Some(());
-                break;
+
+        let upper = prefix_successor(prefix)
+            .ok_or_else(|| DbError::Constraint("PDB6 prefix has no finite upper bound".into()))?;
+        let lower = match after_exclusive {
+            Some(cursor) => {
+                if !cursor.starts_with(prefix) || cursor.len() > MAX_KEY_BYTES {
+                    return Err(DbError::Constraint("PDB6 scan cursor does not belong to the requested prefix".into()));
+                }
+                cursor.to_vec()
             }
-        }
-        let Some(()) = pivot else {
-            return Err(DbError::Constraint("PDB6 prefix has no finite upper bound".into()));
+            None => prefix.to_vec(),
         };
-        let candidates = page_tree::scan_range_limited(&mut self.pages, prefix, &upper, Some(limit + 1))?;
-        Ok(candidates.into_iter().filter(|(key, _)| key.starts_with(prefix)).take(limit).collect())
+        if lower >= upper { return Ok(Vec::new()); }
+
+        // Keep the cursor inclusive at the tree layer, then discard the exact
+        // cursor key. This preserves variable-length keys that extend it.
+        let candidates = page_tree::scan_range_limited(&mut self.pages, &lower, &upper, Some(limit + 2))?;
+        Ok(candidates.into_iter()
+            .filter(|(key, _)| key.starts_with(prefix)
+                && after_exclusive.is_none_or(|cursor| key.as_slice() > cursor))
+            .take(limit)
+            .collect())
     }
 
     pub(crate) fn manifest(&mut self) -> Result<Option<DatabaseManifest>, DbError> {
@@ -134,6 +154,18 @@ impl Pdb6Store {
         )?;
         Ok(())
     }
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    for index in (0..next.len()).rev() {
+        if next[index] != u8::MAX {
+            next[index] += 1;
+            next.truncate(index + 1);
+            return Some(next);
+        }
+    }
+    None
 }
 
 fn validate_key(key: &[u8]) -> Result<(), DbError> {
@@ -207,6 +239,56 @@ mod tests {
             assert_eq!((removed, inserted), (1, 1));
             assert_eq!(reopened.get(&row_key(1, 9).unwrap()).unwrap(), Some(b"updated".to_vec()));
             assert_eq!(reopened.get(&table_key(1).unwrap()).unwrap(), None);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn prefix_scan_uses_exclusive_keyset_cursor_across_large_keyspaces() {
+        let path = temp_path();
+        {
+            let mut store = Pdb6Store::open(&path, 32).unwrap();
+            let first = (1..=5_000u64).map(|id| {
+                (row_key(7, id).unwrap(), id.to_le_bytes().to_vec())
+            }).collect::<Vec<_>>();
+            store.apply_batch(first, Vec::<Vec<u8>>::new()).unwrap();
+            let second = (5_001..=6_200u64).map(|id| {
+                (row_key(7, id).unwrap(), id.to_le_bytes().to_vec())
+            }).collect::<Vec<_>>();
+            store.apply_batch(second, Vec::<Vec<u8>>::new()).unwrap();
+
+            let mut prefix = vec![KEY_ROW];
+            prefix.extend_from_slice(&7u64.to_be_bytes());
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut observed = Vec::new();
+            loop {
+                let page = store.scan_prefix_after(&prefix, cursor.as_deref(), 777).unwrap();
+                if page.is_empty() { break; }
+                cursor = Some(page.last().unwrap().0.clone());
+                observed.extend(page.into_iter().map(|(_, value)| u64::from_le_bytes(value.try_into().unwrap())));
+            }
+            assert_eq!(observed, (1..=6_200u64).collect::<Vec<_>>());
+            assert!(store.scan_prefix_after(&prefix, cursor.as_deref(), 777).unwrap().is_empty());
+            assert!(store.scan_prefix_after(&prefix, Some(&table_key(7).unwrap()), 1).is_err());
+
+            // Variable-length index keys may extend the cursor byte-for-byte.
+            let index_prefix = crate::storage::pdb6::index_prefix(3, 4).unwrap();
+            let mut key_a = index_prefix.clone();
+            key_a.push(0x11);
+            let mut key_b = key_a.clone();
+            key_b.push(0x00);
+            let mut key_c = key_b.clone();
+            key_c.push(0x00);
+            store.apply_batch(
+                vec![(key_a.clone(), vec![1]), (key_b.clone(), vec![2]), (key_c.clone(), vec![3])],
+                Vec::<Vec<u8>>::new(),
+            ).unwrap();
+            let first = store.scan_prefix_after(&index_prefix, None, 1).unwrap();
+            assert_eq!(first, vec![(key_a.clone(), vec![1])]);
+            let second = store.scan_prefix_after(&index_prefix, Some(&first[0].0), 1).unwrap();
+            assert_eq!(second, vec![(key_b.clone(), vec![2])]);
+            let third = store.scan_prefix_after(&index_prefix, Some(&second[0].0), 1).unwrap();
+            assert_eq!(third, vec![(key_c, vec![3])]);
         }
         cleanup(&path);
     }
