@@ -1608,6 +1608,10 @@ mod tests {
             }
             assert_eq!(store.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
             assert_eq!(store.get_chunk(44, 99, 99).unwrap(), None);
+            let large_payload = vec![0x5a; 24 * 1024 + 1];
+            store.put_chunk(44, 10, 10, &large_payload).unwrap();
+            assert!(store.get_chunk_limited(44, 10, 10, 24 * 1024).is_err());
+            assert_eq!(store.get_chunk_limited(44, 10, 10, large_payload.len()).unwrap(), Some(large_payload.clone()));
             let scan = store.scan_chunks(44, -1, -3, 1, 2, 10).unwrap();
             assert_eq!(scan.iter().map(|(x, z, _)| (*x, *z)).collect::<Vec<_>>(),
                 vec![(-1, -3), (-1, 2), (0, 0), (1, -2)]);
@@ -1620,6 +1624,8 @@ mod tests {
             let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
             assert_eq!(reopened.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
             assert_eq!(reopened.get_chunk(44, 0, 0).unwrap(), None);
+            assert_eq!(reopened.get_chunk_limited(44, 10, 10, 24 * 1024).unwrap_err().to_string(),
+                "constraint violation: EF7 chunk payload exceeds the requested read budget of 24576 bytes");
         }
         cleanup(&path);
     }
