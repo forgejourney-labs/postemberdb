@@ -556,8 +556,13 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"row_id\":41"));
+        let removed_uuid = "33333333333333333333333333333333";
+        writeln!(client, "EF7 PROFILE_PUT 7 42 {removed_uuid} Notch 110 210 310 0708").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("EF7 player profile stored"));
         let new_uuid = "22222222222222222222222222222222";
-        writeln!(client, "EF7 PROFILE_BATCH 7 1 0 41 {new_uuid} Alex 100 250 400 0506").unwrap();
+        writeln!(client, "EF7 PROFILE_BATCH 7 1 1 41 {new_uuid} Alex 100 250 400 0506 42 {removed_uuid}").unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("EF7 profile batch committed"));
@@ -569,6 +574,10 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"username\":\"Alex\""));
+        writeln!(client, "EF7 PROFILE_GET 7 {removed_uuid}").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"profile\":null"));
         writeln!(client, "EF7 PLAYER_DELETE 7 41 {new_uuid}").unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
