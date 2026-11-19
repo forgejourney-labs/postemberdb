@@ -219,6 +219,7 @@ impl TransactionCoordinator {
                     participant_count: tx.participant_count,
                     prepared_participants: tx.prepared.iter().copied().collect(),
                     applied_participants: tx.applied.iter().copied().collect(),
+                    rolled_back_participants: tx.rolled_back.iter().copied().collect(),
                     state: tx.state,
                 })
         }).collect()
