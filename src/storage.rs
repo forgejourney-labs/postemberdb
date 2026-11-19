@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 mod allocator;
+pub(crate) mod cache;
 pub(crate) mod btree;
 pub(crate) mod extent;
 pub(crate) mod index_codec;
 pub(crate) mod page_tree;
+pub mod record_store;
 mod pages;
 mod wal;
 
