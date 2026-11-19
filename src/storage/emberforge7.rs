@@ -251,6 +251,9 @@ impl EmberForge7Store {
         upserts: &[(u64, u64, [u8; 16], Vec<u8>)],
         removals: &[(u64, u64, [u8; 16])],
     ) -> Result<(usize, usize), DbError> {
+        if upserts.is_empty() && removals.is_empty() {
+            return Ok((0, 0));
+        }
         const MAX_BATCH_PLAYERS: usize = 2_500;
         const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
         if upserts.len().saturating_add(removals.len()) > MAX_BATCH_PLAYERS {
@@ -492,6 +495,7 @@ mod tests {
         let uuid_b = [0x22; 16];
         {
             let mut store = EmberForge7Store::open(&path, 32).unwrap();
+            assert_eq!(store.apply_player_batch(&[], &[]).unwrap(), (0, 0));
             let upserts = vec![
                 (7, 101, uuid_a, b"player-a".to_vec()),
                 (7, 102, uuid_b, vec![0x5a; 90_000]),
