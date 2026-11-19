@@ -336,6 +336,35 @@ impl RecordStore {
         Ok(ids)
     }
 
+    /// Reads a bounded, ordered page of records without scanning the entire store.
+    ///
+    /// The cursor is the last ID from the previous page. At most 5,000 records
+    /// and 256 MiB of record payloads are returned in one call.
+    pub fn scan_records(
+        &mut self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, DbError> {
+        let ids = self.scan_ids(after, limit)?;
+        let mut records = Vec::with_capacity(ids.len());
+        let mut total_bytes = 0usize;
+        for record_id in ids {
+            let bytes = self.get(record_id)?
+                .ok_or_else(|| DbError::Storage(format!(
+                    "record {record_id} disappeared during a locked scan"
+                )))?;
+            total_bytes = total_bytes.checked_add(bytes.len())
+                .ok_or_else(|| DbError::Constraint("record scan byte count overflow".into()))?;
+            if total_bytes > MAX_BATCH_BYTES {
+                return Err(DbError::Constraint(format!(
+                    "record scan exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                )));
+            }
+            records.push((record_id, bytes));
+        }
+        Ok(records)
+    }
+
     /// Returns the underlying extent-page cache metrics.
     pub fn page_cache_stats(&self) -> PageCacheStats {
         self.store.page_cache_stats()
@@ -464,6 +493,10 @@ mod tests {
 
             assert_eq!(store.scan_ids(None, 2).unwrap(), vec![10, 20]);
             assert_eq!(store.scan_ids(Some(20), 2).unwrap(), vec![30, 40]);
+            assert_eq!(
+                store.scan_records(Some(10), 1).unwrap(),
+                vec![(20, b"two".to_vec())]
+            );
             assert!(store.scan_ids(Some(40), 2).unwrap().is_empty());
             assert!(store.scan_ids(None, 0).unwrap().is_empty());
             assert!(store.scan_ids(None, 5_001).is_err());
