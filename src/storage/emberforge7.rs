@@ -1671,6 +1671,62 @@ mod tests {
         cleanup(&path);
     }
 
+
+    #[test]
+    fn typed_player_profile_batches_keep_uuid_and_name_indexes_atomic() {
+        let path = path("typed-profile-batch");
+        let ids = [[0x61; 16], [0x62; 16], [0x63; 16]];
+        {
+            let mut store = EmberForge7Store::open(&path, 32).unwrap();
+            let initial = vec![
+                (9, 1, EmberForge7PlayerProfile {
+                    uuid: ids[0], username: "BatchOne".into(), first_joined_ms: 10,
+                    last_seen_ms: 20, playtime_ticks: 30, custom_data: vec![1; 512],
+                }),
+                (9, 2, EmberForge7PlayerProfile {
+                    uuid: ids[1], username: "BatchTwo".into(), first_joined_ms: 11,
+                    last_seen_ms: 21, playtime_ticks: 31, custom_data: vec![2; 512],
+                }),
+            ];
+            store.apply_player_profile_batch(&initial, &[]).unwrap();
+            assert_eq!(store.get_player_profile_by_name(9, "BATCHONE").unwrap().unwrap().0, 1);
+            assert_eq!(store.get_player_profile(9, ids[1]).unwrap().unwrap().0, 2);
+
+            let updated = vec![(9, 1, EmberForge7PlayerProfile {
+                uuid: ids[2], username: "RenamedBatch".into(), first_joined_ms: 10,
+                last_seen_ms: 99, playtime_ticks: 600, custom_data: vec![3; 1_024],
+            })];
+            store.apply_player_profile_batch(&updated, &[(9, 2, ids[1])]).unwrap();
+            assert!(store.get_player_profile(9, ids[0]).unwrap().is_none());
+            assert!(store.get_player_profile_by_name(9, "BatchOne").unwrap().is_none());
+            assert!(store.get_player_profile(9, ids[1]).unwrap().is_none());
+            let current = store.get_player_profile_by_name(9, "RENAMEDBATCH").unwrap().unwrap();
+            assert_eq!(current.0, 1);
+            assert_eq!(current.1.uuid, ids[2]);
+
+            let before = store.stats();
+            let duplicate_names = vec![
+                (9, 3, EmberForge7PlayerProfile {
+                    uuid: [0x70; 16], username: "SameName".into(), first_joined_ms: 1,
+                    last_seen_ms: 2, playtime_ticks: 3, custom_data: Vec::new(),
+                }),
+                (9, 4, EmberForge7PlayerProfile {
+                    uuid: [0x71; 16], username: "samename".into(), first_joined_ms: 1,
+                    last_seen_ms: 2, playtime_ticks: 3, custom_data: Vec::new(),
+                }),
+            ];
+            assert!(store.apply_player_profile_batch(&duplicate_names, &[]).is_err());
+            assert_eq!(store.stats(), before);
+        }
+        {
+            let mut reopened = EmberForge7Store::open(&path, 32).unwrap();
+            assert_eq!(reopened.get_player_profile(9, ids[2]).unwrap().unwrap().0, 1);
+            assert!(reopened.get_player_profile(9, ids[1]).unwrap().is_none());
+            assert_eq!(reopened.search_player_profiles_by_name(9, "renamed", 10).unwrap().len(), 1);
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn empty_payload_and_namespace_validation() {
         let path = path("empty");
