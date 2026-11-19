@@ -206,8 +206,9 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Added `Database::migrate_to_pdb6()`: copies catalog definitions, typed SRW1 row payloads, stable row IDs, and index entries into the PDB6 shared root.
 - [x] Publishes the PDB6 manifest only after the copy is complete; PDB5 snapshot/WAL are not modified by the migration.
 - [x] Bounded row and index batches to 5,000 mutations.
+- [x] Read-back verification of catalog records, every migrated row payload, every index key, and catalog cardinality before publishing the manifest.
 - [ ] PDB6 is not yet the live SQL authority. Normal SQL reads/writes still use PDB5 and in-memory tables.
-- [ ] Automatic resume/cleanup of partially copied overflow pages and safe migration verification remain pending; interrupted copies require operator removal of the incomplete PDB6 sidecars before retry.
+- [ ] Automatic resume/cleanup of partially copied overflow pages and full end-to-end migration verification remain pending; interrupted copies require operator removal of the incomplete PDB6 sidecars before retry.
 
 
 ## Cross-domain Transaction Coordinator foundation
