@@ -208,3 +208,11 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Bounded row and index batches to 5,000 mutations.
 - [ ] PDB6 is not yet the live SQL authority. Normal SQL reads/writes still use PDB5 and in-memory tables.
 - [ ] Automatic resume/cleanup of partially copied overflow pages and safe migration verification remain pending; interrupted copies require operator removal of the incomplete PDB6 sidecars before retry.
+
+
+## Cross-domain Transaction Coordinator foundation
+
+- [x] Durable coordinator decision journal with monotonic transaction IDs, bounded participant sets, fsync'd BEGIN/PREPARED/COMMIT/ABORT records, and CRC validation.
+- [x] Recovery reports undecided transactions and truncates only a torn final record; complete corrupt records fail closed.
+- [x] COMMIT is rejected until every participant has a durable PREPARED marker.
+- [ ] SQL, KV, Registry, and EF7 still need participant adapters with durable prepare, idempotent commit/rollback, and recovery integration. This journal alone does not provide cross-domain atomicity.
