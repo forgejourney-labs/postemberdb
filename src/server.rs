@@ -11,6 +11,7 @@ const MAX_SQL_LINE_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT_SECS: u64 = 30;
 const MAX_EF7_WIRE_CUSTOM_BYTES: usize = 24 * 1024;
 const MAX_EF7_WIRE_CHUNK_BYTES: usize = 24 * 1024;
+const MAX_EF7_WIRE_RECORD_BYTES: usize = 24 * 1024;
 const MAX_EF7_NAMESPACE_LIST: usize = 64;
 const MAX_BINARY_CHUNK_BYTES: usize = DEFAULT_MAX_PAYLOAD - 16;
 
@@ -541,6 +542,63 @@ fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
                     "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
                     json_escape(if deleted { "EF7 chunk deleted" } else { "EF7 chunk not found" }),
                     u8::from(deleted)
+                ))
+            }
+            "RECORD_PUT" => {
+                if parts.len() != 5 { return Err("usage: EF7 RECORD_PUT <namespace> <record_id> <payload_hex|->".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let payload = if parts[4] == "-" { Vec::new() } else { decode_hex(parts[4])? };
+                if payload.len() > MAX_EF7_WIRE_RECORD_BYTES {
+                    return Err(format!("record payload exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_RECORD_BYTES} bytes"));
+                }
+                store.put_record(namespace, record_id, &payload).map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 record stored"))
+            }
+            "RECORD_PUT_TTL" => {
+                if parts.len() != 6 { return Err("usage: EF7 RECORD_PUT_TTL <namespace> <record_id> <expires_at_ms> <payload_hex|->".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let expires_at_ms = parse_id(4, "expires_at_ms")?;
+                let payload = if parts[5] == "-" { Vec::new() } else { decode_hex(parts[5])? };
+                if payload.len() > MAX_EF7_WIRE_RECORD_BYTES {
+                    return Err(format!("record payload exceeds the JSONL/1 bridge limit of {MAX_EF7_WIRE_RECORD_BYTES} bytes"));
+                }
+                store.put_record_with_expiry(namespace, record_id, expires_at_ms, &payload)
+                    .map_err(|error| error.to_string())?;
+                Ok(json_ok_message("EF7 TTL record stored"))
+            }
+            "RECORD_GET" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_GET <namespace> <record_id>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                match store.get_record_limited(namespace, record_id, MAX_EF7_WIRE_RECORD_BYTES)
+                    .map_err(|error| error.to_string())? {
+                    Some(payload) => Ok(format!(
+                        "{{\"ok\":true,\"message\":\"EF7 record found\",\"record\":{{\"namespace_id\":{},\"record_id\":{},\"payload_hex\":{}}}}}\n",
+                        namespace, record_id, json_escape(&encode_hex(&payload))
+                    )),
+                    None => Ok("{\"ok\":true,\"message\":\"EF7 record not found\",\"record\":null}\n".into()),
+                }
+            }
+            "RECORD_DELETE" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_DELETE <namespace> <record_id>".into()); }
+                let namespace = parse_id(2, "namespace ID")?;
+                let record_id = parse_id(3, "record ID")?;
+                let deleted = store.delete_record(namespace, record_id).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":{},\"affected_rows\":{}}}\n",
+                    json_escape(if deleted { "EF7 record deleted" } else { "EF7 record not found" }),
+                    u8::from(deleted)
+                ))
+            }
+            "RECORD_SWEEP" => {
+                if parts.len() != 4 { return Err("usage: EF7 RECORD_SWEEP <now_ms> <limit>".into()); }
+                let now_ms = parse_id(2, "current time in milliseconds")?;
+                let limit = parts[3].parse::<usize>().map_err(|_| "invalid TTL sweep limit".to_owned())?;
+                let removed = store.sweep_expired_records(now_ms, limit).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "{{\"ok\":true,\"message\":\"EF7 TTL sweep completed\",\"affected_rows\":{removed}}}\n"
                 ))
             }
             "PROFILE_PUT" => {
