@@ -44,6 +44,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Strict PPG1 validation for canonical payload lengths, zero padding, and platform-safe length conversion.
 - [x] Experimental file-backed EPG1 data pages with logical page IDs, generations, payload checksums, and canonical zero-padding validation.
 - [x] Variable-length RecordStore prototype: records up to 64 MiB span contiguous EPG1 pages, RDX1 descriptors are indexed by stable caller IDs in the EmberTree B+ Tree, and page/whole-record integrity is checked on reads.
+- [x] RecordStore put_many/delete_many batches validate before allocation and publish descriptor changes through one page-tree redo record/root update (up to 5,000 IDs and 256 MiB of unique record data per put batch).
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
