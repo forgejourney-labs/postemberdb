@@ -483,7 +483,7 @@ mod tests {
         writeln!(client, "EF7 PROFILE_PUT 7 41 {uuid} Steve 100 200 300 01020304").unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
-        assert!(line.contains("\"profile\":null"));
+        assert!(line.contains("EF7 player profile stored"));
         writeln!(client, "EF7 PROFILE_GET 7 {uuid}").unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
