@@ -21,6 +21,23 @@ use sql::{
     validate_value,
 };
 
+/// Runtime statistics for the bounded fixed-page buffer pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCacheStats {
+    /// Maximum number of decoded page payloads retained by this file handle.
+    pub capacity_pages: usize,
+    /// Number of decoded page payloads currently resident.
+    pub resident_pages: usize,
+    /// Total bytes held by cached page payloads.
+    pub resident_bytes: usize,
+    /// Reads served directly from the cache.
+    pub hits: u64,
+    /// Reads that required loading and validating a page from the file.
+    pub misses: u64,
+    /// Cached pages removed to make room for newer pages or a smaller capacity.
+    pub evictions: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
