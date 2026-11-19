@@ -59,3 +59,6 @@ Large text values can span multiple EPG1 pages. RecordStore validates page and w
 - Row-page reclamation/vacuum and streaming payload reads remain future work.
 
 Do not interpret the presence of this API as proof that SQL tables are already disk-backed. The next integration stage must move table catalog metadata and row-ID allocation into durable storage, route DML through a single recoverable transaction protocol, and make SELECT use bounded page reads. Existing PDB1–PDB5 databases must remain readable and receive an explicit, crash-safe migration path.
+
+
+`apply_batch` gives upserts precedence over deletes for the same row ID and avoids a redundant delete/reinsert path.
