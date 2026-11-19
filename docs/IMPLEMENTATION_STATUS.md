@@ -217,3 +217,11 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Recovery reports undecided transactions and truncates only a torn final record; complete corrupt records fail closed.
 - [x] COMMIT is rejected until every participant has a durable PREPARED marker.
 - [ ] SQL, KV, Registry, and EF7 still need participant adapters with durable prepare, idempotent commit/rollback, and recovery integration. This journal alone does not provide cross-domain atomicity.
+
+
+## Coordinator participant-application recovery
+
+- [x] Coordinator journal now records durable per-participant APPLIED acknowledgements after COMMIT.
+- [x] Recovery distinguishes committed transactions that still need participant application from transactions whose participants have all acknowledged.
+- [x] APPLIED records are checksummed, ordered after COMMIT, and reject duplicate or unprepared participant IDs.
+- [ ] SQL, KV, Registry, and EF7 adapters still need to implement durable prepare and idempotent commit/rollback. The journal and acknowledgement protocol do not by themselves enlist those stores or provide cross-domain atomicity.

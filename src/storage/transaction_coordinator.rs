@@ -24,6 +24,8 @@ pub struct RecoveredTransaction {
     pub transaction_id: u64,
     pub participant_count: u8,
     pub prepared_participants: Vec<u8>,
+    /// Participants whose durable commit application has been acknowledged.
+    pub applied_participants: Vec<u8>,
     pub state: TransactionState,
 }
 
@@ -31,6 +33,7 @@ pub struct RecoveredTransaction {
 struct TransactionRecord {
     participant_count: u8,
     prepared: BTreeSet<u8>,
+    applied: BTreeSet<u8>,
     state: TransactionState,
 }
 
@@ -73,7 +76,12 @@ impl TransactionCoordinator {
                     if txid <= last_id || participant_count == 0 || participant_count > MAX_PARTICIPANTS || participant != 0 {
                         return Err(DbError::Storage("invalid transaction coordinator BEGIN record".into()));
                     }
-                    transactions.insert(txid, TransactionRecord { participant_count, prepared: BTreeSet::new(), state: TransactionState::Preparing });
+                    transactions.insert(txid, TransactionRecord {
+                        participant_count,
+                        prepared: BTreeSet::new(),
+                        applied: BTreeSet::new(),
+                        state: TransactionState::Preparing,
+                    });
                     last_id = txid;
                 }
                 2 => {
@@ -90,6 +98,16 @@ impl TransactionCoordinator {
                         return Err(DbError::Storage("invalid transaction COMMIT/ABORT decision".into()));
                     }
                     tx.state = if kind == 3 { TransactionState::Committed } else { TransactionState::Aborted };
+                }
+                5 => {
+                    let tx = transactions.get_mut(&txid).ok_or_else(|| DbError::Storage("APPLIED record references an unknown transaction".into()))?;
+                    if tx.state != TransactionState::Committed
+                        || participant >= tx.participant_count
+                        || participant_count != tx.participant_count
+                        || !tx.prepared.contains(&participant)
+                        || !tx.applied.insert(participant) {
+                        return Err(DbError::Storage("invalid or duplicate transaction APPLIED record".into()));
+                    }
                 }
                 _ => return Err(DbError::Storage("unknown transaction coordinator journal record".into())),
             }
@@ -110,7 +128,12 @@ impl TransactionCoordinator {
         let txid = self.next_transaction_id;
         let next = txid.checked_add(1).ok_or_else(|| DbError::Storage("transaction ID space exhausted".into()))?;
         self.append(1, 0, txid, participant_count)?;
-        self.transactions.insert(txid, TransactionRecord { participant_count, prepared: BTreeSet::new(), state: TransactionState::Preparing });
+        self.transactions.insert(txid, TransactionRecord {
+            participant_count,
+            prepared: BTreeSet::new(),
+            applied: BTreeSet::new(),
+            state: TransactionState::Preparing,
+        });
         self.next_transaction_id = next;
         Ok(txid)
     }
@@ -138,6 +161,40 @@ impl TransactionCoordinator {
         Ok(())
     }
 
+    /// Records that a participant has durably applied a committed decision.
+    ///
+    /// The acknowledgement is itself synced. If a process crashes after the
+    /// participant commit but before this record, recovery retries commit; therefore
+    /// participant commit implementations MUST be idempotent by transaction ID.
+    pub fn mark_applied(&mut self, txid: u64, participant_id: u8) -> Result<(), DbError> {
+        let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
+        if tx.state != TransactionState::Committed
+            || participant_id >= tx.participant_count
+            || !tx.prepared.contains(&participant_id)
+            || tx.applied.contains(&participant_id) {
+            return Err(DbError::Constraint("participant cannot be marked applied in the current transaction state".into()));
+        }
+        let count = tx.participant_count;
+        self.append(5, participant_id, txid, count)?;
+        self.transactions.get_mut(&txid).unwrap().applied.insert(participant_id);
+        Ok(())
+    }
+
+    /// Returns committed transactions that still need one or more participants
+    /// to apply the durable decision. Callers must retry those commits idempotently.
+    pub fn committed_pending_apply(&self) -> Vec<RecoveredTransaction> {
+        self.transactions.iter().filter_map(|(id, tx)| {
+            (tx.state == TransactionState::Committed && tx.applied.len() < usize::from(tx.participant_count))
+                .then(|| RecoveredTransaction {
+                    transaction_id: *id,
+                    participant_count: tx.participant_count,
+                    prepared_participants: tx.prepared.iter().copied().collect(),
+                    applied_participants: tx.applied.iter().copied().collect(),
+                    state: tx.state,
+                })
+        }).collect()
+    }
+
     pub fn rollback(&mut self, txid: u64) -> Result<(), DbError> {
         let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
         if tx.state != TransactionState::Preparing {
@@ -152,7 +209,9 @@ impl TransactionCoordinator {
     pub fn in_doubt(&self) -> Vec<RecoveredTransaction> {
         self.transactions.iter().filter_map(|(id, tx)| (tx.state == TransactionState::Preparing).then(|| RecoveredTransaction {
             transaction_id: *id, participant_count: tx.participant_count,
-            prepared_participants: tx.prepared.iter().copied().collect(), state: tx.state,
+            prepared_participants: tx.prepared.iter().copied().collect(),
+            applied_participants: tx.applied.iter().copied().collect(),
+            state: tx.state,
         })).collect()
     }
 
@@ -248,6 +307,33 @@ mod tests {
             let pending = c.in_doubt();
             assert_eq!(pending.len(), 1); assert_eq!(pending[0].transaction_id, tx);
             assert_eq!(pending[0].prepared_participants, vec![0]);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn committed_participant_application_is_durable_and_retryable() {
+        let path = path();
+        let tx;
+        {
+            let mut c = TransactionCoordinator::open(&path).unwrap();
+            tx = c.begin(2).unwrap();
+            c.mark_prepared(tx, 0).unwrap();
+            c.mark_prepared(tx, 1).unwrap();
+            c.commit(tx).unwrap();
+            c.mark_applied(tx, 0).unwrap();
+            assert_eq!(c.committed_pending_apply()[0].applied_participants, vec![0]);
+            assert!(c.mark_applied(tx, 0).is_err());
+        }
+        {
+            let mut c = TransactionCoordinator::open(&path).unwrap();
+            let pending = c.committed_pending_apply();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].transaction_id, tx);
+            assert_eq!(pending[0].prepared_participants, vec![0, 1]);
+            assert_eq!(pending[0].applied_participants, vec![0]);
+            c.mark_applied(tx, 1).unwrap();
+            assert!(c.committed_pending_apply().is_empty());
         }
         cleanup(&path);
     }
