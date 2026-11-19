@@ -44,3 +44,13 @@ The production design must account for malformed SQL and protocol frames; oversi
 ## Security test suite
 
 Release gates include SQL-parser and protocol fuzzing, property tests for page/WAL codecs, corrupted-file tests, decompression-limit tests, concurrency stress, permission tests, and backup/restore drills. A green unit-test run alone does not establish production security.
+
+
+## Implemented transport authentication and RBAC
+
+- The legacy `server` command remains loopback-only and unauthenticated for local development.
+- `server-tls` loads a PEM certificate/private key, enables TLS, and requires authentication before SQL or EF7 operations. Non-loopback binds are rejected unless this TLS mode is active.
+- Provision accounts with `postemberdb user add <data-file> <username> <admin|read-only|read-write>`; passwords are prompted without terminal echo and stored as Argon2id PHC hashes in the `.auth` sidecar.
+- SQL read/write and EF7 read/write permissions are enforced for authenticated connections. Unknown SQL/EF7 command classes are denied by default.
+- TLS uses rustls and PEM certificate/private-key parsing. Clients must validate the server certificate; mutual TLS and certificate-to-user mapping are not yet implemented.
+- Remaining work includes per-user connection/query quotas, authentication rate limiting, audit logging, password rotation policies, and permission scoping by database/schema/table.

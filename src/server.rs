@@ -1,11 +1,13 @@
-use postemberdb::{Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, QueryResult, Value};
+use postemberdb::{AuthStore, Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, Permission, Principal, QueryResult, Value};
 use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
 use postemberdb::version::version_string;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use rustls::{pki_types::PrivateKeyDer, ServerConfig, ServerConnection, StreamOwned};
+use std::fs::File;
 
 const MAX_CLIENTS: usize = 128;
 const MAX_SQL_LINE_BYTES: usize = 64 * 1024;
@@ -55,35 +57,73 @@ fn read_bounded_line<R: io::BufRead>(reader: &mut R, output: &mut Vec<u8>, limit
     Ok(Some(output.len()))
 }
 
-fn validate_bind_address(address: &str) -> io::Result<SocketAddr> {
+fn validate_bind_address(address: &str, tls_enabled: bool) -> io::Result<SocketAddr> {
     let socket_address: SocketAddr = address.parse().map_err(|_| io::Error::new(
         io::ErrorKind::InvalidInput,
-        "server address must be an explicit loopback socket address until TLS and authentication are implemented",
+        "server address must be an explicit socket address",
     ))?;
-    if !socket_address.ip().is_loopback() {
+    if !socket_address.ip().is_loopback() && !tls_enabled {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "refusing non-loopback bind: this development protocol has no TLS or authentication",
+            "refusing non-loopback bind: remote connections require TLS and authentication",
         ));
     }
     Ok(socket_address)
 }
 
+fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<Arc<ServerConfig>> {
+    let mut cert_reader = BufReader::new(File::open(cert_path)?);
+    let certificates = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS certificate file contains no certificates"));
+    }
+    let mut key_reader = BufReader::new(File::open(key_path)?);
+    let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS private key file contains no supported key"))?;
+    let config = ServerConfig::builder().with_no_client_auth().with_single_cert(certificates, private_key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid TLS identity: {error}")))?;
+    Ok(Arc::new(config))
+}
+
 pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
-    let socket_address = validate_bind_address(address)?;
+    run_server_inner(address, data_path, None)
+}
+
+pub(crate) fn run_server_tls(address: &str, data_path: &str, cert_path: &str, key_path: &str) -> io::Result<()> {
+    run_server_inner(address, data_path, Some(load_tls_config(cert_path, key_path)?))
+}
+
+fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<ServerConfig>>) -> io::Result<()> {
+    let tls_enabled = tls_config.is_some();
+    let socket_address = validate_bind_address(address, tls_enabled)?;
     let listener = TcpListener::bind(socket_address)?;
-    println!("{} — development server listening on loopback {socket_address}", version_string());
-    let database = Database::open(data_path)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-    let database = Arc::new(std::sync::Mutex::new(database));
-    let ef7_store = EmberForge7Store::open(data_path, 256)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-    let ef7_store = Arc::new(std::sync::Mutex::new(ef7_store));
+    if tls_enabled {
+        println!("{} — TLS server listening on {socket_address}; authentication required", version_string());
+    } else {
+        println!("{} — development server listening on loopback {socket_address}", version_string());
+    }
+    let database = Arc::new(std::sync::Mutex::new(
+        Database::open(data_path).map_err(|error| io::Error::other(error.to_string()))?
+    ));
+    let ef7_store = Arc::new(std::sync::Mutex::new(
+        EmberForge7Store::open(data_path, 256).map_err(|error| io::Error::other(error.to_string()))?
+    ));
+    let auth_store = if tls_enabled {
+        Some(Arc::new(std::sync::Mutex::new(
+            AuthStore::open(format!("{data_path}.auth")).map_err(|error| io::Error::other(error.to_string()))?
+        )))
+    } else { None };
     let active_clients = Arc::new(AtomicUsize::new(0));
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                if let Err(error) = stream.set_nodelay(true)
+                    .and_then(|_| stream.set_read_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS))))
+                    .and_then(|_| stream.set_write_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))) {
+                    eprintln!("connection setup failed: {error}");
+                    continue;
+                }
                 let mut current = active_clients.load(Ordering::Acquire);
                 loop {
                     if current >= MAX_CLIENTS {
@@ -95,17 +135,22 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
                         Ok(_) => {
                             let db = database.clone();
                             let ef7 = ef7_store.clone();
+                            let auth = auth_store.clone();
+                            let tls = tls_config.clone();
                             let active = active_clients.clone();
                             let active_on_failure = active_clients.clone();
-                            match thread::Builder::new()
-                                .name("postemberdb-client".into())
-                                .spawn(move || {
-                                    let _guard = ConnectionGuard(active);
-                                    if let Err(error) = handle_client(stream, db, ef7) {
-                                        eprintln!("client error: {error}");
+                            match thread::Builder::new().name("postemberdb-client".into()).spawn(move || {
+                                let _guard = ConnectionGuard(active);
+                                let result = if let Some(config) = tls {
+                                    match ServerConnection::new(config) {
+                                        Ok(connection) => handle_client(StreamOwned::new(connection, stream), db, ef7, auth, true),
+                                        Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.to_string())),
                                     }
-                                })
-                            {
+                                } else {
+                                    handle_client(stream, db, ef7, auth, false)
+                                };
+                                if let Err(error) = result { eprintln!("client error: {error}"); }
+                            }) {
                                 Ok(_) => {}
                                 Err(error) => {
                                     active_on_failure.fetch_sub(1, Ordering::AcqRel);
@@ -124,26 +169,25 @@ pub(crate) fn run_server(address: &str, data_path: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_client(
-    mut stream: TcpStream,
-    database: std::sync::Arc<std::sync::Mutex<Database>>,
-    ef7: std::sync::Arc<std::sync::Mutex<EmberForge7Store>>,
+fn handle_client<S: Read + Write>(
+    stream: S,
+    database: Arc<std::sync::Mutex<Database>>,
+    ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
+    auth: Option<Arc<std::sync::Mutex<AuthStore>>>,
+    auth_required: bool,
 ) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(CLIENT_IO_TIMEOUT_SECS)))?;
-    let reader_stream = stream.try_clone()?;
-    let mut reader = io::BufReader::new(reader_stream);
+    let mut reader = BufReader::new(stream);
     let mut line = Vec::with_capacity(1024);
     let mut session: Option<DatabaseSession> = None;
     let mut jsonl_mode = false;
-    writeln!(stream, "PostemberDB/0.1 ready; {}; send one SQL statement per line", version_string())?;
+    let mut principal: Option<Principal> = None;
+    writeln!(reader.get_mut(), "PostemberDB/0.1 ready; {}; send one SQL statement per line", version_string())?;
     loop {
         let sql = match read_bounded_line(&mut reader, &mut line, MAX_SQL_LINE_BYTES) {
             Ok(Some(_)) => std::str::from_utf8(&line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SQL input must be valid UTF-8"))?.to_owned(),
             Ok(None) => break,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                writeln!(stream, "ERROR {error}")?;
+                writeln!(reader.get_mut(), "ERROR {error}")?;
                 break;
             }
             Err(error) => return Err(error),
@@ -151,20 +195,57 @@ fn handle_client(
         let command = sql.trim();
         if command.eq_ignore_ascii_case("QUIT") { break; }
         if command.eq_ignore_ascii_case("POSTEMBERDB BINARY/1") {
-            let ready = Frame::new(FrameKind::Pong, 0, b"postemberdb-binary/1-ready".to_vec());
-            ready.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
-            return handle_binary_client(stream, reader, database, ef7);
+            if auth_required && principal.is_none() {
+                writeln!(reader.get_mut(), "ERROR authentication required; authenticate before switching protocols")?;
+                continue;
+            }
+            Frame::new(FrameKind::Pong, 0, b"postemberdb-binary/1-ready".to_vec())
+                .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+            return handle_binary_client(&mut reader, database, ef7, principal, auth_required);
         }
-
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
-            stream.write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
-            stream.flush()?;
+            reader.get_mut().write_all(b"{\"protocol\":\"postemberdb-jsonl\",\"version\":1,\"ready\":true}\n")?;
+            reader.get_mut().flush()?;
             continue;
         }
-
+        if command.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("AUTH ")) {
+            let response = match command[5..].split_once(' ') {
+                Some((username, password)) if !username.is_empty() && !password.is_empty() => match auth.as_ref() {
+                    Some(store) => match store.lock() {
+                        Ok(mut store) => match store.authenticate(username, password) {
+                            Ok(Some(value)) => {
+                                principal = Some(value);
+                                if jsonl_mode { json_ok_message("authenticated") } else { "OK authenticated\n".to_owned() }
+                            }
+                            Ok(None) => if jsonl_mode { json_error("authentication failed") } else { "ERROR authentication failed\n".to_owned() },
+                            Err(error) => if jsonl_mode { json_error(&error.to_string()) } else { format!("ERROR {error}\n") },
+                        },
+                        Err(_) => if jsonl_mode { json_error("authentication service unavailable") } else { "ERROR authentication service unavailable\n".to_owned() },
+                    },
+                    None => if jsonl_mode { json_error("authentication is not enabled on this listener") } else { "ERROR authentication is not enabled\n".to_owned() },
+                },
+                _ => if jsonl_mode { json_error("AUTH requires username and password") } else { "ERROR AUTH requires username and password\n".to_owned() },
+            };
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
+        if auth_required && principal.is_none() {
+            let response = if jsonl_mode { json_error("authentication required") } else { "ERROR authentication required\n".to_owned() };
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
         if jsonl_mode && command.starts_with("EF7 ") {
-            let response = if session.is_some() {
+            let permission_error = if auth_required {
+                principal.as_ref().and_then(|p| permission_for_ef7(command).and_then(|permission| p.require(permission).err()))
+            } else { None };
+            let response = if let Some(error) = permission_error {
+                json_error(&error.to_string())
+            } else if auth_required && permission_for_ef7(command).is_none() {
+                json_error("EF7 command is not covered by the RBAC policy")
+            } else if session.is_some() {
                 json_error("EF7 commands cannot run inside a SQL transaction; EF7 is a separate storage domain")
             } else {
                 match ef7.lock() {
@@ -172,11 +253,25 @@ fn handle_client(
                     Err(_) => json_error("EF7 storage lock poisoned"),
                 }
             };
-            stream.write_all(response.as_bytes())?;
-            stream.flush()?;
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
             continue;
         }
-
+        let permission_error = if auth_required {
+            principal.as_ref().and_then(|p| permission_for_sql(command).and_then(|permission| p.require(permission).err()))
+        } else { None };
+        if let Some(error) = permission_error {
+            let response = if jsonl_mode { json_error(&error.to_string()) } else { format!("ERROR {error}\n") };
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
+        if auth_required && permission_for_sql(command).is_none() {
+            let response = if jsonl_mode { json_error("SQL command is not covered by the RBAC policy") } else { "ERROR SQL command is not covered by the RBAC policy\n".to_owned() };
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
         let response = if command.eq_ignore_ascii_case("BEGIN") || command.eq_ignore_ascii_case("BEGIN TRANSACTION") {
             if session.is_some() {
                 if jsonl_mode { json_error("transaction already active") } else { "ERROR transaction already active\n".to_owned() }
@@ -220,11 +315,29 @@ fn handle_client(
                 Err(_) => if jsonl_mode { json_error("database lock poisoned") } else { "ERROR database lock poisoned\n".to_owned() },
             }
         };
-        stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+        reader.get_mut().write_all(response.as_bytes())?;
+        reader.get_mut().flush()?;
     }
-    // An uncommitted session is dropped and therefore rolled back on disconnect.
     Ok(())
+}
+
+fn permission_for_sql(command: &str) -> Option<Permission> {
+    let verb = command.split_whitespace().next()?.trim_matches(|c: char| !c.is_ascii_alphabetic()).to_ascii_uppercase();
+    match verb.as_str() {
+        "SELECT" | "SHOW" | "DESCRIBE" | "EXPLAIN" => Some(Permission::SqlRead),
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "TRUNCATE"
+        | "REPLACE" | "BEGIN" | "COMMIT" | "ROLLBACK" => Some(Permission::SqlWrite),
+        _ => None,
+    }
+}
+
+fn permission_for_ef7(command: &str) -> Option<Permission> {
+    let operation = command.split_whitespace().nth(1)?.to_ascii_uppercase();
+    match operation.as_str() {
+        "GET" | "LIST" | "SCAN" | "PLAYER_GET" | "NAMESPACE_GET" | "RECORD_GET" => Some(Permission::Ef7Read),
+        "PUT" | "DELETE" | "CREATE" | "SWEEP" | "PLAYER_PUT" => Some(Permission::Ef7Write),
+        _ => None,
+    }
 }
 
 
@@ -333,14 +446,15 @@ fn binary_error(request_id: u64, message: &str) -> Frame {
     Frame::new(FrameKind::Error, request_id, message.as_bytes().to_vec())
 }
 
-fn handle_binary_client(
-    mut stream: TcpStream,
-    mut reader: io::BufReader<TcpStream>,
+fn handle_binary_client<S: Read + Write>(
+    reader: &mut BufReader<S>,
     database: Arc<std::sync::Mutex<Database>>,
     ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
+    principal: Option<Principal>,
+    auth_required: bool,
 ) -> io::Result<()> {
     loop {
-        let frame = match Frame::read_from_or_eof(&mut reader, DEFAULT_MAX_PAYLOAD)? {
+        let frame = match Frame::read_from_or_eof(reader, DEFAULT_MAX_PAYLOAD)? {
             Some(frame) => frame,
             None => return Ok(()),
         };
@@ -352,12 +466,19 @@ fn handle_binary_client(
                     Ok(sql) if !sql.trim().is_empty() => sql,
                     _ => {
                         binary_error(request_id, "query payload must be non-empty UTF-8 SQL")
-                            .write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+                            .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
                         continue;
                     }
                 };
                 let command = sql.trim();
-                if ["BEGIN", "COMMIT", "ROLLBACK"].iter().any(|word| command.eq_ignore_ascii_case(word)) {
+                let permission_error = if auth_required {
+                    principal.as_ref().and_then(|p| permission_for_sql(command).and_then(|permission| p.require(permission).err()))
+                } else { None };
+                if auth_required && permission_for_sql(command).is_none() {
+                    binary_error(request_id, "SQL command is not covered by the RBAC policy")
+                } else if let Some(error) = permission_error {
+                    binary_error(request_id, &error.to_string())
+                } else if ["BEGIN", "COMMIT", "ROLLBACK"].iter().any(|word| command.eq_ignore_ascii_case(word)) {
                     binary_error(request_id, "binary/1 query frames do not support transaction control yet")
                 } else {
                     match database.lock() {
@@ -370,7 +491,9 @@ fn handle_binary_client(
                 }
             }
             FrameKind::ChunkPut => {
-                if frame.payload.len() < 16 {
+                if auth_required && principal.as_ref().is_some_and(|p| !p.allows(Permission::Ef7Write)) {
+                    binary_error(request_id, "not authorized for EF7 writes")
+                } else if frame.payload.len() < 16 {
                     binary_error(request_id, "chunk put payload requires namespace:u64, x:i32, z:i32 and bytes")
                 } else if frame.payload.len() - 16 > MAX_BINARY_CHUNK_BYTES {
                     binary_error(request_id, "chunk payload exceeds binary/1 single-frame limit")
@@ -388,7 +511,9 @@ fn handle_binary_client(
                 }
             }
             FrameKind::ChunkGet => {
-                if frame.payload.len() != 16 {
+                if auth_required && principal.as_ref().is_some_and(|p| !p.allows(Permission::Ef7Read)) {
+                    binary_error(request_id, "not authorized for EF7 reads")
+                } else if frame.payload.len() != 16 {
                     binary_error(request_id, "chunk get payload must contain namespace:u64, x:i32 and z:i32")
                 } else {
                     let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
@@ -412,7 +537,9 @@ fn handle_binary_client(
                 }
             }
             FrameKind::ChunkDelete => {
-                if frame.payload.len() != 16 {
+                if auth_required && principal.as_ref().is_some_and(|p| !p.allows(Permission::Ef7Write)) {
+                    binary_error(request_id, "not authorized for EF7 writes")
+                } else if frame.payload.len() != 16 {
                     binary_error(request_id, "chunk delete payload must contain namespace:u64, x:i32 and z:i32")
                 } else {
                     let namespace = u64::from_le_bytes(frame.payload[0..8].try_into().unwrap());
@@ -435,7 +562,7 @@ fn handle_binary_client(
                 binary_error(request_id, "frame kind is response-only or not implemented by this server version")
             }
         };
-        response.write_to(&mut stream, DEFAULT_MAX_PAYLOAD)?;
+        response.write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
     }
 }
 

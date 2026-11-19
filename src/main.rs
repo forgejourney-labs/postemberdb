@@ -13,6 +13,14 @@ fn main() {
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             server::run_server(&address, &data_path)
         }
+        Some("server-tls") => {
+            let address = args.next().unwrap_or_else(|| "0.0.0.0:7432".into());
+            let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
+            let cert_path = args.next().unwrap_or_else(|| "server-cert.pem".into());
+            let key_path = args.next().unwrap_or_else(|| "server-key.pem".into());
+            server::run_server_tls(&address, &data_path, &cert_path, &key_path)
+        }
+        Some("user") => run_user_command(args.collect()),
         Some("check") => {
             let path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             run_check(&path)
@@ -39,6 +47,32 @@ fn main() {
         eprintln!("PostemberDB error: {error}");
         std::process::exit(1);
     }
+}
+
+fn run_user_command(args: Vec<String>) -> std::io::Result<()> {
+    if args.len() != 4 || args[0] != "add" {
+        eprintln!("Usage: postemberdb user add <data-file> <username> <admin|read-only|read-write>");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid user command"));
+    }
+    let data_path = &args[1];
+    let username = &args[2];
+    let permissions = match args[3].as_str() {
+        "admin" => postemberdb::Permissions::ADMIN,
+        "read-only" => postemberdb::Permissions::READ_ONLY,
+        "read-write" => postemberdb::Permissions::READ_WRITE,
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "role must be admin, read-only or read-write")),
+    };
+    let password = rpassword::prompt_password("New user password: ")?;
+    let confirmation = rpassword::prompt_password("Confirm password: ")?;
+    if password != confirmation {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "passwords do not match"));
+    }
+    let mut auth = postemberdb::AuthStore::open(format!("{data_path}.auth"))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    auth.create_user(username, &password, permissions)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    println!("User '{}' created with role '{}'.", username, args[3]);
+    Ok(())
 }
 
 fn require_existing_file(path: &str) -> std::io::Result<()> {
@@ -74,6 +108,8 @@ fn print_usage() {
     eprintln!("{}", version_string());
     eprintln!("Usage:");
     eprintln!("  postemberdb server [127.0.0.1:7432] [data-file]");
+    eprintln!("  postemberdb server-tls [0.0.0.0:7432] [data-file] [cert.pem] [key.pem]");
+    eprintln!("  postemberdb user add <data-file> <username> <admin|read-only|read-write>");
     eprintln!("  postemberdb check [data-file]");
     eprintln!("  postemberdb checkpoint [data-file]");
     eprintln!("  postemberdb version");
