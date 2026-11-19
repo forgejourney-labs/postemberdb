@@ -50,7 +50,7 @@ This is not a JDBC driver and does not make PostemberDB selectable in KSL's exis
 
 ## EF7 typed player profiles through the KSL addon
 
-The optional addon now exposes EF7 profile operations on its existing loopback JSONL/1 connection. The Kotlin API includes `PostemberPlayerProfile`, `PostemberStoredPlayerProfile`, and asynchronous `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, and `deletePlayerAsync` calls. These operations use EF7's dedicated page-backed store and UUID/name indexes rather than SQL tables. See [the addon API guide](../integrations/kotlin-script-loader/README.md).
+The optional addon now exposes EF7 profile operations on its existing loopback JSONL/1 connection. The Kotlin API includes `PostemberPlayerProfile`, `PostemberStoredPlayerProfile`, `PostemberPlayerProfileUpsert`, and `PostemberPlayerRemoval`, plus asynchronous `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, `deletePlayerAsync`, and `applyPlayerProfileBatchAsync` calls. Profile batches are committed through one EF7 CoW root publication and are preferred for bulk player saves. These operations use EF7's dedicated page-backed store and UUID/name indexes rather than SQL tables. See [the addon API guide](../integrations/kotlin-script-loader/README.md).
 
 The current bridge caps profile custom bytes at 24 KiB because the JSONL request line is limited to 64 KiB and the byte payload is hex-encoded. The native Rust EF7 API supports up to 64 MiB records. World chunk APIs and general namespace administration are not yet exposed to Kotlin.
 
