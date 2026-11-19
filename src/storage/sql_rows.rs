@@ -128,6 +128,38 @@ impl SqlRowStore {
             .transpose()
     }
 
+    /// Reads a bounded set of rows by stable ID.
+    ///
+    /// Duplicate IDs are read once; results preserve the first-occurrence input
+    /// order and omit missing rows. The operation is capped at 5,000 distinct IDs
+    /// and 256 MiB of encoded row payloads.
+    pub fn get_many<I>(&mut self, row_ids: I) -> Result<Vec<(u64, Vec<Value>)>, DbError>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut output = Vec::new();
+        let mut total_bytes = 0usize;
+        for row_id in row_ids {
+            if !seen.insert(row_id) { continue; }
+            if seen.len() > MAX_BATCH_ROWS {
+                return Err(DbError::Constraint(format!(
+                    "SQL row read batch exceeds {MAX_BATCH_ROWS} distinct IDs"
+                )));
+            }
+            if let Some(bytes) = self.records.get(row_id)? {
+                total_bytes = total_bytes.checked_add(bytes.len())
+                    .ok_or_else(|| DbError::Constraint("SQL row read byte count overflow".into()))?;
+                if total_bytes > MAX_BATCH_BYTES {
+                    return Err(DbError::Constraint(format!(
+                        "SQL row read batch exceeds the {MAX_BATCH_BYTES}-byte aggregate limit"
+                    )));
+                }
+                output.push((row_id, Self::decode_row(&bytes, self.column_count)?));
+            }
+        }
+        Ok(output)
+    }
     /// Returns whether a row ID exists.
     pub fn contains(&mut self, row_id: u64) -> Result<bool, DbError> {
         self.records.contains(row_id)
@@ -338,6 +370,25 @@ mod tests {
         cleanup(&path);
     }
 
+    #[test]
+    fn get_many_is_bounded_deduplicated_and_preserves_input_order() {
+        let path = temp_path("get-many");
+        let mut rows = SqlRowStore::open(&path, 1).unwrap();
+        rows.put_many(vec![
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Integer(20)]),
+            (3, vec![Value::Integer(30)]),
+        ]).unwrap();
+        assert_eq!(rows.get_many(vec![3, 1, 3, 99, 2]).unwrap(), vec![
+            (3, vec![Value::Integer(30)]),
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Integer(20)]),
+        ]);
+        assert!(rows.get_many(1..=5_001).is_err());
+        assert_eq!(rows.scan_ids(None, 10).unwrap(), vec![1, 2, 3]);
+        drop(rows);
+        cleanup(&path);
+    }
     #[test]
     fn sql_row_store_applies_mixed_upserts_and_deletes_atomically() {
         let path = temp_path("mixed-batch");
