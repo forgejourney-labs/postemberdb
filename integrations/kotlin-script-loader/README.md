@@ -64,9 +64,20 @@ postemberDb().getPlayerProfileAsync(7L, player.uniqueId)
         }
     }
 
-postemberDb().getPlayerProfileByNameAsync(7L, player.name)
-postemberDb().deletePlayerAsync(7L, stableRowId, player.uniqueId)
+``
+
+For high-volume updates, send a batch rather than opening one connection per player:
+
+```kotlin
+val upserts = listOf(
+    PostemberPlayerProfileUpsert(stableRowId, profile)
+)
+val removals = emptyList<PostemberPlayerRemoval>()
+
+postemberDb().applyPlayerProfileBatchAsync(7L, upserts, removals)
 ```
+
+The batch command accepts up to 2,500 total profile operations. The 64 KiB protocol line and 24 KiB per-profile custom-data bridge cap can impose a lower practical batch size.
 
 Available operations are `putPlayerProfileAsync`, `getPlayerProfileAsync`, `getPlayerProfileByNameAsync`, `deletePlayerAsync`, and `applyPlayerProfileBatchAsync`. The batch method accepts `PostemberPlayerProfileUpsert` and `PostemberPlayerRemoval` items and applies all profile/index changes through one EF7 commit. Prefer it for groups of player updates rather than issuing one connection per player. Synchronous variants exist for worker threads and reject calls from Paper's main thread. Profile custom data is capped at 24 KiB by this text/hex JSONL bridge; the native Rust EF7 API supports records up to 64 MiB.
 
