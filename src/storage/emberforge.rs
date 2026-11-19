@@ -280,7 +280,7 @@ impl EmberForgeStore {
             page.extend_from_slice(&(index as u32).to_le_bytes());
             page.extend_from_slice(&(page_count as u32).to_le_bytes());
             page.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            page.extend_from_slice(&checksum.to_le_bytes());
+            page.extend_from_slice(&record_checksum.to_le_bytes());
             page.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
             page.extend_from_slice(&checksum(chunk).to_le_bytes());
             page.extend_from_slice(chunk);
