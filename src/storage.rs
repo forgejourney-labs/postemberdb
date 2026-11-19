@@ -12,6 +12,7 @@ pub(crate) mod extent;
 pub(crate) mod index_codec;
 pub(crate) mod page_tree;
 pub mod record_store;
+pub mod sql_rows;
 mod pages;
 mod wal;
 
