@@ -462,6 +462,36 @@ mod tests {
     }
 
     #[test]
+    fn key_value_store_exposes_cache_configuration_and_metrics() {
+        let path = temp_path("kv-page-cache");
+        {
+            let mut store = KeyValueStore::open_with_cache_capacity(&path, 2).unwrap();
+            assert_eq!(store.page_cache_stats().capacity_pages, 2);
+            store.put(b"cache/key", b"value").unwrap();
+        }
+
+        let mut reopened = KeyValueStore::open_with_cache_capacity(&path, 2).unwrap();
+        assert_eq!(reopened.get(b"cache/key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reopened.get(b"cache/key").unwrap(), Some(b"value".to_vec()));
+        let warm = reopened.page_cache_stats();
+        assert!(warm.hits >= 1, "the repeated key lookup should hit the page cache");
+        assert!(warm.misses >= 1, "the first lookup should read and validate the page");
+
+        reopened.set_page_cache_capacity(0).unwrap();
+        let cold_before = reopened.page_cache_stats();
+        assert_eq!(cold_before.capacity_pages, 0);
+        assert_eq!(cold_before.resident_pages, 0);
+        reopened.get(b"cache/key").unwrap();
+        let cold_after = reopened.page_cache_stats();
+        assert_eq!(cold_after.hits, cold_before.hits);
+        assert!(cold_after.misses > cold_before.misses);
+        drop(reopened);
+        for suffix in [".lock", ".pages", ".pages.wal"] {
+            let _ = fs::remove_file(with_suffix(&path, suffix));
+        }
+    }
+
+    #[test]
     fn registry_hierarchy_is_typed_case_insensitive_and_recursive() {
         let path = temp_path("registry");
         {
