@@ -16,7 +16,7 @@ mod kv;
 pub use kv::{KeyValueStore, Registry, RegistryValue};
 pub use storage::record_store::RecordStore;
 pub use storage::sql_rows::SqlRowStore;
-pub use storage::emberforge7::{EmberForge7Stats, EmberForge7Store};
+pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Stats, EmberForge7Store};
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
