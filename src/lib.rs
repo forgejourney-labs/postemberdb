@@ -18,7 +18,7 @@ pub mod version;
 pub use kv::{KeyValueStore, Registry, RegistryValue};
 pub use storage::record_store::RecordStore;
 pub use storage::sql_rows::SqlRowStore;
-pub use storage::transaction_coordinator::{RecoveredTransaction, TransactionCoordinator, TransactionState};
+pub use storage::transaction_coordinator::{CoordinatorParticipant, RecoveredTransaction, TransactionCoordinator, TransactionState};
 pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Stats, EmberForge7Store};
 
 use sql::{
