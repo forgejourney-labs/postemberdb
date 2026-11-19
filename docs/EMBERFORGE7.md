@@ -62,9 +62,10 @@ Public API:
 - `get_player_profile_by_name(namespace_id, username)`
 - `scan_player_profiles(namespace_id, after_uuid, limit)`
 - `search_player_profiles_by_name(namespace_id, prefix, limit)`
-- `apply_player_batch(upserts, removals)`
+- `apply_player_batch(upserts, removals)` for raw records
+- `apply_player_profile_batch(upserts, removals)` for typed profile records
 
-UUID and name indexes are namespace-scoped. Player row identity metadata remembers the current UUID and optional canonical username. Renaming a player or changing the UUID removes obsolete index entries and writes the new record, identity, and indexes through one B+ tree publication. Duplicate UUIDs and usernames are rejected within a namespace. Reads cross-check the index, identity metadata, and typed profile instead of trusting a stale index entry.
+UUID and name indexes are namespace-scoped. Player row identity metadata remembers the current UUID and optional canonical username. Renaming a player or changing the UUID removes obsolete index entries and writes the new record, identity, and indexes through one B+ tree publication. The typed profile batch accepts up to 2,500 mixed profile upserts/removals and 256 MiB of aggregate encoded profile payload, preserving name indexes across the whole batch commit. Duplicate UUIDs and usernames are rejected within a namespace. Reads cross-check the index, identity metadata, and typed profile instead of trusting a stale index entry.
 
 The UUID scan uses an exclusive cursor and a bounded result limit. Name-prefix scans are case-insensitive and bounded. Both cap a single result page at 10,000 entries.
 
