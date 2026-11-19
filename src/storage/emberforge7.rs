@@ -94,6 +94,9 @@ fn namespace_key(id: u64) -> Result<Vec<u8>, DbError> {
 }
 
 fn namespace_name_key(parent_id: Option<u64>, name: &str) -> Result<Vec<u8>, DbError> {
+    if parent_id == Some(0) {
+        return Err(DbError::Constraint("EF7 namespace parent ID must be non-zero".into()));
+    }
     let normalized = normalize_namespace_name(name)?;
     let mut key = vec![KEY_NAMESPACE_NAME];
     key.extend_from_slice(&parent_id.unwrap_or(0).to_be_bytes());
@@ -506,7 +509,9 @@ impl EmberForge7Store {
         name_prefix.extend_from_slice(&id.to_be_bytes());
         let mut identity_prefix = vec![KEY_PLAYER_ROW_META];
         identity_prefix.extend_from_slice(&id.to_be_bytes());
-        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix] {
+        let mut chunk_prefix = vec![KEY_CHUNK_DATA];
+        chunk_prefix.extend_from_slice(&id.to_be_bytes());
+        for prefix in [child_prefix, record_prefix, uuid_prefix, name_prefix, identity_prefix, chunk_prefix] {
             if !page_tree::scan_range_limited(
                 &mut self.pages, &prefix, &prefix_upper_key(&prefix), Some(1),
             )?.is_empty() {
@@ -748,7 +753,13 @@ impl EmberForge7Store {
             removals.push(identity_key);
         }
         if let Some(name) = identity.username {
-            removals.push(player_name_key(namespace_id, &name)?);
+            let name_key = player_name_key(namespace_id, &name)?;
+            let value = page_tree::get(&mut self.pages, &name_key)?
+                .ok_or_else(|| DbError::Storage("EF7 player-name identity has no index entry".into()))?;
+            if value.len() != 8 || u64::from_be_bytes(value[..8].try_into().unwrap()) != row_id {
+                return Err(DbError::Storage("EF7 player-name index does not point to the requested row".into()));
+            }
+            removals.push(name_key);
         }
         let (removed, _) = page_tree::apply_mutations(&mut self.pages, &self.wal_path, &removals, &[])?;
         if removed != removals.len() {
@@ -947,7 +958,13 @@ impl EmberForge7Store {
                 removal_keys.push(identity_key);
             }
             if let Some(name) = identity.username {
-                removal_keys.push(player_name_key(*namespace_id, &name)?);
+                let name_key = player_name_key(*namespace_id, &name)?;
+                let name_value = page_tree::get(&mut self.pages, &name_key)?
+                    .ok_or_else(|| DbError::Storage("EF7 player-name index is missing".into()))?;
+                if name_value.len() != 8 || u64::from_be_bytes(name_value[..8].try_into().unwrap()) != *row_id {
+                    return Err(DbError::Storage("EF7 player-name index is inconsistent".into()));
+                }
+                removal_keys.push(name_key);
             }
         }
 
@@ -978,7 +995,13 @@ impl EmberForge7Store {
                     removal_keys.push(old_key);
                 }
                 if let Some(name) = &old.username {
-                    removal_keys.push(player_name_key(*namespace_id, name)?);
+                    let old_name_key = player_name_key(*namespace_id, name)?;
+                    let old_name_value = page_tree::get(&mut self.pages, &old_name_key)?
+                        .ok_or_else(|| DbError::Storage("previous EF7 player-name index is missing".into()))?;
+                    if old_name_value.len() != 8 || u64::from_be_bytes(old_name_value[..8].try_into().unwrap()) != *row_id {
+                        return Err(DbError::Storage("previous EF7 player-name index is inconsistent".into()));
+                    }
+                    removal_keys.push(old_name_key);
                 }
             }
             let next = self.write_payload(payload)?;
@@ -1180,12 +1203,12 @@ mod tests {
                 (7, 101, uuid_a, b"player-a".to_vec()),
                 (7, 102, uuid_b, vec![0x5a; 90_000]),
             ];
-            assert_eq!(store.apply_player_batch(&upserts, &[]).unwrap(), (0, 4));
+            assert_eq!(store.apply_player_batch(&upserts, &[]).unwrap(), (0, 6));
             assert_eq!(store.get_player(7, uuid_a).unwrap(), Some((101, b"player-a".to_vec())));
             assert_eq!(store.get_player(7, uuid_b).unwrap(), Some((102, vec![0x5a; 90_000])));
             let replacement = vec![(7, 102, uuid_b, b"updated-player-b".to_vec())];
             let removals = vec![(7, 101, uuid_a)];
-            assert_eq!(store.apply_player_batch(&replacement, &removals).unwrap(), (2, 2));
+            assert_eq!(store.apply_player_batch(&replacement, &removals).unwrap(), (3, 3));
             assert_eq!(store.get_player(7, uuid_a).unwrap(), None);
             assert_eq!(store.get_player(7, uuid_b).unwrap(), Some((102, b"updated-player-b".to_vec())));
             let before = store.stats();
@@ -1315,6 +1338,19 @@ mod tests {
             assert_eq!(reopened.get_chunk(44, -1, 2).unwrap(), Some(b"negative-x".to_vec()));
             assert_eq!(reopened.get_chunk(44, 0, 0).unwrap(), None);
         }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn namespace_cannot_be_deleted_while_chunk_payloads_exist() {
+        let path = path("namespace-chunk-guard");
+        let mut store = EmberForge7Store::open(&path, 8).unwrap();
+        store.create_namespace(88, None, EmberForge7NamespaceKind::World, "world").unwrap();
+        store.put_chunk(88, -1, 2, b"chunk").unwrap();
+        assert!(store.delete_namespace(88).is_err());
+        assert!(store.delete_chunk(88, -1, 2).unwrap());
+        assert!(store.delete_namespace(88).unwrap());
+        drop(store);
         cleanup(&path);
     }
 
