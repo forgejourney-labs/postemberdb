@@ -1626,6 +1626,11 @@ mod tests {
         {
             let mut store = EmberForge7Store::open(&path, 24).unwrap();
             store.put_record_with_expiry(1, 10, 100, b"expires-first").unwrap();
+            let oversized = vec![0x44; 24 * 1024 + 1];
+            store.put_record(1, 99, &oversized).unwrap();
+            assert!(store.get_record_limited(1, 99, 24 * 1024).is_err());
+            assert_eq!(store.get_record_limited(1, 99, oversized.len()).unwrap(), Some(oversized));
+            assert!(store.delete_record(1, 99).unwrap());
             store.put_record_with_expiry(1, 20, 200, b"expires-later").unwrap();
             store.put_record_with_expiry(1, 30, 300, b"will-be-persistent").unwrap();
 
