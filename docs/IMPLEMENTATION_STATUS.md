@@ -88,7 +88,7 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Raw player records with persistent UUID and row-identity indexes; stale UUID mappings are removed when a row changes UUID.
 - [x] Typed Minecraft player profiles with username, first/last-seen timestamps, playtime ticks, and plugin-owned custom bytes.
 - [x] Namespace-scoped, case-insensitive player-name index; bounded UUID pagination and name-prefix search.
-- [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding and bounded rectangular scans.
+- [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding, bounded rectangular scans, and atomic region chunk batches.
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
 - [ ] General user-defined secondary indexes and index rebuild/verification tooling.
 - [ ] Integrate EF7 transactions with canonical SQL WAL, catalog and SQL executor; PDB5 remains authoritative.
