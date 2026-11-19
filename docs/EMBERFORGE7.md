@@ -76,8 +76,9 @@ World chunk data can be stored directly by signed chunk coordinates:
 - `get_chunk(world_namespace_id, chunk_x, chunk_z)`
 - `delete_chunk(world_namespace_id, chunk_x, chunk_z)`
 - `scan_chunks(world_namespace_id, min_x, min_z, max_x, max_z, limit)`
+- `apply_chunk_batch(world_namespace_id, upserts, removals)
 
-Chunk descriptors are their own B+ tree entries and point to the same checked overflow-page format. Updating a chunk publishes one new descriptor root and reclaims the previous extent afterward. Rectangular scans iterate ordered X columns and issue bounded Z-range scans. A query can cover at most 4,096 X columns and return at most 10,000 chunks.
+Chunk descriptors are their own B+ tree entries and point to the same checked overflow-page format. Updating a chunk publishes one new descriptor root and reclaims the previous extent afterward. Region-level batches accept up to 2,500 upserts/removals and 256 MiB of aggregate payload, publishing all chunk-index changes through one redo/root update. Duplicate and overlapping coordinates are rejected before page allocation. Rectangular scans iterate ordered X columns and issue bounded Z-range scans. A query can cover at most 4,096 X columns and return at most 10,000 chunks.
 
 ## Bounds and validation
 
