@@ -451,6 +451,35 @@ mod tests {
     }
 
     #[test]
+    fn record_store_scans_ids_in_bounded_stable_pages() {
+        let path = temp_path("scan-ids");
+        {
+            let mut store = RecordStore::open(&path).unwrap();
+            store.put_many(vec![
+                (40, b"four".to_vec()),
+                (10, b"one".to_vec()),
+                (30, b"three".to_vec()),
+                (20, b"two".to_vec()),
+            ]).unwrap();
+
+            assert_eq!(store.scan_ids(None, 2).unwrap(), vec![10, 20]);
+            assert_eq!(store.scan_ids(Some(20), 2).unwrap(), vec![30, 40]);
+            assert!(store.scan_ids(Some(40), 2).unwrap().is_empty());
+            assert!(store.scan_ids(None, 0).unwrap().is_empty());
+            assert!(store.scan_ids(None, 5_001).is_err());
+
+            store.delete(20).unwrap();
+            assert_eq!(store.scan_ids(Some(10), 10).unwrap(), vec![30, 40]);
+        }
+
+        let mut reopened = RecordStore::open(&path).unwrap();
+        assert_eq!(reopened.scan_ids(None, 10).unwrap(), vec![10, 30, 40]);
+        assert_eq!(reopened.get(30).unwrap(), Some(b"three".to_vec()));
+        drop(reopened);
+        remove_store_files(&path);
+    }
+
+    #[test]
     fn record_store_rejects_corrupt_record_page_metadata() {
         let path = temp_path("corruption");
         let mut store = RecordStore::open(&path).unwrap();
