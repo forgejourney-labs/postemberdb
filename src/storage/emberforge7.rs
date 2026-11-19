@@ -1451,7 +1451,6 @@ mod tests {
             let mut reopened = EmberForge7Store::open(&path, 24).unwrap();
             assert!(reopened.get_player_profile(7, second_uuid).unwrap().is_none());
         }
-        drop(());
         cleanup(&path);
     }
 
@@ -1553,13 +1552,13 @@ mod tests {
         let path = path("chunk-batch");
         {
             let mut store = EmberForge7Store::open(&path, 16).unwrap();
-            store.apply_chunk_batch(1, &[
+            store.apply_chunk_batch(77, &[
                 (-1, 2, b"one".to_vec()),
                 (0, 0, vec![0x44; 70_000]),
                 (1, -2, b"three".to_vec()),
             ], &[]).unwrap();
-            assert_eq!(store.get_chunk(1, -1, 2).unwrap(), Some(b"one".to_vec()));
-            assert_eq!(store.get_chunk(1, 0, 0).unwrap(), Some(vec![0x44; 70_000]));
+            assert_eq!(store.get_chunk(77, -1, 2).unwrap(), Some(b"one".to_vec()));
+            assert_eq!(store.get_chunk(77, 0, 0).unwrap(), Some(vec![0x44; 70_000]));
             let before = store.stats();
             assert!(store.apply_chunk_batch(&[
                 (4, 5, b"a".to_vec()), (4, 5, b"b".to_vec()),
@@ -1573,7 +1572,7 @@ mod tests {
             let mut reopened = EmberForge7Store::open(&path, 16).unwrap();
             assert_eq!(reopened.get_chunk(1, -1, 2).unwrap(), None);
             assert_eq!(reopened.get_chunk(1, 0, 0).unwrap(), Some(b"replacement".to_vec()));
-            assert_eq!(reopened.get_chunk(1, 1, -2).unwrap(), Some(b"three".to_vec()));
+            assert_eq!(reopened.get_chunk(77, 1, -2).unwrap(), Some(b"three".to_vec()));
         }
         cleanup(&path);
     }
