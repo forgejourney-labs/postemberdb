@@ -628,7 +628,14 @@ fn scan_node_limited(
 /// Duplicate references and cycles are rejected; callers must hold exclusive
 /// ownership of the page file while using this set for reclamation.
 pub(crate) fn reachable_page_ids(store: &mut ExtentFile) -> Result<HashSet<u64>, DbError> {
-    let Some(root) = store.root_page_id() else { return Ok(HashSet::new()); };
+    match store.root_page_id() {
+        Some(root) => reachable_page_ids_from_root(store, root),
+        None => Ok(HashSet::new()),
+    }
+}
+
+/// Returns every page reachable from an arbitrary retained immutable root.
+pub(crate) fn reachable_page_ids_from_root(store: &mut ExtentFile, root: u64) -> Result<HashSet<u64>, DbError> {
     let bound = store.stats().allocated_pages;
     let mut visited = HashSet::new();
     collect_reachable(store, root, &mut visited, bound)?;
