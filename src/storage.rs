@@ -511,17 +511,6 @@ pub(super) fn hydrate_pdb6_table(
     Ok(())
 }
 
-/// Hydrates all tables for explicit maintenance operations that need a complete view.
-pub(super) fn hydrate_pdb6_rows(
-    path: &Path,
-    tables: &mut BTreeMap<String, Table>,
-) -> Result<(), DbError> {
-    for (table_name, table) in tables.iter_mut() {
-        hydrate_pdb6_table(path, table_name, table)?;
-    }
-    Ok(())
-}
-
 /// Persists one complete SQL transaction through a single PDB6 root publication.
 /// Row payloads, catalog records, secondary-index deltas and the manifest all
 /// become visible together; PDB5 WAL is not consulted in PDB6 mode.
