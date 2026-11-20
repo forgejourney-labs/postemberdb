@@ -178,6 +178,22 @@ impl AuthStore {
         Ok(Some(Principal { username: username.to_ascii_lowercase(), permissions: record.permissions }))
     }
 
+    /// Replace a user's password hash without exposing or returning password material.
+    /// The new credential is independently salted and persisted before this method returns.
+    pub fn change_password(&mut self, username: &str, new_password: &str) -> Result<(), DbError> {
+        validate_password(new_password)?;
+        let key = user_key(username)?;
+        let bytes = self.users.get(&key)?
+            .ok_or_else(|| DbError::Constraint("user does not exist".into()))?;
+        let mut record = UserRecord::decode(&bytes)?;
+        let salt = SaltString::generate(&mut OsRng);
+        record.password_hash = Argon2::default()
+            .hash_password(new_password.as_bytes(), &salt)
+            .map_err(|_| DbError::Storage("password hashing failed".into()))?
+            .to_string();
+        self.users.put(&key, &record.encode()?)
+    }
+
     pub fn set_permissions(&mut self, username: &str, permissions: Permissions) -> Result<(), DbError> {
         let key = user_key(username)?;
         let bytes = self.users.get(&key)?
@@ -236,6 +252,27 @@ mod tests {
     fn path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("postemberdb-auth-{}.auth",
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    #[test]
+    fn password_change_replaces_the_credential_and_survives_reopen() {
+        let path = path();
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            auth.create_user("rotation", "first secure password", Permissions::READ_WRITE).unwrap();
+            auth.change_password("rotation", "second secure password").unwrap();
+            assert!(auth.authenticate("rotation", "first secure password").unwrap().is_none());
+            assert!(auth.authenticate("rotation", "second secure password").unwrap().is_some());
+        }
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            assert!(auth.authenticate("rotation", "first secure password").unwrap().is_none());
+            assert!(auth.authenticate("rotation", "second secure password").unwrap().is_some());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
     }
 
     #[test]
