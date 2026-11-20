@@ -6,19 +6,33 @@ on:
   pull_request:
     branches: [dev, canary, unstable, stable]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: postemberdb-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy correctness and suspicious lints
+        run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
       - name: Check all targets
         run: cargo check --all-targets
-      - name: Run tests
+      - name: Run unit and binary tests
         run: cargo test --lib --bin postemberdb
+      - name: Run documentation tests
+        run: cargo test --doc
       - name: Build release
         run: cargo build --release
       - name: Compile benchmarks
@@ -33,6 +47,7 @@ jobs:
 
   operator-apps:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust
