@@ -26,12 +26,13 @@ button.danger{padding:5px 9px;border:1px solid #b56d6d;background:#fff7f7;color:
 </style>
 </head>
 <body>
-<header><strong>PostemberDB Admin</strong><span>Database management</span><span>Local mode</span></header>
+<header><strong>PostemberDB Admin</strong><span>Database management</span><span id="header-mode">Local embedded</span></header>
 <div class="layout">
 <aside>
   <div class="tree-title">Database navigator</div>
   <button class="tree-item active" id="overview-link">▣ Current database</button>
   <div class="tree-title">Tables <span id="table-count" class="muted">(loading)</span></div>
+  <input id="table-filter" aria-label="Filter tables" placeholder="Filter tables…" style="width:100%;padding:7px;border:1px solid #aeb8c2;margin:0 0 7px">
   <div id="table-list"><div class="muted" style="padding:8px">Loading catalog…</div></div>
   <button class="secondary" id="refresh-catalog">Refresh catalog</button>
   <div class="tree-title">Server</div>
@@ -259,13 +260,6 @@ function renderRows(response){
   if(response.editable){
    const actions=document.createElement('td');
    const edit=textNode('button','Edit','secondary');edit.type='button';edit.addEventListener('click',()=>showRowEditor(row));
-   const reset=textNode('button','Reset password','secondary');reset.type='button';
-  reset.addEventListener('click',async()=>{
-   const password=window.prompt('New password for '+user.username+' (at least 12 characters):');
-   if(password===null)return;
-   try{await adminRequest('users.password',{username:user.username,password});statusNode.textContent='Password changed for '+user.username;}
-   catch(error){statusNode.textContent='Password reset failed: '+error.message;}
-  });
   const remove=textNode('button','Delete','danger');remove.type='button';
    remove.addEventListener('click',async()=>{
     if(!window.confirm('Delete row #'+row.row_id+'?'))return;
@@ -366,6 +360,16 @@ async function loadUsers(){
   toggle.addEventListener('click',async()=>{
    try{await adminRequest('users.enabled',{username:user.username,enabled:!user.enabled});await loadUsers();}
    catch(error){statusNode.textContent=error.message;}
+  });
+  const reset=textNode('button','Reset password','secondary');reset.type='button';
+  reset.addEventListener('click',async()=>{
+   const password=window.prompt('New password for '+user.username+' (at least 12 characters):');
+   if(password===null)return;
+   if(password.length<12){statusNode.textContent='Password must contain at least 12 characters';return;}
+   try{
+    await adminRequest('users.password',{username:user.username,password});
+    statusNode.textContent='Password changed for '+user.username;
+   }catch(error){statusNode.textContent='Password reset failed: '+error.message;}
   });
   const setPermissions=permissionSelect('permissions-'+user.username,user.permissions);
   const update=textNode('button','Apply rights','secondary');update.type='button';
@@ -480,6 +484,7 @@ async function connectRemote(){
   });
   document.getElementById('remote-password').value='';
   document.getElementById('remote-state').textContent='Connected over verified TLS as '+result.username;
+  document.getElementById('header-mode').textContent='Remote TLS · '+result.username;
   document.getElementById('remote-disconnect').disabled=false;
   document.getElementById('admin-panel').hidden=false;
   await loadCatalog();
@@ -490,6 +495,7 @@ async function disconnectRemote(){
  try{
   await requestJson('/api/remote/disconnect',{method:'POST'});
   document.getElementById('remote-state').textContent='Using the local embedded database';
+  document.getElementById('header-mode').textContent='Local embedded';
   document.getElementById('remote-disconnect').disabled=true;
   document.getElementById('admin-panel').hidden=true;
   document.getElementById('admin-output').replaceChildren(textNode('span','Connect to a remote server to open remote administration.','muted'));
@@ -513,6 +519,12 @@ document.querySelectorAll('[data-admin-view]').forEach(button=>{
  button.addEventListener('click',()=>showAdminView(button.dataset.adminView));
 });
 document.getElementById('refresh-catalog').addEventListener('click',async()=>{try{await loadCatalog();statusNode.textContent='Catalog refreshed';}catch(error){statusNode.textContent='Catalog refresh failed: '+error.message;}});
+document.getElementById('table-filter').addEventListener('input',event=>{
+ const needle=event.target.value.trim().toLocaleLowerCase();
+ document.querySelectorAll('#table-list [data-table]').forEach(button=>{
+  button.hidden=!button.dataset.table.toLocaleLowerCase().includes(needle);
+ });
+});
 document.getElementById('overview-link').addEventListener('click',showOverview);
 document.getElementById('browse-rows').addEventListener('click',()=>loadRows(0).catch(error=>{statusNode.textContent='Could not load rows: '+error.message;}));
 document.getElementById('insert-row').addEventListener('click',showInsertForm);
