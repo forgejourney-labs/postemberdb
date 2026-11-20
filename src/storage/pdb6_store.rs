@@ -9,6 +9,7 @@ use crate::DbError;
 use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAX_MUTATIONS: usize = 5_000;
