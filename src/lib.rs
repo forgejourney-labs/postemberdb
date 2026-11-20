@@ -912,10 +912,10 @@ impl Database {
         if !self.pdb6_mode {
             return Err(DbError::Constraint("SQL coordinator participation requires PDB6".into()));
         }
-        let path = self.storage_path.as_deref()
+        let path = self.storage_path.clone()
             .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
         let (already_committed, encoded) = {
-            let mut store = crate::storage::pdb6_store::Pdb6Store::open(path, 128)?;
+            let mut store = crate::storage::pdb6_store::Pdb6Store::open(&path, 128)?;
             if store.has_coordinator_commit(transaction_id)? {
                 (true, Vec::new())
             } else {
@@ -931,7 +931,7 @@ impl Database {
         let sequence = self.wal_sequence.checked_add(1)
             .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
         self.wal_sequence = crate::storage::persist_pdb6_transition(
-            path, &self.tables, &session.staged.tables, sequence, Some(transaction_id),
+            &path, &self.tables, &session.staged.tables, sequence, Some(transaction_id),
         )?;
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
