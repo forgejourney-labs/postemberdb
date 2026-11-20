@@ -290,3 +290,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_json_values_using_column_types_and_nullability() {
+        assert_eq!(
+            json_to_value(&serde_json::json!(42), &DataType::Integer, false).unwrap(),
+            Value::Integer(42)
+        );
+        assert_eq!(
+            json_to_value(&serde_json::json!("hello"), &DataType::Text, false).unwrap(),
+            Value::Text("hello".into())
+        );
+        assert_eq!(
+            json_to_value(&serde_json::json!(true), &DataType::Boolean, false).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            json_to_value(&JsonValue::Null, &DataType::Text, true).unwrap(),
+            Value::Null
+        );
+        assert!(json_to_value(&JsonValue::Null, &DataType::Text, false).is_err());
+        assert!(json_to_value(&serde_json::json!("42"), &DataType::Integer, false).is_err());
+    }
+
+    #[test]
+    fn sql_text_literals_escape_quotes_and_identifiers_are_restricted() {
+        assert_eq!(sql_literal(&Value::Text("O'Reilly".into())), "'O''Reilly'");
+        assert!(valid_identifier("player_stats_2026"));
+        assert!(!valid_identifier("../player_stats"));
+        assert!(!valid_identifier("player;drop"));
+    }
+
+    #[test]
+    fn row_key_predicate_targets_the_declared_unique_key() {
+        let mut database = Database::new();
+        database.execute("CREATE TABLE editor_rows (id INTEGER PRIMARY KEY, title TEXT)").unwrap();
+        database.execute("INSERT INTO editor_rows VALUES (7, 'before')").unwrap();
+
+        let predicate = key_predicate(&database, "editor_rows", &[serde_json::json!(7)]).unwrap();
+        assert_eq!(predicate, "id = 7");
+
+        let updated = database.execute(&format!(
+            "UPDATE editor_rows SET title = 'after' WHERE {predicate}"
+        )).unwrap();
+        assert_eq!(updated.affected_rows, 1);
+
+        let page = database.read_table_page("editor_rows", 0, 10).unwrap();
+        assert_eq!(page.rows[0].values[1], Value::Text("after".into()));
+
+        let deleted = database.execute(&format!("DELETE FROM editor_rows WHERE {predicate}")).unwrap();
+        assert_eq!(deleted.affected_rows, 1);
+        assert!(database.read_table_page("editor_rows", 0, 10).unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn row_edits_are_rejected_without_a_unique_index() {
+        let database = Database::new();
+        let mut database = database;
+        database.execute("CREATE TABLE no_key (note TEXT)").unwrap();
+        assert!(key_predicate(&database, "no_key", &[]).is_err());
+    }
+}

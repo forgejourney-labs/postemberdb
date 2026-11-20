@@ -10,6 +10,7 @@ A separate Rust web application with a phpMyAdmin-inspired administration layout
 - Provides bounded row paging (50 rows per page by default, up to 200 per request).
 - Allows inserting rows and editing/deleting individual rows when the table has a UNIQUE index or PRIMARY KEY.
 - Edits one cell per request, with type/null validation performed by the server and core engine.
+- Includes tests for typed JSON conversion, SQL literal escaping, unique-key targeting, and rejection of edits without a unique index.
 - Exports the current visible page as CSV or JSON.
 - Shows a classic left-hand table navigator, database overview, structure inspector, SQL console, and result grids.
 
