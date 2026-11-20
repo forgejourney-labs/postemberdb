@@ -59,6 +59,8 @@ struct BrowserApp {
     edit_draft: Option<RowDraft>,
     pending_delete: Option<DeleteDraft>,
     status: String,
+    table_filter: String,
+    query_history: Vec<String>,
 }
 
 impl Default for BrowserApp {
@@ -82,6 +84,8 @@ impl Default for BrowserApp {
             edit_draft: None,
             pending_delete: None,
             status: "No database opened".into(),
+            table_filter: String::new(),
+            query_history: Vec::new(),
         }
     }
 }
@@ -258,6 +262,12 @@ impl BrowserApp {
         match result {
             Ok(result) => {
                 self.status = result.message.clone();
+                let executed = self.sql.trim().to_owned();
+                if !executed.is_empty() {
+                    self.query_history.retain(|entry| entry != &executed);
+                    self.query_history.insert(0, executed);
+                    self.query_history.truncate(20);
+                }
                 self.result = Some(result);
                 self.refresh_catalog();
             }
@@ -620,6 +630,10 @@ impl eframe::App for BrowserApp {
                     else { "○ Disconnected" });
                 ui.separator();
                 ui.heading("Explorer");
+                if self.is_connected() {
+                    ui.label("Filter tables");
+                    ui.text_edit_singleline(&mut self.table_filter);
+                }
                 if !self.is_connected() {
                     ui.weak("Open a .pbd or legacy .db file, or connect to a remote TLS server.");
                 } else if self.catalog.tables.is_empty() {
@@ -629,6 +643,9 @@ impl eframe::App for BrowserApp {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for table in tables {
                             let table_name = table.name.clone();
+                            if !table_name.to_ascii_lowercase().contains(&self.table_filter.trim().to_ascii_lowercase()) {
+                                continue;
+                            }
                             let selected = self.selected_table.as_deref() == Some(table_name.as_str());
                             ui.horizontal(|ui| {
                                 if ui.selectable_label(selected, format!("▦ {table_name}")).clicked() {
@@ -661,6 +678,19 @@ impl eframe::App for BrowserApp {
 
         egui::CentralPanel::default().show(context, |ui| {
             ui.heading("SQL editor");
+            if !self.query_history.is_empty() {
+                egui::ComboBox::from_label("Recent queries")
+                    .selected_text("Choose a previous query")
+                    .show_ui(ui, |ui| {
+                        for query in self.query_history.clone() {
+                            let label = query.chars().take(72).collect::<String>();
+                            let label = if query.chars().count() > 72 { format!("{label}…") } else { label };
+                            if ui.selectable_label(false, label).clicked() {
+                                self.sql = query;
+                            }
+                        }
+                    });
+            }
             ui.add(egui::TextEdit::multiline(&mut self.sql)
                 .desired_rows(8).code_editor().desired_width(f32::INFINITY));
             ui.horizontal(|ui| {
