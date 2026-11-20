@@ -87,7 +87,7 @@ impl Principal {
 }
 
 /// Durable security event. Passwords, hashes, and tokens are never included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuditEvent {
     pub sequence: u64,
     pub timestamp_unix_ms: u64,
@@ -223,6 +223,22 @@ impl UserRecord {
             .map_err(|_| DbError::Storage("authentication hash has invalid PHC syntax".into()))?;
         Ok(Self { password_hash, permissions, enabled: bytes[5] == 1 })
     }
+}
+
+/// Durable authentication identity metadata. Password hashes are never exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserInfo {
+    pub username: String,
+    pub permissions: u32,
+    pub enabled: bool,
+    pub roles: Vec<String>,
+}
+
+/// Public role metadata. This structure never includes credential material.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoleInfo {
+    pub name: String,
+    pub permissions: u32,
 }
 
 /// Persistent user directory. Passwords are never stored: only Argon2id PHC
@@ -527,6 +543,36 @@ impl AuthStore {
         entries.into_iter().map(|(key, _)| {
             String::from_utf8(key[USER_PREFIX.len()..].to_vec())
                 .map_err(|_| DbError::Storage("authentication username key is invalid UTF-8".into()))
+        }).collect()
+    }
+
+    /// Returns bounded public user metadata without revealing password hashes.
+    pub fn list_user_details(&mut self) -> Result<Vec<UserInfo>, DbError> {
+        let entries = self.users.scan_prefix(USER_PREFIX, None)?;
+        let mut users = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let username = String::from_utf8(key[USER_PREFIX.len()..].to_vec())
+                .map_err(|_| DbError::Storage("authentication username key is invalid UTF-8".into()))?;
+            let record = UserRecord::decode(&value)?;
+            let roles = self.list_user_roles(&username)?;
+            users.push(UserInfo {
+                username,
+                permissions: record.permissions.bits(),
+                enabled: record.enabled,
+                roles,
+            });
+        }
+        Ok(users)
+    }
+
+    /// Returns public named-role metadata without exposing internal records.
+    pub fn list_role_details(&mut self) -> Result<Vec<RoleInfo>, DbError> {
+        let entries = self.users.scan_prefix(ROLE_PREFIX, None)?;
+        entries.into_iter().map(|(key, value)| {
+            let name = String::from_utf8(key[ROLE_PREFIX.len()..].to_vec())
+                .map_err(|_| DbError::Storage("authentication role name is invalid UTF-8".into()))?;
+            let record = RoleRecord::decode(&value)?;
+            Ok(RoleInfo { name, permissions: record.permissions.bits() })
         }).collect()
     }
 }

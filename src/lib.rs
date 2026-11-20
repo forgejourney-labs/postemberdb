@@ -17,7 +17,7 @@ pub mod auth;
 pub mod version;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
-pub use auth::{AuditEvent, AuthStore, Permission, Permissions, Principal};
+pub use auth::{AuditEvent, AuthStore, Permission, Permissions, Principal, RoleInfo, UserInfo};
 pub use storage::record_store::RecordStore;
 pub use storage::sql_rows::SqlRowStore;
 pub use storage::transaction_coordinator::{CoordinatorParticipant, RecoveredTransaction, TransactionCoordinator, TransactionState};
@@ -46,7 +46,7 @@ pub struct PageCacheStats {
     pub evictions: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Integer(i64),
@@ -65,28 +65,28 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Integer,
     Text,
     Boolean,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Row {
     /// Stable table-local identifier, independent of the current vector position.
     pub row_id: u64,
     pub values: Vec<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Row>,
@@ -101,13 +101,13 @@ impl QueryResult {
 }
 
 /// Read-only view of the SQL catalog, suitable for database administration tools.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CatalogSnapshot {
     pub tables: Vec<TableInfo>,
 }
 
 /// Metadata for one SQL table. Rows are not copied into the catalog snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableInfo {
     pub name: String,
     pub row_count: usize,
@@ -116,7 +116,7 @@ pub struct TableInfo {
 }
 
 /// Metadata for one index attached to a SQL table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<String>,
