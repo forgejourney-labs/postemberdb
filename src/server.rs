@@ -1,4 +1,4 @@
-use postemberdb::{AuthStore, Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, KeyValueStore, Permission, Principal, QueryResult, Registry, TransactionCoordinator, Value};
+use postemberdb::{AuthStore, Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, KeyValueStore, Permission, Permissions, Principal, QueryResult, Registry, RemoteServerStatus, RemoteTablePage, TransactionCoordinator, Value};
 use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
 use postemberdb::version::version_string;
 use std::ffi::OsString;
@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
+use serde_json::{json, Value as JsonValue};
 use rustls::{pki_types::PrivateKeyDer, ServerConfig, ServerConnection, StreamOwned};
 use std::fs::File;
 
@@ -160,6 +162,7 @@ fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<Serve
         )))
     } else { None };
     let active_clients = Arc::new(AtomicUsize::new(0));
+    let started_at = Instant::now();
 
     for incoming in listener.incoming() {
         match incoming {
@@ -184,16 +187,20 @@ fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<Serve
                             let auth = auth_store.clone();
                             let tls = tls_config.clone();
                             let active = active_clients.clone();
+                            let active_for_handler = active_clients.clone();
                             let active_on_failure = active_clients.clone();
                             match thread::Builder::new().name("postemberdb-client".into()).spawn(move || {
                                 let _guard = ConnectionGuard(active);
                                 let result = if let Some(config) = tls {
                                     match ServerConnection::new(config) {
-                                        Ok(connection) => handle_client(StreamOwned::new(connection, stream), db, ef7, auth, true),
+                                        Ok(connection) => handle_client(
+                                            StreamOwned::new(connection, stream), db, ef7, auth, true,
+                                            active_for_handler, started_at,
+                                        ),
                                         Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.to_string())),
                                     }
                                 } else {
-                                    handle_client(stream, db, ef7, auth, false)
+                                    handle_client(stream, db, ef7, auth, false, active_for_handler, started_at)
                                 };
                                 if let Err(error) = result { eprintln!("client error: {error}"); }
                             }) {
@@ -221,6 +228,8 @@ fn handle_client<S: Read + Write>(
     ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
     auth: Option<Arc<std::sync::Mutex<AuthStore>>>,
     auth_required: bool,
+    active_clients: Arc<AtomicUsize>,
+    started_at: Instant,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::with_capacity(1024);
@@ -247,7 +256,10 @@ fn handle_client<S: Read + Write>(
             }
             Frame::new(FrameKind::Pong, 0, b"postemberdb-binary/1-ready".to_vec())
                 .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
-            return handle_binary_client(&mut reader, database, ef7, principal, auth_required);
+            return handle_binary_client(
+                &mut reader, database, ef7, principal, auth_required,
+                auth.clone(), active_clients.clone(), started_at, auth_required,
+            );
         }
         if command.eq_ignore_ascii_case("POSTEMBERDB JSONL/1") {
             jsonl_mode = true;
@@ -501,6 +513,10 @@ fn handle_binary_client<S: Read + Write>(
     ef7: Arc<std::sync::Mutex<EmberForge7Store>>,
     principal: Option<Principal>,
     auth_required: bool,
+    auth: Option<Arc<std::sync::Mutex<AuthStore>>>,
+    active_clients: Arc<AtomicUsize>,
+    started_at: Instant,
+    tls_enabled: bool,
 ) -> io::Result<()> {
     loop {
         let frame = match Frame::read_from_or_eof(reader, DEFAULT_MAX_PAYLOAD)? {
@@ -510,6 +526,109 @@ fn handle_binary_client<S: Read + Write>(
         let request_id = frame.request_id;
         let response = match frame.kind {
             FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
+            FrameKind::Catalog => {
+                let permission = principal.as_ref().map(|value| value.require(Permission::SqlRead))
+                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                match permission {
+                    Err(error) => binary_error(request_id, &error.to_string()),
+                    Ok(()) => match database.lock() {
+                        Ok(db) => match serde_json::to_vec(&db.catalog()) {
+                            Ok(payload) => Frame::new(FrameKind::CatalogResult, request_id, payload),
+                            Err(error) => binary_error(request_id, &format!("could not encode SQL catalog: {error}")),
+                        },
+                        Err(_) => binary_error(request_id, "database lock poisoned"),
+                    },
+                }
+            }
+            FrameKind::TablePage => {
+                let permission = principal.as_ref().map(|value| value.require(Permission::SqlRead))
+                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                if let Err(error) = permission {
+                    binary_error(request_id, &error.to_string())
+                } else {
+                    match serde_json::from_slice::<TablePageRequest>(&frame.payload) {
+                        Err(error) => binary_error(request_id, &format!("invalid table-page request: {error}")),
+                        Ok(request) if request.table.is_empty() || request.table.len() > 128
+                            || request.limit == 0 || request.limit > 1_000 =>
+                            binary_error(request_id, "table-page request requires a table name and limit 1..=1000"),
+                        Ok(request) => match database.lock() {
+                            Ok(db) => {
+                                let result = db.table_info(&request.table).and_then(|info| {
+                                    let page = db.read_table_page(&info.name, request.offset, request.limit)?;
+                                    Ok((info.row_count, info.name, page))
+                                });
+                                match result {
+                                    Ok((total_rows, table, result)) => {
+                                        let response = RemoteTablePage {
+                                            table, offset: request.offset, limit: request.limit,
+                                            total_rows, result,
+                                        };
+                                        match serde_json::to_vec(&response) {
+                                            Ok(payload) => Frame::new(FrameKind::TablePageResult, request_id, payload),
+                                            Err(error) => binary_error(request_id, &format!("could not encode table page: {error}")),
+                                        }
+                                    }
+                                    Err(error) => binary_error(request_id, &error.to_string()),
+                                }
+                            }
+                            Err(_) => binary_error(request_id, "database lock poisoned"),
+                        },
+                    }
+                }
+            }
+            FrameKind::BatchQuery => {
+                let permission = principal.as_ref().map(|value| value.require(Permission::SqlWrite))
+                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                if let Err(error) = permission {
+                    binary_error(request_id, &error.to_string())
+                } else {
+                    match serde_json::from_slice::<BatchQueryRequest>(&frame.payload) {
+                        Err(error) => binary_error(request_id, &format!("invalid transaction batch: {error}")),
+                        Ok(request) if request.statements.is_empty() || request.statements.len() > 500
+                            || request.statements.iter().any(|statement| statement.trim().is_empty()
+                                || permission_for_sql(statement.trim()) != Some(Permission::SqlWrite)) =>
+                            binary_error(request_id, "transaction batch must contain 1..=500 SQL write statements"),
+                        Ok(request) => match database.lock() {
+                            Ok(mut db) => match db.transaction(|transaction| {
+                                for statement in &request.statements {
+                                    transaction.execute(statement)?;
+                                }
+                                Ok(())
+                            }) {
+                                Ok(()) => Frame::new(
+                                    FrameKind::BatchQueryResult, request_id,
+                                    json!({"ok":true,"message":"transaction batch committed","statements":request.statements.len()}).to_string().into_bytes(),
+                                ),
+                                Err(error) => binary_error(request_id, &error.to_string()),
+                            },
+                            Err(_) => binary_error(request_id, "database lock poisoned"),
+                        },
+                    }
+                }
+            }
+            FrameKind::ServerStatus => {
+                if auth_required && principal.as_ref().is_none_or(|value| !value.allows(Permission::Admin)) {
+                    binary_error(request_id, "server status requires the Admin permission")
+                } else {
+                    let status = RemoteServerStatus {
+                        version: version_string(),
+                        active_clients: active_clients.load(Ordering::Acquire),
+                        maximum_clients: MAX_CLIENTS,
+                        tls_enabled,
+                        uptime_seconds: started_at.elapsed().as_secs(),
+                    };
+                    match serde_json::to_vec(&status) {
+                        Ok(payload) => Frame::new(FrameKind::ServerStatusResult, request_id, payload),
+                        Err(error) => binary_error(request_id, &format!("could not encode server status: {error}")),
+                    }
+                }
+            }
+            FrameKind::AdminRequest => {
+                match handle_binary_admin_request(&frame.payload, auth.as_ref(), principal.as_ref()) {
+                    Ok(payload) => Frame::new(FrameKind::AdminResponse, request_id, payload),
+                    Err(error) => binary_error(request_id, &error),
+                }
+            }
             FrameKind::Query => {
                 let sql = match std::str::from_utf8(&frame.payload) {
                     Ok(sql) if !sql.trim().is_empty() => sql,
@@ -606,13 +725,134 @@ fn handle_binary_client<S: Read + Write>(
                     }
                 }
             }
-            FrameKind::QueryResult | FrameKind::Error | FrameKind::Pong
+            FrameKind::CatalogResult | FrameKind::TablePageResult | FrameKind::ServerStatusResult
+            | FrameKind::AdminResponse | FrameKind::BatchQueryResult
+            | FrameKind::QueryResult | FrameKind::Error | FrameKind::Pong
             | FrameKind::ChunkData | FrameKind::ChunkScan | FrameKind::ChunkScanResult => {
                 binary_error(request_id, "frame kind is response-only or not implemented by this server version")
             }
         };
         response.write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
     }
+}
+
+
+#[derive(serde::Deserialize)]
+struct TablePageRequest {
+    table: String,
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchQueryRequest {
+    statements: Vec<String>,
+}
+
+fn handle_binary_admin_request(
+    payload: &[u8],
+    auth: Option<&Arc<std::sync::Mutex<AuthStore>>>,
+    principal: Option<&Principal>,
+) -> Result<Vec<u8>, String> {
+    let principal = principal.ok_or_else(|| "administrative operations require an authenticated administrator".to_owned())?;
+    principal.require(Permission::Admin).map_err(|error| error.to_string())?;
+    let auth = auth.ok_or_else(|| "authentication store is unavailable on this listener".to_owned())?;
+    let request: JsonValue = serde_json::from_slice(payload)
+        .map_err(|error| format!("invalid administrative request: {error}"))?;
+    let action = request.get("action").and_then(JsonValue::as_str)
+        .ok_or_else(|| "administrative request requires an action".to_owned())?;
+    let mut store = auth.lock().map_err(|_| "authentication store lock poisoned".to_owned())?;
+    let result = store.as_admin(principal, |store| {
+        let text = |field: &str| -> Result<String, crate::DbError> {
+            request.get(field).and_then(JsonValue::as_str).map(str::to_owned)
+                .ok_or_else(|| crate::DbError::Constraint(format!("administrative request requires text field '{field}'")))
+        };
+        let number = |field: &str| -> Result<u64, crate::DbError> {
+            request.get(field).and_then(JsonValue::as_u64)
+                .ok_or_else(|| crate::DbError::Constraint(format!("administrative request requires integer field '{field}'")))
+        };
+        let permission_set = || -> Result<Permissions, crate::DbError> {
+            let bits = u32::try_from(number("permissions")?)
+                .map_err(|_| crate::DbError::Constraint("permissions bitset is out of range".into()))?;
+            Permissions::from_bits(bits)
+        };
+        match action {
+            "users.list" => Ok(json!({"users": store.list_user_details()?})),
+            "users.create" => {
+                let username = text("username")?;
+                let password = text("password")?;
+                store.create_user(&username, &password, permission_set()?)?;
+                Ok(json!({"created": true, "username": username}))
+            }
+            "users.permissions" => {
+                let username = text("username")?;
+                if username.eq_ignore_ascii_case(&principal.username) {
+                    return Err(crate::DbError::Constraint("an administrator may not change their own direct permissions through this session".into()));
+                }
+                store.set_permissions(&username, permission_set()?)?;
+                Ok(json!({"updated": true, "username": username}))
+            }
+            "users.enabled" => {
+                let username = text("username")?;
+                let enabled = request.get("enabled").and_then(JsonValue::as_bool)
+                    .ok_or_else(|| crate::DbError::Constraint("administrative request requires boolean field 'enabled'".into()))?;
+                if username.eq_ignore_ascii_case(&principal.username) && !enabled {
+                    return Err(crate::DbError::Constraint("an administrator may not disable their own account through this session".into()));
+                }
+                store.set_enabled(&username, enabled)?;
+                Ok(json!({"updated": true, "username": username, "enabled": enabled}))
+            }
+            "users.delete" => {
+                let username = text("username")?;
+                if username.eq_ignore_ascii_case(&principal.username) {
+                    return Err(crate::DbError::Constraint("an administrator may not delete their own account through this session".into()));
+                }
+                let deleted = store.delete_user(&username)?;
+                Ok(json!({"deleted": deleted, "username": username}))
+            }
+            "roles.list" => Ok(json!({"roles": store.list_role_details()?})),
+            "roles.create" => {
+                let name = text("name")?;
+                store.create_role(&name, permission_set()?)?;
+                Ok(json!({"created": true, "name": name}))
+            }
+            "roles.permissions" => {
+                let name = text("name")?;
+                store.set_role_permissions(&name, permission_set()?)?;
+                Ok(json!({"updated": true, "name": name}))
+            }
+            "roles.assign" => {
+                let username = text("username")?;
+                let role = text("role")?;
+                store.assign_role(&username, &role)?;
+                Ok(json!({"assigned": true, "username": username, "role": role}))
+            }
+            "roles.revoke" => {
+                let username = text("username")?;
+                let role = text("role")?;
+                let revoked = store.revoke_role(&username, &role)?;
+                Ok(json!({"revoked": revoked, "username": username, "role": role}))
+            }
+            "roles.delete" => {
+                let name = text("name")?;
+                let deleted = store.delete_role(&name)?;
+                Ok(json!({"deleted": deleted, "name": name}))
+            }
+            "audit.list" => {
+                let after = number("after_sequence").unwrap_or(0);
+                let limit = request.get("limit").and_then(JsonValue::as_u64).unwrap_or(100);
+                let limit = usize::try_from(limit)
+                    .map_err(|_| crate::DbError::Constraint("audit limit is out of range".into()))?;
+                if limit > 500 {
+                    return Err(crate::DbError::Constraint("remote audit page is limited to 500 events".into()));
+                }
+                Ok(json!({"events": store.audit_events(after, limit)?}))
+            }
+            _ => Err(crate::DbError::Unsupported(format!("unknown administrative action: {action}"))),
+        }
+    }).map_err(|error| error.to_string())?;
+    serde_json::to_vec(&json!({"ok":true,"result":result}))
+        .map_err(|error| format!("could not encode administrative response: {error}"))
 }
 
 fn handle_ef7_command(command: &str, store: &mut EmberForge7Store) -> String {
