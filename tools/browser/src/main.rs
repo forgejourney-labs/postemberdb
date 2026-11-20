@@ -19,7 +19,7 @@ impl FieldDraft {
     }
     fn empty(column: &Column) -> Self {
         Self {
-            text: match column.data_type {
+            text: match &column.data_type {
                 DataType::Boolean => "FALSE".into(),
                 _ => String::new(),
             },
@@ -91,7 +91,7 @@ fn field_value(field: &FieldDraft, column: &Column) -> Result<Value, String> {
     if field.is_null {
         return if column.nullable { Ok(Value::Null) } else { Err(format!("{} does not allow NULL", column.name)) };
     }
-    match column.data_type {
+    match &column.data_type {
         DataType::Integer => field.text.trim().parse::<i64>()
             .map(Value::Integer).map_err(|_| format!("{} must be a signed 64-bit integer", column.name)),
         DataType::Text => Ok(Value::Text(field.text.clone())),
@@ -219,6 +219,12 @@ impl BrowserApp {
             .and_then(|name| self.table_info(name))
             .is_some_and(|table| table.indexes.iter().any(|index| index.unique)
                 && valid_identifier(&table.name)
+                && table.columns.iter().all(|column| valid_identifier(&column.name)))
+    }
+    fn can_insert_selected_table(&self) -> bool {
+        self.selected_table.as_ref()
+            .and_then(|name| self.table_info(name))
+            .is_some_and(|table| valid_identifier(&table.name)
                 && table.columns.iter().all(|column| valid_identifier(&column.name)))
     }
     fn begin_insert(&mut self) {
@@ -567,7 +573,7 @@ impl eframe::App for BrowserApp {
                         self.load_table_page(self.page_offset.saturating_add(PAGE_SIZE));
                     }
                     ui.label(format!("Rows {}–{} of {}", if shown == 0 {0} else {self.page_offset + 1}, self.page_offset + shown, total));
-                    if self.can_edit_selected_table() && ui.button("＋ Insert row").clicked() {
+                    if self.can_insert_selected_table() && ui.button("＋ Insert row").clicked() {
                         self.begin_insert();
                     }
                 });

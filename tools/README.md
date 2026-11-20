@@ -7,7 +7,7 @@ This directory contains two independent operator applications.
 | [Browser](browser/README.md) | Native desktop database browser | Compact classic desktop UI inspired by 2014–2015 tools |
 | [Admin](admin/README.md) | Local web administration panel | Browser-based, phpMyAdmin-style layout |
 
-Both applications use the read-only SQL catalog API in the Rust core. Catalog reads and row paging do not clone the full table into the UI. Remote connections require a stable authenticated protocol with TLS, not the development JSONL/1 transport.
+Both applications use the SQL catalog and bounded row-page APIs in the Rust core. Remote connections require a stable authenticated protocol with TLS, not the development JSONL/1 transport.
 
 ## Safety boundary
 
@@ -21,15 +21,14 @@ Both applications use the read-only SQL catalog API in the Rust core. Catalog re
 - Open .pbd and legacy .db files in desktop Browser.
 - Inspect tables, columns, types, nullability, indexes, uniqueness, and row counts.
 - Read bounded pages of rows from the Rust core.
-- Run SQL and render result grids in both applications.
+- Insert rows, edit non-key fields transactionally, and delete rows after confirmation in desktop Browser.
 - Export desktop Browser results as CSV or JSON.
-- Use the live catalog and browse rows in Admin.
-- Insert rows and edit/delete rows in Admin when the table has a UNIQUE key.
+- Use the live catalog, browse pages, insert rows, and edit/delete rows with a UNIQUE key in Admin.
 - Export the currently visible Admin page to CSV or JSON.
+- Run SQL and render result grids in both applications.
 
 ## Still pending
 
 - Remote connections and remote administration.
 - Admin authentication, CSRF protection, RBAC-backed user/role management, and server metrics.
-- Native desktop file picker, desktop data editing forms, and query history.
-- Full-table streaming exports and configurable sorting/filtering.
+- Native desktop file picker, query history, sorting/filtering, and full-table streaming exports.
