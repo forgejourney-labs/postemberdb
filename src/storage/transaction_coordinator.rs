@@ -577,6 +577,68 @@ mod tests {
     }
 
     #[test]
+    fn one_coordinator_commit_applies_sql_kv_registry_and_ef7_together() {
+        let coordinator_path = path();
+        let database_path = coordinator_path.with_extension("pbd");
+        let kv_path = coordinator_path.with_extension("kv");
+        let registry_path = coordinator_path.with_extension("registry");
+        let ef7_path = coordinator_path.with_extension("ef7");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut database = crate::Database::open(&database_path).unwrap();
+            database.migrate_to_pdb6().unwrap();
+            database.execute("CREATE TABLE players (uuid TEXT, name TEXT)").unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            let mut registry = crate::Registry::open(&registry_path).unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            let mut ef7 = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
+            ef7.create_namespace(1, None, crate::storage::emberforge7::EmberForge7NamespaceKind::World, "world").unwrap();
+
+            tx = coordinator.begin(4).unwrap();
+            database.prepare_sql(tx, &[String::from(
+                "INSERT INTO players (uuid, name) VALUES ('player-42', 'Riley')"
+            )]).unwrap();
+            kv.prepare_batch(tx, &[], &[(b"player/42".to_vec(), b"kv-value".to_vec())]).unwrap();
+            registry.prepare_set_value(
+                tx, "SYSTEM", "StorageMode", crate::RegistryValue::String("PDB6".into()),
+            ).unwrap();
+            ef7.prepare_put_chunk(tx, 1, -12, 34, b"chunk-payload").unwrap();
+
+            {
+                let mut participants: [&mut dyn CoordinatorParticipant; 4] = [
+                    &mut database, &mut kv, &mut registry, &mut ef7,
+                ];
+                coordinator.commit_prepared_participants(tx, &mut participants).unwrap();
+            }
+            assert_eq!(database.execute("SELECT * FROM players").unwrap().rows.len(), 1);
+            assert_eq!(kv.get(b"player/42").unwrap(), Some(b"kv-value".to_vec()));
+            assert_eq!(registry.get_value("SYSTEM", "StorageMode").unwrap(),
+                Some(crate::RegistryValue::String("PDB6".into())));
+            assert_eq!(ef7.get_chunk(1, -12, 34).unwrap(), Some(b"chunk-payload".to_vec()));
+            assert!(database.pending_prepared_transactions().unwrap().is_empty());
+            assert!(kv.pending_prepared_transactions().is_empty());
+            assert!(registry.pending_prepared_transactions().is_empty());
+            assert!(ef7.pending_prepared_transactions().is_empty());
+            assert!(coordinator.committed_pending_apply().is_empty());
+        }
+
+        for (base, suffixes) in [
+            (&database_path, vec!["", ".lock", ".wal", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal", ".pdb6.wal.prepared.1"]),
+            (&kv_path, vec![".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"]),
+            (&registry_path, vec![".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"]),
+            (&ef7_path, vec![".ef7.lock", ".ef7.pages", ".ef7.wal", ".ef7.wal.prepared.1"]),
+        ] {
+            for suffix in suffixes {
+                let mut candidate = base.as_os_str().to_os_string();
+                candidate.push(suffix);
+                let _ = fs::remove_file(PathBuf::from(candidate));
+            }
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
     fn coordinator_applies_and_finalizes_a_prepared_kv_participant() {
         let coordinator_path = path();
         let kv_path = coordinator_path.with_extension("kv");
