@@ -40,6 +40,8 @@ pub struct RecoveredTransaction {
     pub prepared_participants: Vec<u8>,
     /// Participants whose durable commit application has been acknowledged.
     pub applied_participants: Vec<u8>,
+    /// Participants whose prepared markers have been durably finalized.
+    pub finalized_participants: Vec<u8>,
     /// Participants whose durable abort cleanup has been acknowledged.
     pub rolled_back_participants: Vec<u8>,
     pub state: TransactionState,
@@ -50,6 +52,7 @@ struct TransactionRecord {
     participant_count: u8,
     prepared: BTreeSet<u8>,
     applied: BTreeSet<u8>,
+    finalized: BTreeSet<u8>,
     rolled_back: BTreeSet<u8>,
     state: TransactionState,
 }
@@ -97,6 +100,7 @@ impl TransactionCoordinator {
                         participant_count,
                         prepared: BTreeSet::new(),
                         applied: BTreeSet::new(),
+                        finalized: BTreeSet::new(),
                         rolled_back: BTreeSet::new(),
                         state: TransactionState::Preparing,
                     });
@@ -136,6 +140,16 @@ impl TransactionCoordinator {
                         return Err(DbError::Storage("invalid or duplicate transaction ROLLED_BACK record".into()));
                     }
                 }
+                7 => {
+                    let tx = transactions.get_mut(&txid).ok_or_else(|| DbError::Storage("FINALIZED record references an unknown transaction".into()))?;
+                    if tx.state != TransactionState::Committed
+                        || participant_count != tx.participant_count
+                        || !tx.prepared.contains(&participant)
+                        || !tx.applied.contains(&participant)
+                        || !tx.finalized.insert(participant) {
+                        return Err(DbError::Storage("invalid or duplicate transaction FINALIZED record".into()));
+                    }
+                }
                 _ => return Err(DbError::Storage("unknown transaction coordinator journal record".into())),
             }
         }
@@ -159,6 +173,7 @@ impl TransactionCoordinator {
             participant_count,
             prepared: BTreeSet::new(),
             applied: BTreeSet::new(),
+            finalized: BTreeSet::new(),
             rolled_back: BTreeSet::new(),
             state: TransactionState::Preparing,
         });
@@ -251,16 +266,36 @@ impl TransactionCoordinator {
         Ok(())
     }
 
-    /// Returns committed transactions that still need one or more participants
-    /// to apply the durable decision. Callers must retry those commits idempotently.
+    /// Records that a participant's prepared marker has been durably removed.
+    /// This acknowledgement closes the crash window between APPLIED and cleanup.
+    pub fn mark_finalized(&mut self, txid: u64, participant_id: u8) -> Result<(), DbError> {
+        let tx = self.transactions.get(&txid).ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
+        if tx.state != TransactionState::Committed
+            || !tx.prepared.contains(&participant_id)
+            || !tx.applied.contains(&participant_id)
+            || tx.finalized.contains(&participant_id) {
+            return Err(DbError::Constraint("participant cannot be marked finalized in the current transaction state".into()));
+        }
+        let count = tx.participant_count;
+        self.append(7, participant_id, txid, count)?;
+        self.transactions.get_mut(&txid).unwrap().finalized.insert(participant_id);
+        Ok(())
+    }
+
+    /// Returns committed transactions that still need application or durable
+    /// finalization. Finalization is tracked separately because a crash may occur
+    /// after APPLIED is synced but before a participant's prepare marker is removed.
     pub fn committed_pending_apply(&self) -> Vec<RecoveredTransaction> {
         self.transactions.iter().filter_map(|(id, tx)| {
-            (tx.state == TransactionState::Committed && tx.applied.len() < usize::from(tx.participant_count))
+            (tx.state == TransactionState::Committed
+                && (tx.applied.len() < usize::from(tx.participant_count)
+                    || tx.finalized.len() < tx.prepared.len()))
                 .then(|| RecoveredTransaction {
                     transaction_id: *id,
                     participant_count: tx.participant_count,
                     prepared_participants: tx.prepared.iter().copied().collect(),
                     applied_participants: tx.applied.iter().copied().collect(),
+                    finalized_participants: tx.finalized.iter().copied().collect(),
                     rolled_back_participants: tx.rolled_back.iter().copied().collect(),
                     state: tx.state,
                 })
@@ -301,6 +336,7 @@ impl TransactionCoordinator {
                     participant_count: tx.participant_count,
                     prepared_participants: tx.prepared.iter().copied().collect(),
                     applied_participants: tx.applied.iter().copied().collect(),
+                    finalized_participants: tx.finalized.iter().copied().collect(),
                     rolled_back_participants: tx.rolled_back.iter().copied().collect(),
                     state: tx.state,
                 })
@@ -360,6 +396,7 @@ impl TransactionCoordinator {
             transaction_id: *id, participant_count: tx.participant_count,
             prepared_participants: tx.prepared.iter().copied().collect(),
             applied_participants: tx.applied.iter().copied().collect(),
+            finalized_participants: tx.finalized.iter().copied().collect(),
             rolled_back_participants: tx.rolled_back.iter().copied().collect(),
             state: tx.state,
         })).collect()
@@ -380,6 +417,7 @@ impl TransactionCoordinator {
         }
         let prepared = tx.prepared.iter().copied().collect::<Vec<_>>();
         let applied = tx.applied.clone();
+        let finalized = tx.finalized.clone();
         let mut supplied = BTreeSet::new();
         for participant in participants.iter() {
             let id = participant.participant_id();
@@ -400,6 +438,9 @@ impl TransactionCoordinator {
             }
             if participant.has_prepared(txid)? {
                 participant.finalize_prepared(txid)?;
+            }
+            if !finalized.contains(&id) {
+                self.mark_finalized(txid, id)?;
             }
         }
         Ok(())
