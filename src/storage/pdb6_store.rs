@@ -356,20 +356,68 @@ impl Pdb6Store {
             .collect()
     }
 
-    /// Reclaims unreachable B+ tree node pages from the current published root.
-    /// P6R1 overflow pages and unknown page kinds are deliberately retained:
-    /// their ownership must be established by a descriptor-aware vacuum first.
-    /// The exclusive PDB6 file lock prevents another process publishing a root
-    /// during this pass. This is not a retained-snapshot API.
+    /// Reclaims unreachable tree nodes and orphaned P6R1 overflow pages.
+    /// Every live row descriptor is validated and its full contiguous payload
+    /// extent is pinned before any page is released. Unknown page kinds remain
+    /// allocated. The exclusive PDB6 lock prevents another process publishing
+    /// a root during this pass; retained snapshots/readers are not yet supported.
     pub(crate) fn vacuum_unreachable_tree_pages(&mut self) -> Result<u64, DbError> {
         let reachable = page_tree::reachable_page_ids(&mut self.pages)?;
+        let row_prefix = [KEY_ROW];
+        let mut live_overflow = BTreeSet::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = self.scan_prefix_after(&row_prefix, cursor.as_deref(), 1_000)?;
+            if batch.is_empty() { break; }
+            for (key, encoded_descriptor) in &batch {
+                if key.len() != 17 {
+                    return Err(DbError::Storage("invalid PDB6 row key during overflow vacuum".into()));
+                }
+                let table_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let row_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                let descriptor = RowPayloadDescriptor::decode(encoded_descriptor)?;
+                let total_len = usize::try_from(descriptor.total_len)
+                    .map_err(|_| DbError::Storage("PDB6 row length does not fit this platform".into()))?;
+                for page_index in 0..descriptor.page_count {
+                    let page_id = descriptor.first_page_id.checked_add(u64::from(page_index))
+                        .ok_or_else(|| DbError::Storage("PDB6 overflow page ID overflow during vacuum".into()))?;
+                    if reachable.contains(&page_id) || !live_overflow.insert(page_id) {
+                        return Err(DbError::Storage("PDB6 overflow extent overlaps a tree node or another row".into()));
+                    }
+                    let page = self.pages.read_page(page_id)?;
+                    if page.len() < ROW_PAGE_HEADER_BYTES || &page[..4] != ROW_PAGE_MAGIC {
+                        return Err(DbError::Storage(format!("invalid live PDB6 overflow page {page_id}")));
+                    }
+                    let stored_table_id = u64::from_le_bytes(page[4..12].try_into().unwrap());
+                    let stored_row_id = u64::from_le_bytes(page[12..20].try_into().unwrap());
+                    let stored_index = u32::from_le_bytes(page[20..24].try_into().unwrap());
+                    let stored_count = u32::from_le_bytes(page[24..28].try_into().unwrap());
+                    let stored_total_len = u64::from_le_bytes(page[28..36].try_into().unwrap());
+                    let stored_checksum = u64::from_le_bytes(page[36..44].try_into().unwrap());
+                    let chunk_len = u32::from_le_bytes(page[44..48].try_into().unwrap()) as usize;
+                    let expected_chunk_len = total_len.saturating_sub(page_index as usize * ROW_CHUNK_BYTES).min(ROW_CHUNK_BYTES);
+                    if stored_table_id != table_id || stored_row_id != row_id
+                        || stored_index != page_index || stored_count != descriptor.page_count
+                        || stored_total_len != descriptor.total_len || stored_checksum != descriptor.checksum
+                        || chunk_len != page.len() - ROW_PAGE_HEADER_BYTES
+                        || chunk_len != expected_chunk_len || chunk_len > ROW_CHUNK_BYTES {
+                        return Err(DbError::Storage(format!("live PDB6 overflow page metadata mismatch at page {page_id}")));
+                    }
+                }
+            }
+            cursor = batch.last().map(|(key, _)| key.clone());
+            if batch.len() < 1_000 { break; }
+        }
+
         let mut dead = Vec::new();
         for (start, count) in self.pages.allocated_extents() {
             let end = start.checked_add(count).ok_or_else(|| DbError::Storage("allocated extent end overflow during vacuum".into()))?;
             for page_id in start..end {
-                if reachable.contains(&page_id) { continue; }
+                if reachable.contains(&page_id) || live_overflow.contains(&page_id) { continue; }
                 let payload = self.pages.read_page(page_id)?;
-                if payload.starts_with(b"EBL1") || payload.starts_with(b"EBI1") { dead.push(page_id); }
+                if payload.starts_with(b"EBL1") || payload.starts_with(b"EBI1") || payload.starts_with(ROW_PAGE_MAGIC) {
+                    dead.push(page_id);
+                }
             }
         }
         if dead.is_empty() { return Ok(0); }
@@ -672,6 +720,31 @@ mod tests {
             let reclaimed = store.vacuum_unreachable_tree_pages().unwrap();
             assert!(reclaimed > 0);
             assert_eq!(store.get_row_payload(5, 9).unwrap(), Some(payload));
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn vacuum_reclaims_orphaned_overflow_pages_but_preserves_live_descriptors() {
+        let path = temp_path();
+        let payload = vec![0x6b; 90_000];
+        {
+            let mut store = Pdb6Store::open(&path, 32).unwrap();
+            store.apply_row_batch(
+                vec![(77, 9001, payload.clone())],
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+                Vec::<Vec<u8>>::new(),
+            ).unwrap();
+            let descriptor = RowPayloadDescriptor::decode(
+                &store.get(&crate::storage::pdb6::row_key(77, 9001).unwrap()).unwrap().unwrap()
+            ).unwrap();
+            assert_eq!(store.get_row_payload(77, 9001).unwrap(), Some(payload));
+            store.apply_batch(Vec::<(Vec<u8>, Vec<u8>)>::new(), vec![
+                crate::storage::pdb6::row_key(77, 9001).unwrap()
+            ]).unwrap();
+            let reclaimed = store.vacuum_unreachable_tree_pages().unwrap();
+            assert!(reclaimed >= u64::from(descriptor.page_count));
+            assert_eq!(store.get_row_payload(77, 9001).unwrap(), None);
         }
         cleanup(&path);
     }
