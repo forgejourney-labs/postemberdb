@@ -1636,6 +1636,27 @@ fn decode_coordinator_sql_statements(bytes: &[u8]) -> Result<Vec<String>, DbErro
     Ok(statements)
 }
 
+fn pdb6_write_table_target(statement: &str) -> Option<String> {
+    let identifier = if starts_with_kw(statement, "INSERT INTO") {
+        statement["INSERT INTO".len()..].split_whitespace().next()
+    } else if starts_with_kw(statement, "UPDATE") {
+        statement["UPDATE".len()..].split_whitespace().next()
+    } else if starts_with_kw(statement, "DELETE FROM") {
+        statement["DELETE FROM".len()..].split_whitespace().next()
+    } else if starts_with_kw(statement, "CREATE INDEX") {
+        let rest = &statement["CREATE INDEX".len()..];
+        let on_position = find_kw(rest, " ON ")?;
+        let target = rest[on_position + 4..].trim();
+        let end = target.find(|character: char| character == '(' || character.is_whitespace())
+            .unwrap_or(target.len());
+        Some(&target[..end])
+    } else {
+        None
+    }?;
+    let normalized = normalize_ident(identifier);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 pub struct DatabaseSession {
     base_revision: u64,
     staged: Database,
