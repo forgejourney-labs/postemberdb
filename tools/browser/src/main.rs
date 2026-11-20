@@ -1,5 +1,5 @@
 use eframe::egui;
-use postemberdb::{CatalogSnapshot, Column, DataType, Database, QueryResult, Row, TableInfo, Value};
+use postemberdb::{CatalogSnapshot, Column, DataType, Database, QueryResult, RemoteClient, Row, TableInfo, Value};
 
 const PAGE_SIZE: usize = 100;
 
@@ -42,8 +42,14 @@ struct DeleteDraft {
 
 struct BrowserApp {
     database_path: String,
+    remote_address: String,
+    remote_server_name: String,
+    remote_ca_bundle: String,
+    remote_username: String,
+    remote_password: String,
     sql: String,
     database: Option<Database>,
+    remote: Option<RemoteClient>,
     catalog: CatalogSnapshot,
     selected_table: Option<String>,
     page_offset: usize,
@@ -59,8 +65,14 @@ impl Default for BrowserApp {
     fn default() -> Self {
         Self {
             database_path: "postemberdb.pbd".into(),
+            remote_address: "127.0.0.1:7432".into(),
+            remote_server_name: "localhost".into(),
+            remote_ca_bundle: "server-ca.pem".into(),
+            remote_username: String::new(),
+            remote_password: String::new(),
             sql: "SELECT * FROM your_table LIMIT 100;".into(),
             database: None,
+            remote: None,
             catalog: CatalogSnapshot::default(),
             selected_table: None,
             page_offset: 0,
@@ -132,13 +144,82 @@ impl BrowserApp {
     fn table_info(&self, name: &str) -> Option<TableInfo> {
         self.catalog.tables.iter().find(|table| table.name == name).cloned()
     }
+    fn is_connected(&self) -> bool {
+        self.database.is_some() || self.remote.is_some()
+    }
+
     fn refresh_catalog(&mut self) {
-        self.catalog = self.database.as_ref().map(Database::catalog).unwrap_or_default();
+        if let Some(remote) = self.remote.as_mut() {
+            match remote.catalog() {
+                Ok(catalog) => self.catalog = catalog,
+                Err(error) => self.status = format!("Remote catalog failed: {error}"),
+            }
+        } else {
+            self.catalog = self.database.as_ref().map(Database::catalog).unwrap_or_default();
+        }
+    }
+
+    fn connect_remote(&mut self) {
+        match RemoteClient::connect(
+            self.remote_address.trim(),
+            self.remote_server_name.trim(),
+            self.remote_ca_bundle.trim(),
+            self.remote_username.trim(),
+            &self.remote_password,
+        ) {
+            Ok(mut remote) => match remote.catalog() {
+                Ok(catalog) => {
+                    let username = remote.username().to_owned();
+                    self.database = None;
+                    self.remote = Some(remote);
+                    self.catalog = catalog;
+                    self.selected_table = None;
+                    self.page_offset = 0;
+                    self.browsing_table = false;
+                    self.result = None;
+                    self.insert_draft = None;
+                    self.edit_draft = None;
+                    self.pending_delete = None;
+                    self.remote_password.clear();
+                    self.status = format!("Connected to {} as {}", self.remote_address, username);
+                }
+                Err(error) => self.status = format!("Connected, but catalog load failed: {error}"),
+            },
+            Err(error) => self.status = format!("Remote connection failed: {error}"),
+        }
+    }
+
+    fn disconnect_remote(&mut self) {
+        self.remote = None;
+        self.catalog = CatalogSnapshot::default();
+        self.selected_table = None;
+        self.result = None;
+        self.browsing_table = false;
+        self.insert_draft = None;
+        self.edit_draft = None;
+        self.pending_delete = None;
+        self.status = "Remote connection closed".into();
+    }
+
+    fn execute_write_batch(&mut self, statements: &[String]) -> Result<(), String> {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.execute_batch(statements).map_err(|error| error.to_string())
+        } else if let Some(database) = self.database.as_mut() {
+            database.transaction(|transaction| {
+                for statement in statements {
+                    transaction.execute(statement)?;
+                }
+                Ok(())
+            }).map_err(|error| error.to_string())
+        } else {
+            Err("Open a local database or connect to a remote server first".into())
+        }
     }
     fn open_database(&mut self) {
         match Database::open(self.database_path.trim()) {
             Ok(database) => {
                 self.catalog = database.catalog();
+                self.remote = None;
                 self.database = Some(database);
                 self.selected_table = None;
                 self.page_offset = 0;
@@ -160,15 +241,21 @@ impl BrowserApp {
         }
     }
     fn execute_sql(&mut self) {
-        let Some(database) = self.database.as_mut() else {
-            self.status = "Open a database first".into();
+        if !self.is_connected() {
+            self.status = "Open a database or connect to a remote server first".into();
             return;
-        };
+        }
         self.browsing_table = false;
         self.insert_draft = None;
         self.edit_draft = None;
         self.pending_delete = None;
-        match database.execute(self.sql.trim()) {
+        let result = if let Some(remote) = self.remote.as_mut() {
+            remote.execute(self.sql.trim()).map_err(|error| error.to_string())
+        } else {
+            self.database.as_mut().expect("connected local database").execute(self.sql.trim())
+                .map_err(|error| error.to_string())
+        };
+        match result {
             Ok(result) => {
                 self.status = result.message.clone();
                 self.result = Some(result);
@@ -185,11 +272,17 @@ impl BrowserApp {
             self.status = "Choose a table in Explorer first".into();
             return;
         };
-        let Some(database) = self.database.as_ref() else {
-            self.status = "Open a database first".into();
-            return;
+        let result = if let Some(remote) = self.remote.as_mut() {
+            remote.read_table_page(&table_name, offset, PAGE_SIZE)
+                .map(|page| page.result)
+                .map_err(|error| error.to_string())
+        } else if let Some(database) = self.database.as_ref() {
+            database.read_table_page(&table_name, offset, PAGE_SIZE)
+                .map_err(|error| error.to_string())
+        } else {
+            Err("Open a database or connect to a remote server first".into())
         };
-        match database.read_table_page(&table_name, offset, PAGE_SIZE) {
+        match result {
             Ok(result) => {
                 self.page_offset = offset;
                 self.browsing_table = true;
@@ -281,16 +374,21 @@ impl BrowserApp {
             columns.join(", "),
             values.iter().map(sql_literal).collect::<Vec<_>>().join(", ")
         );
-        let result = self.database.as_mut().map(|database| database.execute(&statement));
+        let result = if let Some(remote) = self.remote.as_mut() {
+            remote.execute(&statement).map_err(|error| error.to_string())
+        } else if let Some(database) = self.database.as_mut() {
+            database.execute(&statement).map_err(|error| error.to_string())
+        } else {
+            Err("Open a database or connect to a remote server first".into())
+        };
         match result {
-            Some(Ok(result)) => {
+            Ok(result) => {
                 self.status = result.message;
                 self.insert_draft = None;
                 self.refresh_catalog();
                 self.load_table_page(self.page_offset);
             }
-            Some(Err(error)) => self.status = format!("Insert failed: {error}"),
-            None => self.status = "Open a database first".into(),
+            Err(error) => self.status = format!("Insert failed: {error}"),
         }
     }
     fn save_edit(&mut self) {
@@ -330,16 +428,7 @@ impl BrowserApp {
             self.edit_draft = None;
             return;
         }
-        let result = match self.database.as_mut() {
-            Some(database) => database.transaction(|transaction| {
-                for statement in &statements { transaction.execute(statement)?; }
-                Ok(())
-            }),
-            None => {
-                self.status = "Open a database first".into();
-                return;
-            }
-        };
+        let result = self.execute_write_batch(&statements);
         match result {
             Ok(()) => {
                 self.status = format!("Updated {} field(s) in one transaction", statements.len());
@@ -361,17 +450,22 @@ impl BrowserApp {
             Err(error) => { self.status = error; return; }
         };
         let statement = format!("DELETE FROM {} WHERE {}", draft.table_name, predicate);
-        let result = self.database.as_mut().map(|database| database.execute(&statement));
+        let result = if let Some(remote) = self.remote.as_mut() {
+            remote.execute(&statement).map_err(|error| error.to_string())
+        } else if let Some(database) = self.database.as_mut() {
+            database.execute(&statement).map_err(|error| error.to_string())
+        } else {
+            Err("Open a database or connect to a remote server first".into())
+        };
         match result {
-            Some(Ok(result)) if result.affected_rows == 1 => {
+            Ok(result) if result.affected_rows == 1 => {
                 self.status = "Row deleted".into();
                 self.pending_delete = None;
                 self.refresh_catalog();
                 self.load_table_page(self.page_offset);
             }
-            Some(Ok(result)) => self.status = format!("Delete stopped: expected one row, removed {}", result.affected_rows),
-            Some(Err(error)) => self.status = format!("Delete failed: {error}"),
-            None => self.status = "Open a database first".into(),
+            Ok(result) => self.status = format!("Delete stopped: expected one row, removed {}", result.affected_rows),
+            Err(error) => self.status = format!("Delete failed: {error}"),
         }
     }
     fn export_result(&mut self, format: &str) {
@@ -496,13 +590,34 @@ impl eframe::App for BrowserApp {
             .default_width(265.0)
             .resizable(true)
             .show(context, |ui| {
+                ui.heading("Remote TLS connection");
+                ui.label("Server address");
+                ui.text_edit_singleline(&mut self.remote_address);
+                ui.label("TLS server name");
+                ui.text_edit_singleline(&mut self.remote_server_name);
+                ui.label("Trusted CA PEM bundle");
+                ui.text_edit_singleline(&mut self.remote_ca_bundle);
+                ui.label("Username");
+                ui.text_edit_singleline(&mut self.remote_username);
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut self.remote_password).password(true));
+                ui.horizontal(|ui| {
+                    if ui.button("Connect securely").clicked() { self.connect_remote(); }
+                    if self.remote.is_some() && ui.button("Disconnect").clicked() { self.disconnect_remote(); }
+                });
+                if let Some(remote) = self.remote.as_ref() {
+                    ui.small(format!("Remote session: {}", remote.username()));
+                }
+                ui.separator();
                 ui.heading("Database");
                 ui.separator();
                 ui.label("Database file");
                 ui.text_edit_singleline(&mut self.database_path);
                 if ui.button("Open").clicked() { self.open_database(); }
                 ui.add_space(8.0);
-                ui.label(if self.database.is_some() { "● Connected locally" } else { "○ Disconnected" });
+                ui.label(if self.remote.is_some() { "● Connected remotely · TLS" }
+                    else if self.database.is_some() { "● Connected locally" }
+                    else { "○ Disconnected" });
                 ui.separator();
                 ui.heading("Explorer");
                 if self.database.is_none() {
@@ -540,8 +655,8 @@ impl eframe::App for BrowserApp {
                 }
                 ui.add_space(10.0);
                 ui.heading("Connections");
-                ui.label("Local / embedded");
-                ui.add_enabled(false, egui::Button::new("Remote server (coming later)"));
+                if self.database.is_some() { ui.label("Local / embedded"); }
+                if self.remote.is_some() { ui.label("Remote / verified TLS"); }
             });
 
         egui::CentralPanel::default().show(context, |ui| {
@@ -632,7 +747,8 @@ impl eframe::App for BrowserApp {
 
         egui::TopBottomPanel::bottom("status_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.small("PostemberDB Browser · local mode");
+                ui.small(if self.remote.is_some() { "PostemberDB Browser · remote TLS mode" }
+                    else { "PostemberDB Browser · local mode" });
                 ui.separator();
                 ui.small(&self.status);
             });
