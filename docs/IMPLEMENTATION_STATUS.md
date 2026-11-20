@@ -54,6 +54,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] PDB6 PDM1 manifest is published by the SQL migration/commit path and validated during `Database::open`.
 - [x] Initial shared Pdb6Store over one ExtentFile/EmberTree root, with keyspace validation, atomic mixed mutation batches, bounded prefix scans, manifest access, and reopen tests.
 - [x] PDB6 P6R1 overflow row pages + P6D1 descriptors are used by SQL migration/load/commit, with checksummed reads, 64 MiB per-row / 256 MiB per-batch bounds, keyset scans, and shared CoW root publication for row/catalog/index mutations.
+- [x] PDB6 SQL table-page reads and SELECT scans now stream row IDs and validated row payloads from the page store in bounded batches; LIMIT stops disk reads early and COUNT(*) does not materialize row payloads in the result. The current open path still reconstructs an in-memory compatibility row cache, and DML still stages full table state; full lazy-open and bounded write staging remain unfinished.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.

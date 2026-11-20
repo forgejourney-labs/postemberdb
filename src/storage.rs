@@ -407,6 +407,65 @@ fn load_pdb6_database(path: &Path) -> Result<Option<(BTreeMap<String, Table>, u6
     Ok(Some((tables, manifest.generation)))
 }
 
+/// Streams validated PDB6 rows in stable row-ID order without materializing a table.
+/// The visitor returns false to stop the scan early (for example, after LIMIT).
+pub(super) fn scan_pdb6_table_rows<F>(
+    path: &Path,
+    table_name: &str,
+    batch_size: usize,
+    mut visitor: F,
+) -> Result<(), DbError>
+where
+    F: FnMut(Row) -> Result<bool, DbError>,
+{
+    if batch_size == 0 || batch_size > 5_000 {
+        return Err(DbError::Constraint("PDB6 SQL scan batch size must be in 1..=5000".into()));
+    }
+    let mut store = Pdb6Store::open(path, 128)?;
+    let manifest = store.manifest()?
+        .ok_or_else(|| DbError::Storage("PDB6 SQL manifest is missing".into()))?;
+    let mut catalog = None;
+    for table_id in 1..=u64::from(manifest.table_count) {
+        let bytes = store.get(&pdb6::table_key(table_id)?)?
+            .ok_or_else(|| DbError::Storage(format!("PDB6 manifest references missing table {table_id}")))?;
+        let candidate = CatalogTable::decode(&bytes)?;
+        if candidate.name == table_name {
+            catalog = Some(candidate);
+            break;
+        }
+    }
+    let catalog = catalog.ok_or_else(|| DbError::TableNotFound(table_name.to_owned()))?;
+    let columns = catalog.columns.iter().map(|column| Column {
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }).collect::<Vec<_>>();
+    let mut after = None;
+    loop {
+        let row_ids = store.scan_row_ids(catalog.table_id, after, batch_size)?;
+        if row_ids.is_empty() { break; }
+        for row_id in &row_ids {
+            if *row_id == 0 || *row_id >= catalog.next_row_id {
+                return Err(DbError::Storage("PDB6 row ID is outside the table allocator range".into()));
+            }
+            let payload = store.get_row_payload(catalog.table_id, *row_id)?
+                .ok_or_else(|| DbError::Storage(format!(
+                    "PDB6 row descriptor missing for table {}, row {row_id}", catalog.name
+                )))?;
+            let values = sql_rows::SqlRowStore::decode_values(&payload, columns.len())?;
+            for (column, value) in columns.iter().zip(&values) {
+                validate_value(column, value)?;
+            }
+            if !visitor(Row { row_id: *row_id, values })? {
+                return Ok(());
+            }
+        }
+        after = row_ids.last().copied();
+        if row_ids.len() < batch_size { break; }
+    }
+    Ok(())
+}
+
 /// Persists one complete SQL transaction through a single PDB6 root publication.
 /// Row payloads, catalog records, secondary-index deltas and the manifest all
 /// become visible together; PDB5 WAL is not consulted in PDB6 mode.

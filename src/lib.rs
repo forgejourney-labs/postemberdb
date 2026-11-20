@@ -584,6 +584,29 @@ impl Database {
         let name = normalize_ident(table_name);
         let table = self.tables.get(&name)
             .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
+        if self.pdb6_mode {
+            let path = self.storage_path.as_deref()
+                .ok_or_else(|| DbError::Storage("PDB6 database has no storage path".into()))?;
+            let mut rows = Vec::with_capacity(limit);
+            let mut skipped = 0usize;
+            storage::scan_pdb6_table_rows(path, &name, 512, |row| {
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                if rows.len() >= limit {
+                    return Ok(false);
+                }
+                rows.push(row);
+                Ok(rows.len() < limit)
+            })?;
+            return Ok(QueryResult {
+                columns: table.columns.iter().map(|column| column.name.clone()).collect(),
+                message: format!("{} row(s) in page (offset {offset})", rows.len()),
+                rows,
+                affected_rows: 0,
+            });
+        }
         let page = table.rows.get(offset..).unwrap_or(&[]);
         let rows = page.iter()
             .take(limit)
@@ -1151,6 +1174,74 @@ impl Database {
         Ok(QueryResult { columns: vec![], rows: vec![], affected_rows: removed, message: format!("{removed} row(s) deleted") })
     }
 
+    fn select_pdb6_from_disk(
+        &self,
+        table_name: &str,
+        projection: &str,
+        predicate: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<QueryResult, DbError> {
+        let table = self.tables.get(table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.to_owned()))?;
+        let projection_upper = projection.to_ascii_uppercase();
+        let is_count = projection_upper.starts_with("COUNT(*)");
+        let predicates = predicate
+            .map(|value| parse_equality_predicates(&table.columns, value))
+            .transpose()?
+            .unwrap_or_default();
+        let projection_indices = if is_count {
+            Vec::new()
+        } else if projection == "*" {
+            (0..table.columns.len()).collect::<Vec<_>>()
+        } else {
+            split_csv(projection).into_iter().map(|name| {
+                let normalized = normalize_ident(name);
+                table.columns.iter().position(|column| column.name == normalized)
+                    .ok_or_else(|| DbError::ColumnNotFound(normalized))
+            }).collect::<Result<Vec<_>, _>>()?
+        };
+        let columns = if is_count {
+            vec![projection_upper.find(" AS ")
+                .map(|position| normalize_ident(&projection[position + 4..]))
+                .unwrap_or_else(|| "count".into())]
+        } else {
+            projection_indices.iter()
+                .map(|index| table.columns[*index].name.clone())
+                .collect()
+        };
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no storage path".into()))?;
+        let mut rows = Vec::new();
+        let mut matched = 0usize;
+        if limit != Some(0) {
+            storage::scan_pdb6_table_rows(path, table_name, 512, |row| {
+                if !predicates.iter().all(|(column, value)| row.values[*column] == *value) {
+                    return Ok(true);
+                }
+                matched = matched.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("SQL result row count overflow".into()))?;
+                if !is_count {
+                    rows.push(Row {
+                        row_id: row.row_id,
+                        values: projection_indices.iter()
+                            .map(|column| row.values[*column].clone())
+                            .collect(),
+                    });
+                }
+                Ok(is_count || limit.is_none_or(|maximum| matched < maximum))
+            })?;
+        }
+        if is_count {
+            rows.push(Row { row_id: 0, values: vec![Value::Integer(matched as i64)] });
+        }
+        Ok(QueryResult {
+            message: format!("{} row(s)", rows.len()),
+            rows,
+            columns,
+            affected_rows: 0,
+        })
+    }
+
     fn select(&self, sql: &str) -> Result<QueryResult, DbError> {
         let upper = sql.to_ascii_uppercase();
         let from = upper.find(" FROM ").ok_or_else(|| DbError::Parse("expected FROM".into()))?;
@@ -1178,6 +1269,9 @@ impl Database {
         };
         let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        if self.pdb6_mode {
+            return self.select_pdb6_from_disk(&table_name, projection, predicate, limit);
+        }
 
         let projection_upper = projection.to_ascii_uppercase();
         let is_count = projection_upper.starts_with("COUNT(*)");
