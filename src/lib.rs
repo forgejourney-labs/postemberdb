@@ -1444,6 +1444,9 @@ impl Database {
         }
 
         let inserted = batch.len();
+        if self.pdb6_mode && !table.rows_loaded {
+            return self.insert_many_pdb6(&normalized, batch);
+        }
         self.transaction(|transaction| {
             for values in batch {
                 let encoded = values.iter().map(value_to_sql).collect::<Vec<_>>().join(", ");
@@ -1451,6 +1454,124 @@ impl Database {
             }
             Ok(inserted)
         })
+    }
+
+    /// Bulk-inserts PDB6 rows without hydrating the table cache.
+    /// Row payloads, index entries, catalog counters and the manifest share one
+    /// bounded CoW publication. Unique keys are checked both against the disk
+    /// index and against other rows in this batch.
+    fn insert_many_pdb6(&mut self, table_name: &str, batch: Vec<Vec<Value>>) -> Result<usize, DbError> {
+        self.ensure_no_prepared_sql_transactions()?;
+        let path = self.storage_path.clone()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+        let generation = self.wal_sequence.checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
+        let table_schema = self.tables.get(table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.to_owned()))?.clone();
+        if table_schema.rows_loaded {
+            return Err(DbError::Storage("PDB6 bulk insert expected a cold table cache".into()));
+        }
+
+        let mut store = storage::pdb6_store::Pdb6Store::open(&path, 128)?;
+        let mut manifest = store.manifest()?
+            .ok_or_else(|| DbError::Storage("PDB6 SQL manifest is missing".into()))?;
+        let mut catalog = None;
+        for table_id in 1..=u64::from(manifest.table_count) {
+            let encoded = store.get(&storage::pdb6::table_key(table_id)?)?
+                .ok_or_else(|| DbError::Storage(format!("PDB6 manifest references missing table {table_id}")))?;
+            let candidate = storage::pdb6::CatalogTable::decode(&encoded)?;
+            if candidate.name == table_name {
+                catalog = Some(candidate);
+                break;
+            }
+        }
+        let mut catalog = catalog.ok_or_else(|| DbError::Storage(format!(
+            "PDB6 catalog does not contain table {table_name}"
+        )))?;
+        let table_id = catalog.table_id;
+        if catalog.name != table_name
+            || catalog.columns.len() != table_schema.columns.len()
+            || catalog.indexes.len() != table_schema.indexes.len()
+            || catalog.columns.iter().zip(&table_schema.columns).any(|(stored, memory)| {
+                stored.name != memory.name
+                    || stored.data_type != memory.data_type
+                    || stored.nullable != memory.nullable
+            })
+        {
+            return Err(DbError::Storage("PDB6 catalog and in-memory SQL schema disagree".into()));
+        }
+        for (stored, (name, index)) in catalog.indexes.iter().zip(table_schema.indexes.iter()) {
+            let columns = index.column_indices.iter()
+                .map(|column| u32::try_from(*column))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DbError::Storage("PDB6 index column ordinal exceeds u32".into()))?;
+            if stored.name != *name || stored.columns != columns || stored.unique != index.unique {
+                return Err(DbError::Storage("PDB6 catalog and in-memory SQL index definitions disagree".into()));
+            }
+        }
+
+        let index_definitions = table_schema.indexes.iter().enumerate()
+            .map(|(offset, (name, index))| (name.clone(), (offset as u64) + 1, index.column_indices.clone(), index.unique))
+            .collect::<Vec<_>>();
+        let mut unique_batch_keys = BTreeMap::<u64, std::collections::BTreeSet<Vec<u8>>>::new();
+        let mut row_upserts = Vec::with_capacity(batch.len());
+        let mut index_upserts = Vec::with_capacity(batch.len().saturating_mul(index_definitions.len()));
+        for values in batch.iter() {
+            for (column, value) in table_schema.columns.iter().zip(values) {
+                validate_value(column, value)?;
+            }
+            for (_, index_id, columns, unique) in &index_definitions {
+                if !unique { continue; }
+                let encoded = storage::index_codec::encode_index_key(
+                    &IndexKey::from_columns(values, columns)
+                )?;
+                if !unique_batch_keys.entry(*index_id).or_default().insert(encoded.clone()) {
+                    return Err(DbError::Constraint("bulk INSERT contains duplicate values for a unique SQL index".into()));
+                }
+                let prefix = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                if !store.scan_prefix(&prefix, 1)?.is_empty() {
+                    return Err(DbError::Constraint("bulk INSERT conflicts with an existing unique SQL index value".into()));
+                }
+            }
+
+            let row_id = catalog.next_row_id;
+            catalog.next_row_id = catalog.next_row_id.checked_add(1)
+                .ok_or_else(|| DbError::Storage("table row identifier space exhausted".into()))?;
+            let payload = storage::sql_rows::SqlRowStore::encode_values(values, table_schema.columns.len())?;
+            row_upserts.push((table_id, row_id, payload));
+            for (_, index_id, columns, _) in &index_definitions {
+                let encoded = storage::index_codec::encode_index_key(
+                    &IndexKey::from_columns(values, columns)
+                )?;
+                let mut key = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                key.extend_from_slice(&row_id.to_be_bytes());
+                if key.len() > 1_024 {
+                    return Err(DbError::Constraint("PDB6 index key exceeds 1,024 bytes".into()));
+                }
+                index_upserts.push((key, Vec::new()));
+            }
+        }
+
+        let inserted = row_upserts.len();
+        if inserted == 0 { return Ok(0); }
+        manifest.generation = generation;
+        manifest.last_tx_id = manifest.last_tx_id.checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 transaction ID space exhausted".into()))?;
+        let metadata_upserts = vec![
+            (storage::pdb6::table_key(table_id)?, catalog.encode()?),
+            (storage::pdb6::database_root_key(), manifest.encode()?),
+        ];
+        store.apply_row_batch(row_upserts, metadata_upserts.into_iter().chain(index_upserts), std::iter::empty())?;
+
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.to_owned()))?;
+        table.next_row_id = catalog.next_row_id;
+        table.persisted_row_count = table.persisted_row_count.checked_add(inserted)
+            .ok_or_else(|| DbError::Storage("PDB6 table row count overflow".into()))?;
+        self.wal_sequence = generation;
+        self.revision = self.revision.wrapping_add(1);
+        self.ember_indexes_valid = false;
+        Ok(inserted)
     }
 
     fn create_table(&mut self, sql: &str) -> Result<QueryResult, DbError> {
