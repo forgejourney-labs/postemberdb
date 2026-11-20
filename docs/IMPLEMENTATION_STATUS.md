@@ -49,11 +49,11 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Standalone `SqlRowStore` stores typed SRW1 SQL row records over RecordStore pages, with stable-ID lookup, bounded scans, schema-width checks, and corruption validation; it is not yet integrated into `Database`.
 - [x] RecordStore and SqlRowStore expose mixed upsert/delete batches committed through one descriptor-tree redo frame and one atomic root publication; this is a storage primitive, not yet the SQL transaction coordinator.
 - [x] SqlRowStore bounded multi-get by stable row ID, preserving first-seen order, deduplicating IDs, and enforcing 5,000-ID / 256 MiB read limits; this remains a row-store API, not SQL executor integration.
-- [x] PDB6 canonical SQL storage design is documented in `docs/PDB6_CANONICAL_SQL_STORAGE.md`; implementation gates remain open and PDB5 remains authoritative.
-- [x] Initial PDB6 PCT1 binary catalog codec and versioned shared key constructors (table, row, index, counters, database root), with strict validation tests; not yet wired into Database.
-- [x] PDB6 PDM1 database manifest codec for logical generation, last transaction ID, next table ID, and table count, with strict header/counter tests; not yet published by the live SQL engine.
+- [x] PDB6 is the canonical SQL authority after explicit `Database::migrate_to_pdb6()`; `Database::open` loads a published PDB6 manifest first. Unmigrated legacy databases remain PDB5-backed and readable.
+- [x] PDB6 PCT1 catalog codec and versioned key constructors are used by the live PDB6 SQL migration/load/commit path.
+- [x] PDB6 PDM1 manifest is published by the SQL migration/commit path and validated during `Database::open`.
 - [x] Initial shared Pdb6Store over one ExtentFile/EmberTree root, with keyspace validation, atomic mixed mutation batches, bounded prefix scans, manifest access, and reopen tests.
-- [x] PDB6 P6R1 overflow row payload pages + P6D1 descriptors, checksummed reads, 64 MiB per-row / 256 MiB per-batch bounds, keyset row-ID scans, and one shared CoW root publication for row descriptors plus catalog/index mutations; this is a storage primitive and is not yet wired into Database SQL execution.
+- [x] PDB6 P6R1 overflow row pages + P6D1 descriptors are used by SQL migration/load/commit, with checksummed reads, 64 MiB per-row / 256 MiB per-batch bounds, keyset scans, and shared CoW root publication for row/catalog/index mutations.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
@@ -70,7 +70,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Add bounded EmberTree range scans with subtree pruning and push SQL LIMIT into persistent equality-index scans.
 - [x] Validate full reachable-tree structure on recovery, including separator/minimum agreement, ordered non-overlapping child ranges, cycles, and multiply referenced pages.
 - [x] Harden redo WAL decoding against duplicate page IDs and malformed page images.
-- [ ] Incremental path-copy insert/delete, cross-log crash fault injection, and old-page reclamation/vacuum.
+- [x] Incremental path-copy insert/delete and conservative tree-node reclamation; [ ] cross-log crash fault injection and full descriptor-/snapshot-aware reclamation.
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
 - [x] In-memory B+ tree deletion with leaf/internal borrowing, merging, root collapse, and strict occupancy validation; focused and deterministic reference tests added.
 - [x] Stack-based successor-leaf traversal for in-memory range scans.
@@ -80,7 +80,7 @@ The native in-memory B+ tree backs SQL equality indexes and supports point looku
 
 SQL transaction commits no longer diff complete previous/current index snapshots. INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX now append encoded row-level index mutations while executing against the staged transaction. Repeated changes to the same key are coalesced in transaction order (last mutation wins), then removals and upserts are applied through one mixed CoW batch, one redo record, and one root publication after the canonical SQL WAL commit. This avoids O(total indexed entries) transaction-time delta discovery. A full scan remains necessary when rebuilding the derived mirror at startup. In-memory SQL indexes now store stable table-local row IDs rather than vector positions. INSERT adds only the new IDs, UPDATE removes and reinserts an ID only when an indexed key changes, DELETE removes each deleted row from its index keys, and UPSERT rekeys only the affected row. A DELETE still compacts the row vector and rebuilds the row-ID-to-position map in O(remaining rows), but it does not rebuild the B+ tree indexes. Unique-index updates are checked as a group before any staged row is changed.
 
-Startup and redo recovery validate the complete reachable persistent tree, including separators, child ranges, cycles, and duplicate references; redo records reject duplicate page IDs and malformed page images before replay. A durable SQL commit remains successful if only the derived EmberTree mirror fails; the database disables that mirror and falls back to in-memory indexes until a successful rebuild. Incremental page-tree insertion/deletion uses path copying; deletion merges adjacent same-level siblings when their combined contents fit and collapses unary roots. Redistribution of underfull siblings, cross-log crash fault injection, reachability-aware page reclamation, and vacuum remain pending. The persistent tree does not yet use leaf sibling pointers. The PPG1 snapshot remains a physical snapshot layout, not a lazy page store. RecordStore provides a reusable multi-page record primitive, but SQL rows are not yet migrated into it. The initial LRU cache applies to EPG1 extent files (including EmberTree/KV/RecordStore page operations); it is not yet a shared cache for canonical SQL rows. Database startup still reconstructs the snapshot and loads all SQL rows into memory.
+Startup and redo recovery validate the complete reachable persistent tree, including separators, child ranges, cycles, and duplicate references; redo records reject duplicate page IDs and malformed page images before replay. A durable SQL commit remains successful if only the derived EmberTree mirror fails; the database disables that mirror and falls back to in-memory indexes until a successful rebuild. Incremental page-tree insertion/deletion uses path copying; deletion merges adjacent same-level siblings when their combined contents fit and collapses unary roots. Conservative vacuum now reclaims only unreachable tree-node pages and deliberately preserves overflow and unknown page types. Redistribution of underfull siblings, cross-log crash fault injection, descriptor-aware overflow reclamation, and snapshot/reader-pin protection remain pending. The persistent tree does not yet use leaf sibling pointers. The PPG1 snapshot remains a physical snapshot layout, not a lazy page store. RecordStore provides a reusable multi-page record primitive, but SQL rows are not yet migrated into it. The initial LRU cache applies to EPG1 extent files (including EmberTree/KV/RecordStore page operations); it is not yet a shared cache for canonical SQL rows. Database startup still reconstructs the snapshot and loads all SQL rows into memory.
 ## 3.1 EmberForge 7 (EF7) — Minecraft/KSL record engine
 
 - [x] Independent EF7 sidecar and versioned EF7C overflow chunks / EF7R record descriptors over the PDB6 page allocator and CoW B+ tree.
@@ -93,7 +93,7 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding, bounded rectangular scans, and atomic region chunk batches.
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
 - [ ] General user-defined secondary indexes and index rebuild/verification tooling.
-- [ ] Integrate EF7 transactions with canonical SQL WAL, catalog and SQL executor; PDB5 remains authoritative.
+- [ ] Enlist EF7 mutations in the same user-visible SQL transaction and coordinator commit path; EF7 remains a separate durable participant.
 - [x] KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username, delete, and atomic profile batches; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
 - [x] KSL JSONL/1 namespace administration: create/get/find/list/delete with parent-scoped hierarchy; bridge listing is capped at 64 entries per call.
 - [x] KSL JSONL/1 chunk CRUD with signed coordinates and a pre-read descriptor-size check; the bridge caps chunk payloads at 24 KiB.
@@ -185,8 +185,8 @@ Do not label PostemberDB production-ready until the page cache, transaction/reco
 - [x] Coalesce repeated row-key mutations in transaction order and publish one mixed CoW batch after the canonical SQL WAL commit.
 - [x] Stable row IDs in persistent index entries prevent row-position shifts after DELETE.
 - [ ] Replace in-memory index row positions with stable row IDs and remove full in-memory index rebuilds on UPDATE/DELETE.
-- [ ] Reachability-aware page reclamation and vacuum; old CoW pages remain allocated.
-- [ ] Reachability-aware reclamation and vacuum; old CoW pages remain allocated.
+- [x] Conservative PDB6 vacuum traces the current published B+ Tree root and frees unreachable EBL1/EBI1 nodes while retaining P6R1 overflow and unknown page types.
+- [ ] Descriptor-aware reclamation of orphan overflow extents, named snapshot roots, active-reader pins/epochs, and crash-safe vacuum progress.
 - [ ] Fault injection at allocation, redo sync, page write, and root publication boundaries.
 
 The incremental insert/delete APIs are now used by SQL transaction commits for the derived index mirror.  Delete batches ignore missing keys, publish one redo record/root per batch, merge adjacent same-level siblings when their combined contents fit one page, and collapse unary roots. Non-root unary internal pages may remain when siblings cannot be merged; byte-balanced redistribution and a minimum-occupancy invariant are not implemented. SQL transaction commits now compute the set difference between the previous and next derived index entries, then apply removed and inserted keys through one mixed page-tree mutation batch, one redo record, and one root publication. This reduces persistent page writes and preserves untouched CoW subtrees. Stable table-local row identifiers are now stored in PDB5 snapshots and used in EmberTree index keys, so deleting a row does not renumber later entries. PDB4 and earlier snapshots remain readable; legacy rows receive deterministic IDs when loaded. The current delta collector still scans all in-memory index entries to calculate the difference (O(total indexed entries)). SQL table rows are not page-backed. Allocation metadata is committed as new pages are reserved; an interrupted operation before its redo record can leave unreachable allocated pages. This is safe for correctness but requires future vacuum/reclamation support.
@@ -256,12 +256,13 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] SQL and EF7 read/write authorization on JSONL and supported binary operations; unknown command classes fail closed.
 - [x] Standalone JDBC Maven module with Connection, Statement, PreparedStatement, ResultSet, metadata basics, TLS and JSONL/1 transport.
 - [ ] Server-side prepared-statement protocol, streaming ResultSets, JDBC batch/generated keys/savepoints, and complete JDBC metadata remain pending.
-- [ ] Mutual TLS, per-user rate/connection quotas, audit logging, password rotation, and schema/table-scoped grants remain pending.
+- [x] Durable password rotation with independent Argon2 salt/hash persistence.
+- [ ] Mutual TLS, per-user rate/connection quotas, audit logging, and schema/table-scoped grants remain pending.
 
 ## Vacuum and snapshots
 
-- [ ] Reachability-based page reclamation across current roots, named snapshots, and active reader pins is not yet implemented.
-- [ ] Snapshot root persistence, reader epochs/pins, crash-safe vacuum progress, and safe page reuse remain required before enabling general page freeing.
+- [x] Current-root reachability for B+ Tree nodes and conservative release/reuse of unreachable tree-node pages.
+- [ ] Descriptor-aware overflow-page reachability, named snapshot roots, active reader epochs/pins, crash-safe vacuum progress, and safe reuse across retained snapshots remain unimplemented.
 
 
 - [x] Coordinator ABORT recovery now retries each prepared participant's idempotent rollback, syncs a per-participant ROLLED_BACK acknowledgement, and exposes aborted transactions still needing cleanup.
