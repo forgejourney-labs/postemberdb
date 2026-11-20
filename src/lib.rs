@@ -100,6 +100,29 @@ impl QueryResult {
     }
 }
 
+/// Read-only view of the SQL catalog, suitable for database administration tools.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogSnapshot {
+    pub tables: Vec<TableInfo>,
+}
+
+/// Metadata for one SQL table. Rows are not copied into the catalog snapshot.
+#[derive(Debug, Clone)]
+pub struct TableInfo {
+    pub name: String,
+    pub row_count: usize,
+    pub columns: Vec<Column>,
+    pub indexes: Vec<IndexInfo>,
+}
+
+/// Metadata for one index attached to a SQL table.
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
 #[derive(Debug)]
 pub enum DbError {
     Parse(String),
@@ -424,6 +447,23 @@ impl Table {
     }
 }
 
+fn describe_table(name: &str, table: &Table) -> TableInfo {
+    let indexes = table.indexes.iter().map(|(index_name, index)| IndexInfo {
+        name: index_name.clone(),
+        columns: index.column_indices.iter()
+            .filter_map(|column_index| table.columns.get(*column_index).map(|column| column.name.clone()))
+            .collect(),
+        unique: index.unique,
+    }).collect();
+
+    TableInfo {
+        name: name.to_owned(),
+        row_count: table.rows.len(),
+        columns: table.columns.clone(),
+        indexes,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EmberIndexDelta {
     key: Vec<u8>,
@@ -502,6 +542,25 @@ impl Default for Database {
 
 impl Database {
     pub fn new() -> Self { Self::default() }
+
+    /// Returns a stable, read-only snapshot of SQL table and index metadata.
+    ///
+    /// The snapshot contains metadata only; it does not clone table row payloads.
+    pub fn catalog(&self) -> CatalogSnapshot {
+        CatalogSnapshot {
+            tables: self.tables.iter()
+                .map(|(name, table)| describe_table(name, table))
+                .collect(),
+        }
+    }
+
+    /// Returns metadata for a single table using the same identifier rules as SQL.
+    pub fn table_info(&self, table_name: &str) -> Result<TableInfo, DbError> {
+        let name = normalize_ident(table_name);
+        let table = self.tables.get(&name)
+            .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
+        Ok(describe_table(&name, table))
+    }
 
     /// Opens the database's independent persistent key/value sidecar.
     pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
@@ -1413,6 +1472,34 @@ mod tests {
         let result = db.execute("SELECT * FROM users").unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values, vec![Value::Integer(1), Value::Text("Ada".into())]);
+    }
+
+    #[test]
+    fn catalog_exposes_table_columns_indexes_and_row_counts() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE browser_players (uuid TEXT PRIMARY KEY, coins INTEGER NOT NULL)").unwrap();
+        db.execute("CREATE INDEX browser_players_coins ON browser_players (coins)").unwrap();
+        db.execute("INSERT INTO browser_players VALUES ('player-a', 42)").unwrap();
+
+        let catalog = db.catalog();
+        assert_eq!(catalog.tables.len(), 1);
+        let table = &catalog.tables[0];
+        assert_eq!(table.name, "browser_players");
+        assert_eq!(table.row_count, 1);
+        assert_eq!(table.columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["uuid", "coins"]);
+        assert!(!table.columns[0].nullable);
+        assert!(!table.columns[1].nullable);
+        let primary = table.indexes.iter().find(|index| index.name == "__pk_browser_players").unwrap();
+        assert!(primary.unique);
+        assert_eq!(primary.columns, vec!["uuid"]);
+        let secondary = table.indexes.iter().find(|index| index.name == "browser_players_coins").unwrap();
+        assert!(!secondary.unique);
+        assert_eq!(secondary.columns, vec!["coins"]);
+
+        let detail = db.table_info("BROWSER_PLAYERS").unwrap();
+        assert_eq!(detail.row_count, 1);
+        assert!(db.table_info("missing_table").is_err());
     }
 
 
