@@ -931,10 +931,25 @@ impl Database {
             "PDB6 catalog does not contain table {table_name}"
         )))?;
         let table_id = catalog.table_id;
-        if catalog.columns.len() != table_schema.columns.len()
+        if catalog.name != table_name
+            || catalog.columns.len() != table_schema.columns.len()
             || catalog.indexes.len() != table_schema.indexes.len()
+            || catalog.columns.iter().zip(&table_schema.columns).any(|(stored, memory)| {
+                stored.name != memory.name
+                    || stored.data_type != memory.data_type
+                    || stored.nullable != memory.nullable
+            })
         {
             return Err(DbError::Storage("PDB6 catalog and in-memory SQL schema disagree".into()));
+        }
+        for (stored, (name, index)) in catalog.indexes.iter().zip(table_schema.indexes.iter()) {
+            let columns = index.column_indices.iter()
+                .map(|column| u32::try_from(*column))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DbError::Storage("PDB6 index column ordinal exceeds u32".into()))?;
+            if stored.name != *name || stored.columns != columns || stored.unique != index.unique {
+                return Err(DbError::Storage("PDB6 catalog and in-memory SQL index definitions disagree".into()));
+            }
         }
 
         let index_definitions = table_schema.indexes.iter().enumerate()
@@ -1012,7 +1027,7 @@ impl Database {
                 let predicates = predicate.as_deref()
                     .map(|text| parse_where_predicates(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
-                let mut changed = Vec::<Row>::new();
+                let mut changed = Vec::<(Row, Vec<Value>)>::new();
                 let mut matched_count = 0usize;
                 let mut after = None;
                 loop {
@@ -1025,11 +1040,12 @@ impl Database {
                         for (column, value) in table_schema.columns.iter().zip(&values) {
                             validate_value(column, value)?;
                         }
-                        if matches_sql_predicates(&values, &predicates) {
+                        let matches = matches_sql_predicates(&values, &predicates);
+                        if matches {
                             matched_count = matched_count.checked_add(1)
                                 .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
                         }
-                        if matches_sql_predicates(&values, &predicates) && values[target_index] != *value {
+                        if matches && values[target_index] != *value {
                             if changed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
@@ -1037,19 +1053,17 @@ impl Database {
                             }
                             let mut new_values = values.clone();
                             new_values[target_index] = (*value).clone();
-                            changed.push(Row { row_id: *row_id, values: new_values });
-                            // Keep old values in a side map for index maintenance.
-                            // The key is stable row ID, independent of page placement.
+                            changed.push((Row { row_id: *row_id, values: new_values }, values));
                         }
                     }
                     after = ids.last().copied();
                     if ids.len() < SCAN_BATCH { break; }
                 }
-                let changing_ids = changed.iter().map(|row| row.row_id).collect::<std::collections::BTreeSet<_>>();
+                let changing_ids = changed.iter().map(|(row, _)| row.row_id).collect::<std::collections::BTreeSet<_>>();
                 for (_, index_id, columns, unique) in &index_definitions {
                     if !unique || !columns.contains(&target_index) { continue; }
                     let mut seen = std::collections::BTreeSet::new();
-                    for row in &changed {
+                    for (row, _) in &changed {
                         let encoded = storage::index_codec::encode_index_key(
                             &IndexKey::from_columns(&row.values, columns)
                         )?;
@@ -1068,15 +1082,12 @@ impl Database {
                         }
                     }
                 }
-                for row in &changed {
-                    let old_payload = store.get_row_payload(table_id, row.row_id)?
-                        .ok_or_else(|| DbError::Storage("PDB6 row disappeared during bounded UPDATE".into()))?;
-                    let old_values = storage::sql_rows::SqlRowStore::decode_values(&old_payload, table_schema.columns.len())?;
+                for (row, old_values) in &changed {
                     row_upserts.push((table_id, row.row_id,
                         storage::sql_rows::SqlRowStore::encode_values(&row.values, table_schema.columns.len())?));
                     for (_, index_id, columns, _) in &index_definitions {
                         let old_key = storage::index_codec::encode_index_key(
-                            &IndexKey::from_columns(&old_values, columns)
+                            &IndexKey::from_columns(old_values, columns)
                         )?;
                         let new_key = storage::index_codec::encode_index_key(
                             &IndexKey::from_columns(&row.values, columns)
