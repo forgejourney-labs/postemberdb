@@ -162,6 +162,25 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn remote_operator_frame_kind_ids_round_trip() {
+        let kinds = [
+            FrameKind::Catalog,
+            FrameKind::CatalogResult,
+            FrameKind::TablePage,
+            FrameKind::TablePageResult,
+            FrameKind::ServerStatus,
+            FrameKind::ServerStatusResult,
+            FrameKind::AdminRequest,
+            FrameKind::AdminResponse,
+            FrameKind::BatchQuery,
+            FrameKind::BatchQueryResult,
+        ];
+        for kind in kinds {
+            assert_eq!(FrameKind::try_from(kind as u8).unwrap(), kind);
+        }
+    }
+
+    #[test]
     fn frame_round_trip_preserves_kind_request_and_binary_payload() {
         let frame = Frame::new(FrameKind::ChunkPut, 0x1020_3040_5060_7080, vec![0, 1, 0xff, 0, 0x7f]);
         let mut encoded = Vec::new();

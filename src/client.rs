@@ -253,3 +253,111 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, maximum: usize) -> io::Result<S
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_typed_sql_result_values_and_metadata() {
+        let payload = br#"{
+            "ok": true,
+            "columns": ["id", "name", "active", "note"],
+            "rows": [
+                [42, "Ada", true, null],
+                [-7, "Grace", false, "legacy"]
+            ],
+            "affected_rows": 2,
+            "message": "2 row(s)"
+        }"#;
+
+        let result = parse_query_result(payload).unwrap();
+        assert_eq!(result.columns, vec!["id", "name", "active", "note"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].row_id, 0);
+        assert_eq!(result.rows[0].values, vec![
+            Value::Integer(42),
+            Value::Text("Ada".into()),
+            Value::Boolean(true),
+            Value::Null,
+        ]);
+        assert_eq!(result.rows[1].values, vec![
+            Value::Integer(-7),
+            Value::Text("Grace".into()),
+            Value::Boolean(false),
+            Value::Text("legacy".into()),
+        ]);
+        assert_eq!(result.affected_rows, 2);
+        assert_eq!(result.message, "2 row(s)");
+    }
+
+    #[test]
+    fn rejects_remote_sql_errors_and_malformed_result_shapes() {
+        let denied = br#"{"ok":false,"error":"not authorized"}"#;
+        assert_eq!(
+            parse_query_result(denied).unwrap_err().kind(),
+            io::ErrorKind::Other,
+        );
+
+        let missing_columns = br#"{"rows":[],"affected_rows":0}"#;
+        assert_eq!(
+            parse_query_result(missing_columns).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let invalid_value = br#"{"columns":["value"],"rows":[[{}]]}"#;
+        assert_eq!(
+            parse_query_result(invalid_value).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let malformed_json = b"{";
+        assert_eq!(
+            parse_query_result(malformed_json).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn rejects_missing_remote_connection_fields_before_opening_ca_bundle() {
+        let error = RemoteClient::connect(
+            "",
+            "localhost",
+            "/path/that/does/not/exist/ca.pem",
+            "admin",
+            "a valid test password",
+        ).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = RemoteClient::connect(
+            "127.0.0.1:7432",
+            "",
+            "/path/that/does/not/exist/ca.pem",
+            "admin",
+            "a valid test password",
+        ).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_line_breaks_and_oversized_authentication_tokens() {
+        let error = RemoteClient::connect(
+            "127.0.0.1:7432",
+            "localhost",
+            "/path/that/does/not/exist/ca.pem",
+            "admin\nAUTH root anything",
+            "valid password",
+        ).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = RemoteClient::connect(
+            "127.0.0.1:7432",
+            "localhost",
+            "/path/that/does/not/exist/ca.pem",
+            "admin",
+            &"p".repeat(1025),
+        ).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
