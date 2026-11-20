@@ -915,7 +915,7 @@ const FAIL_AFTER_ROOT_PUBLICATION: u8 = 4;
 
 #[cfg(test)]
 thread_local! {
-    static COMMIT_FAILPOINT: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    static COMMIT_FAILPOINT: std::cell::Cell<Option<u8>> = std::cell::Cell::new(None);
 }
 
 #[cfg(test)]
