@@ -8,13 +8,13 @@ This plan records the implementation order and invariants required before Postem
 
 The current implementation has useful building blocks, but they are not yet one database transaction domain:
 
-- Database owns PDB5 snapshot/WAL state and reconstructs Table.rows into memory.
-- SqlRowStore is a typed SRW1 layer over RecordStore; it is not connected to the live SQL executor.
-- Pdb6Store provides a shared CoW tree, redo WAL and catalog/row/index keyspaces, but the live SQL engine does not use it as its canonical store.
-- KV, Registry, RecordStore and EF7 have independent sidecar files, roots and WALs.
-- page_tree retains replaced/deleted pages. It does not yet perform complete root-reachability vacuum and safe page reuse.
-- The server intentionally accepts loopback binds only. TLS, identity and authorization are absent.
-- The repository has no JDBC driver module yet.
+- PDB5 remains the compatibility snapshot/WAL format for databases not explicitly migrated.
+- Explicitly migrated PDB6 databases use the shared CoW page tree, P6R1 overflow row pages, P6D1 descriptors, catalog/index keyspaces and one-root SQL commit publication.
+- PDB6 SELECT and table-page reads now fetch rows directly from disk in bounded batches, but Database::open still reconstructs full Table.rows vectors and DML still stages full table copies in RAM.
+- KV, Registry, RecordStore and EF7 still have sidecar storage domains; cross-domain atomicity must use the coordinator participant protocol.
+- page_tree retains replaced/deleted pages until reachability-aware vacuum proves safe reuse.
+- The server has verified TLS, authentication, RBAC and audit for Binary/1 remote sessions; the Admin web panel remains loopback-only.
+- A JDBC driver module exists, but remaining protocol integration and conformance scope must be tracked separately.
 
 PDB5 must remain readable. A migration must never silently replace or discard the only valid copy of a database.
 
@@ -32,7 +32,7 @@ PDB5 must remain readable. A migration must never silently replace or discard th
 
 ### Design
 
-- Promote PDB6 to canonical SQL persistence only after a complete reader/writer exists.
+- Keep PDB6 as the canonical SQL persistence format for migrated databases; finish lazy reads and bounded write staging before calling the engine fully disk-native.
 - Persist a versioned catalog record per table, stable row descriptors, index definitions and index entries in the shared PDB6 keyspace.
 - Use overflow records for row payloads that do not fit in a B+ tree leaf value. A row descriptor points to the checked multi-page payload.
 - Keep Table metadata and indexes in memory only as bounded/rebuildable metadata where justified. Do not keep Vec<Row> as authoritative table contents.

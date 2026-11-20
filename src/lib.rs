@@ -1524,6 +1524,18 @@ mod tests {
             assert!(rows.iter().any(|row| row.values == vec![Value::Text("player-a".into()), Value::Integer(99)]));
             assert!(rows.iter().any(|row| row.values == vec![Value::Text("player-c".into()), Value::Integer(30)]));
             assert!(db.execute("SELECT * FROM players WHERE uuid = 'player-b'").unwrap().rows.is_empty());
+
+            // Prove that SQL SELECT and table paging fetch committed payloads
+            // from PDB6 pages rather than depending on the reconstructed RAM cache.
+            let table = db.tables.get_mut("players").unwrap();
+            table.rows.clear();
+            table.row_positions.clear();
+            assert_eq!(db.read_table_page("players", 0, 1).unwrap().rows[0].values,
+                vec![Value::Text("player-a".into()), Value::Integer(99)]);
+            let selected = db.execute("SELECT coins FROM players WHERE uuid = 'player-c' LIMIT 1").unwrap();
+            assert_eq!(selected.rows[0].values, vec![Value::Integer(30)]);
+            let count = db.execute("SELECT COUNT(*) FROM players").unwrap();
+            assert_eq!(count.rows[0].values, vec![Value::Integer(2)]);
         }
         for suffix in [
             "", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal",

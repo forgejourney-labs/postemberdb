@@ -2,7 +2,9 @@
 
 ## Status
 
-Design contract for the next storage generation. This is not a claim that PDB6 is implemented. The current PDB5 snapshot plus SQL statement WAL remains authoritative. The PDB6 shared tree now has a bounded overflow-row payload primitive, but Database SQL execution has not yet been migrated to it.
+PDB6 is the canonical SQL persistence format after explicit `Database::migrate_to_pdb6()`. `Database::open` detects and loads its published manifest; committed SQL writes publish catalog, row descriptors, index mutations and the manifest through one PDB6 CoW root. PDB5 remains the compatibility format for databases that have not been migrated.
+
+The current SQL executor still reconstructs complete table row vectors into RAM when opening PDB6 and stages full table state for writes. PDB6 `SELECT` and table-page reads now fetch validated row payloads directly from disk in bounded row-ID batches; `LIMIT` stops scanning early and `COUNT(*)` does not build a result vector of every row. This is an incremental disk-read improvement, not yet a fully lazy disk-native executor.
 
 ## Implemented PDB6 row-payload primitive
 
@@ -76,7 +78,10 @@ PDB5 migration must use a side-by-side target file or a new versioned sidecar, p
 - [ ] Transaction redo format and crash-point fault injection.
 - [ ] Atomic multi-table root publication and recovery.
 - [ ] PDB5 read-only compatibility and restartable migration.
-- [ ] Database DML routed through page-backed rows; SQL snapshot no longer stores full row vectors.
+- [x] PDB6 SQL commit path publishes row payloads, catalog and index changes through one CoW root after explicit migration.
+- [x] PDB6 SELECT and table-page reads stream row payloads from disk in bounded batches.
+- [ ] Remove eager PDB6 row reconstruction on open; replace full Vec<Row> with a bounded row cache and stable-ID disk accessor.
+- [ ] Stage INSERT/UPDATE/DELETE in bounded page batches without cloning whole tables; preserve unique-index validation and one-root atomic publication.
 - [ ] Lazy point reads, bounded scans, and shared buffer pool.
 - [x] Durable named snapshot roots and tree-page reachability across retained snapshots; PDB6's exclusive page-store lock serializes store access.
 - [ ] Active-reader epochs/pins, per-snapshot overflow-descriptor tracing, and crash-safe vacuum progress.
