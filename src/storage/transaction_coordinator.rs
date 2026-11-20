@@ -617,6 +617,7 @@ mod tests {
             c.mark_prepared(tx, 1).unwrap();
             c.commit(tx).unwrap();
             c.mark_applied(tx, 0).unwrap();
+            c.mark_finalized(tx, 0).unwrap();
             assert_eq!(c.committed_pending_apply()[0].applied_participants, vec![0]);
             assert!(c.mark_applied(tx, 0).is_err());
         }
@@ -627,7 +628,9 @@ mod tests {
             assert_eq!(pending[0].transaction_id, tx);
             assert_eq!(pending[0].prepared_participants, vec![0, 1]);
             assert_eq!(pending[0].applied_participants, vec![0]);
+            assert_eq!(pending[0].finalized_participants, vec![0]);
             c.mark_applied(tx, 1).unwrap();
+            c.mark_finalized(tx, 1).unwrap();
             assert!(c.committed_pending_apply().is_empty());
         }
         cleanup(&path);
