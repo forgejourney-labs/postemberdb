@@ -13,7 +13,7 @@ PostemberDB is a Rust SQL database engine with a deliberately documented dialect
 | Upsert | `ON CONFLICT (...) DO UPDATE SET`, KSL-compatible `ON DUPLICATE KEY UPDATE` |
 | Updates | Single-column assignment with optional equality predicates |
 | Deletes | `DELETE FROM` with optional equality predicates |
-| Queries | `SELECT *`, selected columns, equality predicates joined by `AND`, `COUNT(*)`, `LIMIT` |
+| Queries | `SELECT *`, selected columns, equality/range comparisons, `IS NULL`, `IS NOT NULL`, `LIKE`, `AND`, `COUNT(*)`, `LIMIT` |
 | Sorting | `ORDER BY column [ASC|DESC]`, multiple sort keys |
 | Parameters | Typed positional `?` parameters through the Rust API and client sessions |
 | Transactions | Rust transaction callback and owned client sessions; server transaction-control commands |
@@ -44,13 +44,14 @@ PDB6 queries scan row IDs and decode only required row payloads in bounded batch
 
 ## Not implemented yet
 
-- General comparison predicates: `<`, `<=`, `>`, `>=`, `!=`, `<>`.
-- `IS NULL`, `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, `OR`, nested boolean expressions.
+- `IN`, `BETWEEN`, `OR`, nested boolean expressions and parenthesized predicate groups.
 - `JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, subqueries and CTEs.
 - Aggregates beyond `COUNT(*)`, including `SUM`, `AVG`, `MIN`, `MAX`.
 - `OFFSET`, window functions, unions and set operators.
 - `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, foreign keys, check constraints and defaults.
 - Explicit SQL `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints and isolation levels.
 - Cost-based query planning, `EXPLAIN`, prepared execution plans and index range scans.
+
+`LIKE` currently supports `%` (any sequence) and `_` (one character) and is case-sensitive. Comparisons against `NULL` follow SQL filtering behavior: they do not match rows; use `IS NULL` or `IS NOT NULL` instead.
 
 Unsupported SQL must return a clear error; the engine must not silently accept syntax it cannot execute.
