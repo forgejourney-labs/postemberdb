@@ -3432,4 +3432,43 @@ mod tests {
         assert_eq!(rows.rows[1].values[1], Value::Text("b@example.test".into()));
     }
 
+    #[test]
+    fn where_or_groups_follow_sql_and_before_or_precedence() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE logical_filters (id INTEGER, state TEXT)").unwrap();
+        db.execute("INSERT INTO logical_filters VALUES (1, 'cold')").unwrap();
+        db.execute("INSERT INTO logical_filters VALUES (2, 'ready')").unwrap();
+        db.execute("INSERT INTO logical_filters VALUES (3, 'cold')").unwrap();
+        db.execute("INSERT INTO logical_filters VALUES (4, 'ready')").unwrap();
+        db.execute("CREATE INDEX idx_logical_filters_id ON logical_filters (id)").unwrap();
+
+        let either = db.execute(
+            "SELECT id FROM logical_filters WHERE id = 1 OR id = 3 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            either.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(3)]
+        );
+
+        // AND has higher precedence: id=1 OR (id=2 AND state='ready').
+        let precedence = db.execute(
+            "SELECT id FROM logical_filters WHERE id = 1 OR id = 2 AND state = 'ready' ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            precedence.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2)]
+        );
+
+        // OR inside a quoted string is data, not a logical separator.
+        db.execute("INSERT INTO logical_filters VALUES (5, 'left OR right')").unwrap();
+        let quoted = db.execute(
+            "SELECT id FROM logical_filters WHERE state = 'left OR right' OR id = 3 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            quoted.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(3), Value::Integer(5)]
+        );
+    }
+
+
 }
