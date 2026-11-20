@@ -562,6 +562,39 @@ impl Database {
         Ok(describe_table(&name, table))
     }
 
+    /// Reads a bounded page of rows without materializing the entire table.
+    ///
+    /// Pages follow the table's current physical row order. The maximum page
+    /// size is capped to keep administration tools from accidentally loading
+    /// an unbounded result set into memory.
+    pub fn read_table_page(
+        &self,
+        table_name: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<QueryResult, DbError> {
+        const MAX_PAGE_SIZE: usize = 1_000;
+        if limit > MAX_PAGE_SIZE {
+            return Err(DbError::Constraint(format!(
+                "table page size exceeds the maximum of {MAX_PAGE_SIZE} rows"
+            )));
+        }
+        let name = normalize_ident(table_name);
+        let table = self.tables.get(&name)
+            .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
+        let rows = table.rows.iter()
+            .skip(offset)
+            .take(limit)
+            .map(|row| Row { row_id: row.row_id, values: row.values.clone() })
+            .collect::<Vec<_>>();
+        Ok(QueryResult {
+            columns: table.columns.iter().map(|column| column.name.clone()).collect(),
+            message: format!("{} row(s) in page (offset {offset})", rows.len()),
+            rows,
+            affected_rows: 0,
+        })
+    }
+
     /// Opens the database's independent persistent key/value sidecar.
     pub fn open_key_value_store(&self) -> Result<KeyValueStore, DbError> {
         self.open_key_value_store_with_cache_capacity(128)
@@ -1500,6 +1533,25 @@ mod tests {
         let detail = db.table_info("BROWSER_PLAYERS").unwrap();
         assert_eq!(detail.row_count, 1);
         assert!(db.table_info("missing_table").is_err());
+    }
+
+    #[test]
+    fn table_pages_are_bounded_and_preserve_stable_row_ids() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE page_test (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        for id in 1..=5 {
+            db.execute(&format!("INSERT INTO page_test VALUES ({id}, 'row-{id}')")).unwrap();
+        }
+
+        let first = db.read_table_page("page_test", 0, 2).unwrap();
+        let second = db.read_table_page("page_test", 2, 2).unwrap();
+        let beyond_end = db.read_table_page("page_test", 20, 2).unwrap();
+
+        assert_eq!(first.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(second.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(second.rows[0].values[1], Value::Text("row-3".into()));
+        assert!(beyond_end.rows.is_empty());
+        assert!(db.read_table_page("page_test", 0, 1_001).is_err());
     }
 
 
