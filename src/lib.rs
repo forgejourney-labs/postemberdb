@@ -1330,7 +1330,6 @@ impl Database {
         let from = upper.find(" FROM ").ok_or_else(|| DbError::Parse("expected FROM".into()))?;
         let projection = sql["SELECT".len()..from].trim();
         let tail = sql[from + 6..].trim();
-        let upper_tail = tail.to_ascii_uppercase();
 
         let (without_limit, limit) = if let Some(position) = find_unquoted_keyword(tail, " LIMIT ") {
             let limit_text = tail[position + 7..].trim();
@@ -1626,6 +1625,10 @@ mod tests {
             assert_eq!(db.catalog().tables[0].row_count, 2);
             assert_eq!(db.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap().rows.len(), 1);
             assert!(!db.tables["players"].rows_loaded, "SELECT must keep the table row cache cold");
+            let ordered = db.execute("SELECT uuid FROM players ORDER BY coins DESC").unwrap();
+            assert_eq!(ordered.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+                vec![Value::Text("player-b".into()), Value::Text("player-a".into())]);
+            assert!(!db.tables["players"].rows_loaded, "ordered SELECT must not hydrate the table cache");
             db.execute("UPDATE players SET coins = 99 WHERE uuid = 'player-a'").unwrap();
             assert!(!db.tables["players"].rows_loaded, "committed DML must evict its temporary full-table staging cache");
             db.execute("DELETE FROM players WHERE uuid = 'player-b'").unwrap();
