@@ -3,9 +3,15 @@ use crate::{protocol::crc32, DbError, KeyValueStore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use rand_core::OsRng;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_PREFIX: &[u8] = b"AUTH/USER/";
+const AUDIT_COUNTER_KEY: &[u8] = b"AUTH/AUDIT/NEXT";
+const AUDIT_EVENT_PREFIX: &[u8] = b"AUTH/AUDIT/EVENT/";
 const RECORD_MAGIC: &[u8; 4] = b"PAU1";
+const AUDIT_MAGIC: &[u8; 4] = b"PAE1";
+const MAX_AUDIT_FIELD_BYTES: usize = 256;
+const MAX_AUDIT_PAGE_SIZE: usize = 10_000;
 const MAX_USERNAME_BYTES: usize = 64;
 const MAX_PASSWORD_BYTES: usize = 1024;
 const KNOWN_PERMISSION_BITS: u32 = (1 << 6) - 1 | (1 << 31);
@@ -75,6 +81,76 @@ impl Principal {
     }
 }
 
+/// Durable security event. Passwords, hashes, and tokens are never included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub sequence: u64,
+    pub timestamp_unix_ms: u64,
+    pub actor: String,
+    pub action: String,
+    pub subject: String,
+    pub succeeded: bool,
+}
+
+impl AuditEvent {
+    fn encode(&self) -> Result<Vec<u8>, DbError> {
+        let actor = self.actor.as_bytes();
+        let action = self.action.as_bytes();
+        let subject = self.subject.as_bytes();
+        if actor.is_empty() || action.is_empty()
+            || actor.len() > MAX_AUDIT_FIELD_BYTES
+            || action.len() > MAX_AUDIT_FIELD_BYTES
+            || subject.len() > MAX_AUDIT_FIELD_BYTES {
+            return Err(DbError::Storage("invalid authentication audit field length".into()));
+        }
+        let mut out = Vec::with_capacity(32 + actor.len() + action.len() + subject.len());
+        out.extend_from_slice(AUDIT_MAGIC);
+        out.push(1);
+        out.push(u8::from(self.succeeded));
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&self.timestamp_unix_ms.to_le_bytes());
+        for field in [actor, action, subject] {
+            out.extend_from_slice(&(field.len() as u16).to_le_bytes());
+        }
+        out.extend_from_slice(actor);
+        out.extend_from_slice(action);
+        out.extend_from_slice(subject);
+        let checksum = crc32(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() < 32 || &bytes[..4] != AUDIT_MAGIC || bytes[4] != 1 || bytes[5] > 1
+            || u32::from_le_bytes(bytes[bytes.len()-4..].try_into().unwrap()) != crc32(&bytes[..bytes.len()-4]) {
+            return Err(DbError::Storage("corrupt authentication audit event".into()));
+        }
+        let sequence = u64::from_le_bytes(bytes[6..14].try_into().unwrap());
+        let timestamp_unix_ms = u64::from_le_bytes(bytes[14..22].try_into().unwrap());
+        let actor_len = u16::from_le_bytes(bytes[22..24].try_into().unwrap()) as usize;
+        let action_len = u16::from_le_bytes(bytes[24..26].try_into().unwrap()) as usize;
+        let subject_len = u16::from_le_bytes(bytes[26..28].try_into().unwrap()) as usize;
+        if sequence == 0 || actor_len == 0 || action_len == 0
+            || [actor_len, action_len, subject_len].iter().any(|n| *n > MAX_AUDIT_FIELD_BYTES)
+            || 28usize.checked_add(actor_len).and_then(|n| n.checked_add(action_len))
+                .and_then(|n| n.checked_add(subject_len)).and_then(|n| n.checked_add(4)) != Some(bytes.len()) {
+            return Err(DbError::Storage("invalid authentication audit event lengths".into()));
+        }
+        let mut offset = 28;
+        let mut read_field = |length: usize| -> Result<String, DbError> {
+            let end = offset + length;
+            let value = String::from_utf8(bytes[offset..end].to_vec())
+                .map_err(|_| DbError::Storage("authentication audit field is not UTF-8".into()))?;
+            offset = end;
+            Ok(value)
+        };
+        let actor = read_field(actor_len)?;
+        let action = read_field(action_len)?;
+        let subject = read_field(subject_len)?;
+        Ok(Self { sequence, timestamp_unix_ms, actor, action, subject, succeeded: bytes[5] == 1 })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserRecord {
     password_hash: String,
@@ -136,6 +212,63 @@ impl AuthStore {
         Ok(Self { users: KeyValueStore::open(path)?, dummy_hash })
     }
 
+    fn commit_audited_mutation(
+        &mut self,
+        removals: &[Vec<u8>],
+        upserts: &[(Vec<u8>, Vec<u8>)],
+        actor: &str,
+        action: &str,
+        subject: &str,
+        succeeded: bool,
+    ) -> Result<(), DbError> {
+        let current = match self.users.get(AUDIT_COUNTER_KEY)? {
+            Some(bytes) if bytes.len() == 8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+            Some(_) => return Err(DbError::Storage("authentication audit counter is corrupt".into())),
+            None => 0,
+        };
+        let sequence = current.checked_add(1)
+            .ok_or_else(|| DbError::Storage("authentication audit sequence exhausted".into()))?;
+        let timestamp_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)
+            .unwrap_or_default().as_millis().min(u128::from(u64::MAX)) as u64;
+        let event = AuditEvent {
+            sequence, timestamp_unix_ms,
+            actor: actor.to_string(), action: action.to_string(),
+            subject: subject.to_string(), succeeded,
+        };
+        let mut batch = upserts.to_vec();
+        batch.push((AUDIT_COUNTER_KEY.to_vec(), sequence.to_le_bytes().to_vec()));
+        batch.push((audit_event_key(sequence), event.encode()?));
+        self.users.apply_batch(removals, &batch)?;
+        Ok(())
+    }
+
+    /// Reads a bounded sequence of durable audit events after a sequence number.
+    /// Sequence-addressed reads avoid scanning the complete audit history.
+    pub fn audit_events(&mut self, after_sequence: u64, limit: usize) -> Result<Vec<AuditEvent>, DbError> {
+        if limit > MAX_AUDIT_PAGE_SIZE {
+            return Err(DbError::Constraint(format!("audit page cannot exceed {MAX_AUDIT_PAGE_SIZE} events")));
+        }
+        if limit == 0 { return Ok(Vec::new()); }
+        let current = match self.users.get(AUDIT_COUNTER_KEY)? {
+            Some(bytes) if bytes.len() == 8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+            Some(_) => return Err(DbError::Storage("authentication audit counter is corrupt".into())),
+            None => 0,
+        };
+        let mut events = Vec::new();
+        let mut sequence = after_sequence.saturating_add(1);
+        while sequence <= current && events.len() < limit {
+            let bytes = self.users.get(&audit_event_key(sequence))?
+                .ok_or_else(|| DbError::Storage(format!("authentication audit event {sequence} is missing")))?;
+            let event = AuditEvent::decode(&bytes)?;
+            if event.sequence != sequence {
+                return Err(DbError::Storage("authentication audit sequence/key mismatch".into()));
+            }
+            events.push(event);
+            sequence = sequence.saturating_add(1);
+        }
+        Ok(events)
+    }
+
     pub fn create_user(
         &mut self,
         username: &str,
@@ -153,28 +286,32 @@ impl AuthStore {
             .map_err(|_| DbError::Storage("password hashing failed".into()))?
             .to_string();
         let record = UserRecord { password_hash, permissions, enabled: true };
-        self.users.put(&key, &record.encode()?)
+        self.commit_audited_mutation(&[], &[(key, record.encode()?)], "local-api", "user.create", username, true)
     }
 
     /// Returns None for an unknown, disabled, or incorrectly authenticated user.
     /// Unknown usernames still perform an Argon2 verification against a dummy hash.
     pub fn authenticate(&mut self, username: &str, password: &str) -> Result<Option<Principal>, DbError> {
+        let key = user_key(username)?;
         if password.len() > MAX_PASSWORD_BYTES {
+            self.commit_audited_mutation(&[], &[], username, "auth.login", username, false)?;
             return Ok(None);
         }
-        let key = user_key(username)?;
         let Some(bytes) = self.users.get(&key)? else {
             let parsed = PasswordHash::new(&self.dummy_hash)
                 .map_err(|_| DbError::Storage("dummy password hash is invalid".into()))?;
             let _ = Argon2::default().verify_password(password.as_bytes(), &parsed);
+            self.commit_audited_mutation(&[], &[], username, "auth.login", username, false)?;
             return Ok(None);
         };
         let record = UserRecord::decode(&bytes)?;
         let parsed = PasswordHash::new(&record.password_hash)
             .map_err(|_| DbError::Storage("stored password hash is invalid".into()))?;
         if Argon2::default().verify_password(password.as_bytes(), &parsed).is_err() || !record.enabled {
+            self.commit_audited_mutation(&[], &[], username, "auth.login", username, false)?;
             return Ok(None);
         }
+        self.commit_audited_mutation(&[], &[], username, "auth.login", username, true)?;
         Ok(Some(Principal { username: username.to_ascii_lowercase(), permissions: record.permissions }))
     }
 
@@ -191,7 +328,7 @@ impl AuthStore {
             .hash_password(new_password.as_bytes(), &salt)
             .map_err(|_| DbError::Storage("password hashing failed".into()))?
             .to_string();
-        self.users.put(&key, &record.encode()?)
+        self.commit_audited_mutation(&[], &[(key, record.encode()?)], "local-api", "user.password.change", username, true)
     }
 
     pub fn set_permissions(&mut self, username: &str, permissions: Permissions) -> Result<(), DbError> {
@@ -200,7 +337,7 @@ impl AuthStore {
             .ok_or_else(|| DbError::Constraint("user does not exist".into()))?;
         let mut record = UserRecord::decode(&bytes)?;
         record.permissions = permissions;
-        self.users.put(&key, &record.encode()?)
+        self.commit_audited_mutation(&[], &[(key, record.encode()?)], "local-api", "user.permissions.change", username, true)
     }
 
     pub fn set_enabled(&mut self, username: &str, enabled: bool) -> Result<(), DbError> {
@@ -209,11 +346,14 @@ impl AuthStore {
             .ok_or_else(|| DbError::Constraint("user does not exist".into()))?;
         let mut record = UserRecord::decode(&bytes)?;
         record.enabled = enabled;
-        self.users.put(&key, &record.encode()?)
+        self.commit_audited_mutation(&[], &[(key, record.encode()?)], "local-api", if enabled { "user.enable" } else { "user.disable" }, username, true)
     }
 
     pub fn delete_user(&mut self, username: &str) -> Result<bool, DbError> {
-        self.users.delete(&user_key(username)?)
+        let key = user_key(username)?;
+        if self.users.get(&key)?.is_none() { return Ok(false); }
+        self.commit_audited_mutation(&[key], &[], "local-api", "user.delete", username, true)?;
+        Ok(true)
     }
 
     pub fn list_users(&mut self) -> Result<Vec<String>, DbError> {
@@ -223,6 +363,12 @@ impl AuthStore {
                 .map_err(|_| DbError::Storage("authentication username key is invalid UTF-8".into()))
         }).collect()
     }
+}
+
+fn audit_event_key(sequence: u64) -> Vec<u8> {
+    let mut key = AUDIT_EVENT_PREFIX.to_vec();
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
 }
 
 fn user_key(username: &str) -> Result<Vec<u8>, DbError> {
@@ -268,6 +414,45 @@ mod tests {
             let mut auth = AuthStore::open(&path).unwrap();
             assert!(auth.authenticate("rotation", "first secure password").unwrap().is_none());
             assert!(auth.authenticate("rotation", "second secure password").unwrap().is_some());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn audit_events_are_durable_bounded_and_never_contain_password_material() {
+        let path = path();
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            auth.create_user("audit-user", "correct horse battery staple", Permissions::READ_ONLY).unwrap();
+            assert!(auth.authenticate("audit-user", "incorrect password").unwrap().is_none());
+            assert!(auth.authenticate("audit-user", "correct horse battery staple").unwrap().is_some());
+            auth.set_permissions("audit-user", Permissions::READ_WRITE).unwrap();
+            auth.set_enabled("audit-user", false).unwrap();
+            assert!(auth.delete_user("audit-user").unwrap());
+            let events = auth.audit_events(0, 100).unwrap();
+            assert_eq!(events.len(), 6);
+            assert_eq!(events[0].action, "user.create");
+            assert_eq!(events[1].action, "auth.login");
+            assert!(!events[1].succeeded);
+            assert!(events[2].succeeded);
+            assert_eq!(events[3].action, "user.permissions.change");
+            assert_eq!(events[4].action, "user.disable");
+            assert_eq!(events[5].action, "user.delete");
+            assert!(auth.audit_events(3, 2).unwrap().iter().all(|event| event.sequence > 3));
+            assert!(auth.audit_events(0, MAX_AUDIT_PAGE_SIZE + 1).is_err());
+        }
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            let events = auth.audit_events(0, 100).unwrap();
+            assert_eq!(events.len(), 6);
+            let encoded = events.iter().flat_map(|event| {
+                [event.actor.as_bytes(), event.action.as_bytes(), event.subject.as_bytes()]
+            }).flatten().copied().collect::<Vec<_>>();
+            assert!(!encoded.windows(b"correct horse battery staple".len())
+                .any(|window| window == b"correct horse battery staple"));
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal"] {
             let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
