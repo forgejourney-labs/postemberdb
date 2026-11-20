@@ -2156,6 +2156,87 @@ mod tests {
     }
 
     #[test]
+    fn pdb6_single_statement_dml_stages_only_changed_rows_and_keeps_cache_cold() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-pdb6-bounded-dml-{}-{}.pbd",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::create_pdb6(&path).unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
+            db.execute("CREATE UNIQUE INDEX players_uuid ON players (uuid)").unwrap();
+            let rows = (0..2_000).map(|index| vec![
+                Value::Text(format!("player-{index:04}")),
+                Value::Integer(index),
+            ]).collect::<Vec<_>>();
+            assert_eq!(db.insert_many("players", rows).unwrap(), 2_000);
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert!(!db.tables["players"].rows_loaded);
+            assert_eq!(db.catalog().tables[0].row_count, 2_000);
+
+            let updated = db.execute(
+                "UPDATE players SET coins = 777 WHERE uuid = 'player-1000'"
+            ).unwrap();
+            assert_eq!(updated.affected_rows, 1);
+            assert!(!db.tables["players"].rows_loaded,
+                "bounded UPDATE must not hydrate the full table");
+
+            let duplicate = db.execute(
+                "UPDATE players SET uuid = 'player-0002' WHERE uuid = 'player-1001'"
+            );
+            assert!(matches!(duplicate, Err(DbError::Constraint(_))));
+            assert!(!db.tables["players"].rows_loaded);
+
+            let deleted = db.execute(
+                "DELETE FROM players WHERE uuid = 'player-1001'"
+            ).unwrap();
+            assert_eq!(deleted.affected_rows, 1);
+            assert!(!db.tables["players"].rows_loaded);
+            assert_eq!(db.catalog().tables[0].row_count, 1_999);
+
+            let inserted = db.execute(
+                "INSERT INTO players VALUES ('player-1001', 2001)"
+            ).unwrap();
+            assert_eq!(inserted.affected_rows, 1);
+            assert!(!db.tables["players"].rows_loaded);
+            assert_eq!(db.catalog().tables[0].row_count, 2_000);
+
+            assert_eq!(
+                db.execute("SELECT coins FROM players WHERE uuid = 'player-1000'").unwrap().rows[0].values[0],
+                Value::Integer(777)
+            );
+            assert_eq!(
+                db.execute("SELECT coins FROM players WHERE uuid = 'player-1001'").unwrap().rows[0].values[0],
+                Value::Integer(2001)
+            );
+            assert!(!db.tables["players"].rows_loaded);
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert!(!db.tables["players"].rows_loaded);
+            assert_eq!(db.catalog().tables[0].row_count, 2_000);
+            assert_eq!(
+                db.execute("SELECT coins FROM players WHERE uuid = 'player-1000'").unwrap().rows[0].values[0],
+                Value::Integer(777)
+            );
+        }
+
+        for suffix in [
+            "", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal",
+            ".pdb6.pages.wal", ".pdb6.pages.lock", ".pdb6.snapshots",
+        ] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
+
+    #[test]
     fn pdb6_writes_hydrate_only_the_tables_they_modify() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-pdb6-table-hydration-{}-{}.pbd",
