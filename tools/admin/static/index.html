@@ -408,7 +408,12 @@ async function loadRoles(){
   try{await adminRequest('roles.assign',{username:userInput.value,role:roleInput.value});await loadRoles();}
   catch(error){statusNode.textContent=error.message;}
  });
- assign.append(userInput,document.createTextNode(' '),roleInput,document.createTextNode(' '),assignButton);output.append(assign);
+ const revokeButton=textNode('button','Revoke','danger');revokeButton.type='button';
+ revokeButton.addEventListener('click',async()=>{
+  try{await adminRequest('roles.revoke',{username:userInput.value,role:roleInput.value});await loadRoles();}
+  catch(error){statusNode.textContent=error.message;}
+ });
+ assign.append(userInput,document.createTextNode(' '),roleInput,document.createTextNode(' '),assignButton,document.createTextNode(' '),revokeButton);output.append(assign);
  const table=document.createElement('table'),head=document.createElement('thead'),row=document.createElement('tr'),body=document.createElement('tbody');
  ['Role','Permissions','Actions'].forEach(v=>row.append(textNode('th',v)));head.append(row);
  for(const role of data.roles||[]){
