@@ -1,7 +1,44 @@
 use eframe::egui;
-use postemberdb::{CatalogSnapshot, Database, QueryResult, Value};
+use postemberdb::{CatalogSnapshot, Column, DataType, Database, QueryResult, Row, TableInfo, Value};
 
 const PAGE_SIZE: usize = 100;
+
+#[derive(Clone)]
+struct FieldDraft {
+    text: String,
+    is_null: bool,
+}
+impl FieldDraft {
+    fn from_value(value: &Value) -> Self {
+        Self { text: match value {
+            Value::Null => String::new(),
+            Value::Integer(value) => value.to_string(),
+            Value::Text(value) => value.clone(),
+            Value::Boolean(value) => if *value { "TRUE".into() } else { "FALSE".into() },
+        }, is_null: matches!(value, Value::Null) }
+    }
+    fn empty(column: &Column) -> Self {
+        Self {
+            text: match column.data_type {
+                DataType::Boolean => "FALSE".into(),
+                _ => String::new(),
+            },
+            is_null: column.nullable,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RowDraft {
+    table_name: String,
+    original_values: Vec<Value>,
+    fields: Vec<FieldDraft>,
+}
+#[derive(Clone)]
+struct DeleteDraft {
+    table_name: String,
+    values: Vec<Value>,
+}
 
 struct BrowserApp {
     database_path: String,
@@ -12,6 +49,9 @@ struct BrowserApp {
     page_offset: usize,
     browsing_table: bool,
     result: Option<QueryResult>,
+    insert_draft: Option<RowDraft>,
+    edit_draft: Option<RowDraft>,
+    pending_delete: Option<DeleteDraft>,
     status: String,
 }
 
@@ -26,16 +66,75 @@ impl Default for BrowserApp {
             page_offset: 0,
             browsing_table: false,
             result: None,
+            insert_draft: None,
+            edit_draft: None,
+            pending_delete: None,
             status: "No database opened".into(),
         }
     }
 }
 
+fn valid_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+fn sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Integer(value) => value.to_string(),
+        Value::Boolean(value) => if *value { "TRUE".into() } else { "FALSE".into() },
+        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+    }
+}
+fn field_value(field: &FieldDraft, column: &Column) -> Result<Value, String> {
+    if field.is_null {
+        return if column.nullable { Ok(Value::Null) } else { Err(format!("{} does not allow NULL", column.name)) };
+    }
+    match column.data_type {
+        DataType::Integer => field.text.trim().parse::<i64>()
+            .map(Value::Integer).map_err(|_| format!("{} must be a signed 64-bit integer", column.name)),
+        DataType::Text => Ok(Value::Text(field.text.clone())),
+        DataType::Boolean => match field.text.trim().to_ascii_uppercase().as_str() {
+            "TRUE" => Ok(Value::Boolean(true)),
+            "FALSE" => Ok(Value::Boolean(false)),
+            _ => Err(format!("{} must be TRUE or FALSE", column.name)),
+        },
+    }
+}
+fn key_predicate(table: &TableInfo, row_values: &[Value]) -> Result<(Vec<String>, String), String> {
+    let unique = table.indexes.iter().find(|index| index.unique)
+        .ok_or_else(|| "Editing and deleting require a UNIQUE index or PRIMARY KEY".to_owned())?;
+    let mut terms = Vec::with_capacity(unique.columns.len());
+    for name in &unique.columns {
+        if !valid_identifier(name) { return Err("A key column name cannot be used safely in SQL".into()); }
+        let column_index = table.columns.iter().position(|column| column.name == *name)
+            .ok_or_else(|| format!("Key column {name} is missing"))?;
+        let value = row_values.get(column_index)
+            .ok_or_else(|| "The row does not contain every key column".to_owned())?;
+        terms.push(format!("{name} = {}", sql_literal(value)));
+    }
+    Ok((unique.columns.clone(), terms.join(" AND ")))
+}
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(value) => serde_json::json!(value),
+        Value::Text(value) => serde_json::json!(value),
+        Value::Boolean(value) => serde_json::json!(value),
+    }
+}
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 impl BrowserApp {
+    fn table_info(&self, name: &str) -> Option<TableInfo> {
+        self.catalog.tables.iter().find(|table| table.name == name).cloned()
+    }
     fn refresh_catalog(&mut self) {
         self.catalog = self.database.as_ref().map(Database::catalog).unwrap_or_default();
     }
-
     fn open_database(&mut self) {
         match Database::open(self.database_path.trim()) {
             Ok(database) => {
@@ -45,6 +144,9 @@ impl BrowserApp {
                 self.page_offset = 0;
                 self.browsing_table = false;
                 self.result = None;
+                self.insert_draft = None;
+                self.edit_draft = None;
+                self.pending_delete = None;
                 self.status = format!("Opened {}", self.database_path.trim());
             }
             Err(error) => {
@@ -57,13 +159,15 @@ impl BrowserApp {
             }
         }
     }
-
     fn execute_sql(&mut self) {
         let Some(database) = self.database.as_mut() else {
             self.status = "Open a database first".into();
             return;
         };
         self.browsing_table = false;
+        self.insert_draft = None;
+        self.edit_draft = None;
+        self.pending_delete = None;
         match database.execute(self.sql.trim()) {
             Ok(result) => {
                 self.status = result.message.clone();
@@ -76,7 +180,6 @@ impl BrowserApp {
             }
         }
     }
-
     fn load_table_page(&mut self, offset: usize) {
         let Some(table_name) = self.selected_table.clone() else {
             self.status = "Choose a table in Explorer first".into();
@@ -99,19 +202,172 @@ impl BrowserApp {
             }
         }
     }
-
     fn browse_table(&mut self, table_name: &str) {
         self.selected_table = Some(table_name.to_owned());
+        self.insert_draft = None;
+        self.edit_draft = None;
+        self.pending_delete = None;
         self.load_table_page(0);
     }
-
     fn total_rows(&self) -> usize {
         self.selected_table.as_ref()
             .and_then(|name| self.catalog.tables.iter().find(|table| &table.name == name))
-            .map(|table| table.row_count)
-            .unwrap_or(0)
+            .map(|table| table.row_count).unwrap_or(0)
     }
-
+    fn can_edit_selected_table(&self) -> bool {
+        self.selected_table.as_ref()
+            .and_then(|name| self.table_info(name))
+            .is_some_and(|table| table.indexes.iter().any(|index| index.unique)
+                && valid_identifier(&table.name)
+                && table.columns.iter().all(|column| valid_identifier(&column.name)))
+    }
+    fn begin_insert(&mut self) {
+        let Some(table_name) = self.selected_table.clone() else { return; };
+        let Some(info) = self.table_info(&table_name) else { return; };
+        if !info.columns.iter().all(|column| valid_identifier(&column.name)) || !valid_identifier(&table_name) {
+            self.status = "This table contains identifiers that the editor cannot safely use".into();
+            return;
+        }
+        self.insert_draft = Some(RowDraft {
+            table_name,
+            original_values: Vec::new(),
+            fields: info.columns.iter().map(FieldDraft::empty).collect(),
+        });
+        self.edit_draft = None;
+    }
+    fn begin_edit(&mut self, row: &Row) {
+        let Some(table_name) = self.selected_table.clone() else { return; };
+        let Some(info) = self.table_info(&table_name) else { return; };
+        if key_predicate(&info, &row.values).is_err() {
+            self.status = "Editing requires a UNIQUE index or PRIMARY KEY".into();
+            return;
+        }
+        self.edit_draft = Some(RowDraft {
+            table_name,
+            original_values: row.values.clone(),
+            fields: row.values.iter().map(FieldDraft::from_value).collect(),
+        });
+        self.insert_draft = None;
+        self.pending_delete = None;
+    }
+    fn request_delete(&mut self, row: &Row) {
+        let Some(table_name) = self.selected_table.clone() else { return; };
+        self.pending_delete = Some(DeleteDraft { table_name, values: row.values.clone() });
+        self.edit_draft = None;
+    }
+    fn save_insert(&mut self) {
+        let Some(draft) = self.insert_draft.clone() else { return; };
+        let Some(info) = self.table_info(&draft.table_name) else {
+            self.status = "Table metadata is unavailable".into();
+            return;
+        };
+        let mut values = Vec::with_capacity(info.columns.len());
+        for (field, column) in draft.fields.iter().zip(info.columns.iter()) {
+            match field_value(field, column) {
+                Ok(value) => values.push(value),
+                Err(error) => { self.status = error; return; }
+            }
+        }
+        let columns = info.columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>();
+        let statement = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            draft.table_name,
+            columns.join(", "),
+            values.iter().map(sql_literal).collect::<Vec<_>>().join(", ")
+        );
+        let result = self.database.as_mut().map(|database| database.execute(&statement));
+        match result {
+            Some(Ok(result)) => {
+                self.status = result.message;
+                self.insert_draft = None;
+                self.refresh_catalog();
+                self.load_table_page(self.page_offset);
+            }
+            Some(Err(error)) => self.status = format!("Insert failed: {error}"),
+            None => self.status = "Open a database first".into(),
+        }
+    }
+    fn save_edit(&mut self) {
+        let Some(draft) = self.edit_draft.clone() else { return; };
+        let Some(info) = self.table_info(&draft.table_name) else {
+            self.status = "Table metadata is unavailable".into();
+            return;
+        };
+        let (key_columns, predicate) = match key_predicate(&info, &draft.original_values) {
+            Ok(value) => value,
+            Err(error) => { self.status = error; return; }
+        };
+        if !valid_identifier(&draft.table_name) {
+            self.status = "Table name cannot be used safely in SQL".into();
+            return;
+        }
+        let mut statements = Vec::new();
+        for (index, (field, column)) in draft.fields.iter().zip(info.columns.iter()).enumerate() {
+            if key_columns.contains(&column.name) { continue; }
+            if !valid_identifier(&column.name) {
+                self.status = format!("Column {} cannot be used safely in SQL", column.name);
+                return;
+            }
+            let value = match field_value(field, column) {
+                Ok(value) => value,
+                Err(error) => { self.status = error; return; }
+            };
+            if draft.original_values.get(index) != Some(&value) {
+                statements.push(format!(
+                    "UPDATE {} SET {} = {} WHERE {}",
+                    draft.table_name, column.name, sql_literal(&value), predicate
+                ));
+            }
+        }
+        if statements.is_empty() {
+            self.status = "No editable fields were changed".into();
+            self.edit_draft = None;
+            return;
+        }
+        let result = match self.database.as_mut() {
+            Some(database) => database.transaction(|transaction| {
+                for statement in &statements { transaction.execute(statement)?; }
+                Ok(())
+            }),
+            None => {
+                self.status = "Open a database first".into();
+                return;
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.status = format!("Updated {} field(s) in one transaction", statements.len());
+                self.edit_draft = None;
+                self.refresh_catalog();
+                self.load_table_page(self.page_offset);
+            }
+            Err(error) => self.status = format!("Update failed: {error}"),
+        }
+    }
+    fn confirm_delete(&mut self) {
+        let Some(draft) = self.pending_delete.clone() else { return; };
+        let Some(info) = self.table_info(&draft.table_name) else {
+            self.status = "Table metadata is unavailable".into();
+            return;
+        };
+        let (_, predicate) = match key_predicate(&info, &draft.values) {
+            Ok(value) => value,
+            Err(error) => { self.status = error; return; }
+        };
+        let statement = format!("DELETE FROM {} WHERE {}", draft.table_name, predicate);
+        let result = self.database.as_mut().map(|database| database.execute(&statement));
+        match result {
+            Some(Ok(result)) if result.affected_rows == 1 => {
+                self.status = "Row deleted".into();
+                self.pending_delete = None;
+                self.refresh_catalog();
+                self.load_table_page(self.page_offset);
+            }
+            Some(Ok(result)) => self.status = format!("Delete stopped: expected one row, removed {}", result.affected_rows),
+            Some(Err(error)) => self.status = format!("Delete failed: {error}"),
+            None => self.status = "Open a database first".into(),
+        }
+    }
     fn export_result(&mut self, format: &str) {
         let Some(result) = self.result.as_ref() else {
             self.status = "There are no results to export".into();
@@ -121,7 +377,6 @@ impl BrowserApp {
             self.status = "The current result has no rows or columns to export".into();
             return;
         }
-
         let raw_name = self.selected_table.as_deref().unwrap_or("query-results");
         let base_name = raw_name.chars()
             .map(|ch| if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' { ch } else { '_' })
@@ -131,7 +386,6 @@ impl BrowserApp {
         } else {
             format!("{base_name}.{format}")
         };
-
         let content = if format == "csv" {
             let mut lines = Vec::with_capacity(result.rows.len() + 1);
             lines.push(result.columns.iter().map(|value| csv_cell(value)).collect::<Vec<_>>().join(","));
@@ -147,25 +401,74 @@ impl BrowserApp {
                 }
                 serde_json::Value::Object(object)
             }).collect::<Vec<_>>();
-            serde_json::to_string_pretty(&rows).unwrap_or_else(|error| format!("JSON export failed: {error}"))
+            match serde_json::to_string_pretty(&rows) {
+                Ok(json) => json,
+                Err(error) => {
+                    self.status = format!("JSON export failed: {error}");
+                    return;
+                }
+            }
         };
-
         match std::fs::write(&filename, content) {
             Ok(()) => self.status = format!("Exported {}", filename),
             Err(error) => self.status = format!("Export failed: {error}"),
         }
     }
-}
-
-fn csv_cell(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Integer(value) => serde_json::json!(value),
-        Value::Text(value) => serde_json::json!(value),
-        Value::Boolean(value) => serde_json::json!(value),
+    fn render_field(ui: &mut egui::Ui, field: &mut FieldDraft, column: &Column, enabled: bool) {
+        ui.horizontal(|ui| {
+            ui.label(&column.name);
+            ui.add_enabled_ui(enabled && !field.is_null, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut field.text).desired_width(190.0));
+            });
+            if column.nullable && enabled {
+                ui.checkbox(&mut field.is_null, "NULL");
+            } else if !enabled {
+                ui.weak("key");
+            }
+        });
+    }
+    fn render_insert_form(&mut self, ui: &mut egui::Ui) {
+        let Some(table_name) = self.insert_draft.as_ref().map(|draft| draft.table_name.clone()) else { return; };
+        let Some(info) = self.table_info(&table_name) else { return; };
+        let mut save = false;
+        let mut cancel = false;
+        ui.group(|ui| {
+            ui.heading(format!("Insert row into {table_name}"));
+            if let Some(draft) = self.insert_draft.as_mut() {
+                for (field, column) in draft.fields.iter_mut().zip(info.columns.iter()) {
+                    Self::render_field(ui, field, column, true);
+                }
+            }
+            ui.horizontal(|ui| {
+                save = ui.button("Insert row").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if save { self.save_insert(); }
+        if cancel { self.insert_draft = None; }
+    }
+    fn render_edit_form(&mut self, ui: &mut egui::Ui) {
+        let Some(table_name) = self.edit_draft.as_ref().map(|draft| draft.table_name.clone()) else { return; };
+        let Some(info) = self.table_info(&table_name) else { return; };
+        let key_columns = info.indexes.iter().find(|index| index.unique)
+            .map(|index| index.columns.clone()).unwrap_or_default();
+        let mut save = false;
+        let mut cancel = false;
+        ui.group(|ui| {
+            ui.heading(format!("Edit row in {table_name}"));
+            ui.label("Primary/unique key fields are locked so the row can be identified safely.");
+            if let Some(draft) = self.edit_draft.as_mut() {
+                for (field, column) in draft.fields.iter_mut().zip(info.columns.iter()) {
+                    Self::render_field(ui, field, column, !key_columns.contains(&column.name));
+                }
+            }
+            ui.horizontal(|ui| {
+                save = ui.button("Save changes").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if save { self.save_edit(); }
+        if cancel { self.edit_draft = None; }
     }
 }
 
@@ -264,21 +567,51 @@ impl eframe::App for BrowserApp {
                         self.load_table_page(self.page_offset.saturating_add(PAGE_SIZE));
                     }
                     ui.label(format!("Rows {}–{} of {}", if shown == 0 {0} else {self.page_offset + 1}, self.page_offset + shown, total));
+                    if self.can_edit_selected_table() && ui.button("＋ Insert row").clicked() {
+                        self.begin_insert();
+                    }
                 });
+                if self.selected_table.as_ref().is_some_and(|name| !self.can_edit_selected_table()) {
+                    ui.weak("Row editing requires a UNIQUE index or PRIMARY KEY and simple SQL identifiers.");
+                }
             }
             ui.horizontal(|ui| {
                 if ui.button("Export CSV").clicked() { self.export_result("csv"); }
                 if ui.button("Export JSON").clicked() { self.export_result("json"); }
             });
-            if let Some(result) = &self.result {
+
+            self.render_insert_form(ui);
+            self.render_edit_form(ui);
+
+            if let Some(pending) = self.pending_delete.clone() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(160, 50, 50), format!("Delete a row from {}?", pending.table_name));
+                        if ui.button("Confirm delete").clicked() { self.confirm_delete(); }
+                        if ui.button("Cancel").clicked() { self.pending_delete = None; }
+                    });
+                });
+            }
+
+            if let Some(result) = self.result.clone() {
                 ui.label(format!("{} row(s) returned · {} affected", result.rows.len(), result.affected_rows));
+                let table_info = self.selected_table.as_ref().and_then(|name| self.table_info(name));
+                let show_actions = self.browsing_table && table_info.as_ref()
+                    .is_some_and(|table| table.indexes.iter().any(|index| index.unique)
+                        && valid_identifier(&table.name)
+                        && table.columns.iter().all(|column| valid_identifier(&column.name)));
                 if !result.columns.is_empty() {
                     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                         egui::Grid::new("result_grid").striped(true).show(ui, |ui| {
                             for column in &result.columns { ui.strong(column); }
+                            if show_actions { ui.strong("Actions"); }
                             ui.end_row();
                             for row in &result.rows {
                                 for value in &row.values { ui.label(value.to_string()); }
+                                if show_actions {
+                                    if ui.button("Edit").clicked() { self.begin_edit(row); }
+                                    if ui.button("Delete").clicked() { self.request_delete(row); }
+                                }
                                 ui.end_row();
                             }
                         });
