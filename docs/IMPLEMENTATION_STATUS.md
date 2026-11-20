@@ -247,8 +247,10 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Registry can prepare value updates/deletions and participates through its own stable coordinator ID.
 - [x] EF7 can prepare raw keyspace batches and typed chunk replacements/deletions; payload pages are synced before descriptor preparation and old extents are not released by the prepared path.
 - [x] Coordinator replays committed participants idempotently, syncs APPLIED, then removes each participant prepare marker; crash retry is covered for KV and EF7, with Registry value application covered by tests.
-- [ ] SQL still needs a durable participant adapter. Until SQL is enlisted, these adapters do not provide cross-domain atomicity for SQL + KV + Registry + EF7.
-- [ ] Durable abort acknowledgements/recovery and snapshot-aware reclamation remain pending.
+- [x] SQL, KV, Registry, and EF7 expose durable coordinator participant adapters; the coordinator verifies durable prepares, records a commit/abort decision, and persists APPLIED/FINALIZED/ROLLED_BACK acknowledgements.
+- [x] Server startup opens all four participants and replays committed/aborted coordinator decisions before binding its listener; PREPARING transactions block startup.
+- [x] Durable abort acknowledgements and idempotent abort recovery across prepared participants.
+- [ ] Snapshot-/reader-aware reclamation and crash recovery across every storage/allocator boundary remain pending.
 
 
 ## TLS, authentication, RBAC and JDBC baseline
@@ -260,7 +262,7 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [ ] Server-side prepared-statement protocol, streaming ResultSets, JDBC batch/generated keys/savepoints, and complete JDBC metadata remain pending.
 - [x] Durable password rotation with independent Argon2 salt/hash persistence.
 - [x] Durable authentication audit events are stored in the auth sidecar with monotonic sequence IDs, checksums, bounded page reads, and no password material.
-- [ ] Named roles, actor-attributed administrative audit identity, audit retention/export, mutual TLS, per-user rate/connection quotas, and schema/table-scoped grants remain pending.
+- [ ] Actor-attributed administrative audit identity, audit retention/export, mutual TLS, per-user rate/connection quotas, and schema/table-scoped grants remain pending.
 
 ## Vacuum and snapshots
 
