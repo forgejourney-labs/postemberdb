@@ -306,9 +306,12 @@ impl Database {
                 }
                 rows.push(Row { row_id, values });
             }
+            let persisted_row_count = rows.len();
             let mut table = Table {
                 columns,
                 rows,
+                persisted_row_count,
+                rows_loaded: true,
                 next_row_id,
                 row_positions,
                 indexes: BTreeMap::new(),
@@ -360,37 +363,30 @@ fn load_pdb6_database(path: &Path) -> Result<Option<(BTreeMap<String, Table>, u6
             data_type: column.data_type.clone(),
             nullable: column.nullable,
         }).collect::<Vec<_>>();
-        let mut table = Table {
-            columns,
-            rows: Vec::new(),
-            next_row_id: catalog.next_row_id,
-            row_positions: BTreeMap::new(),
-            indexes: BTreeMap::new(),
-        };
-
+        let mut persisted_row_count = 0usize;
         let mut after = None;
         loop {
             let row_ids = store.scan_row_ids(table_id, after, 5_000)?;
             if row_ids.is_empty() { break; }
             for row_id in &row_ids {
-                let payload = store.get_row_payload(table_id, *row_id)?
-                    .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for table {table_id}, row {row_id}")))?;
-                let values = sql_rows::SqlRowStore::decode_values(&payload, table.columns.len())?;
-                for (column, value) in table.columns.iter().zip(&values) {
-                    validate_value(column, value)?;
-                }
-                if *row_id == 0 || *row_id >= table.next_row_id {
+                if *row_id == 0 || *row_id >= catalog.next_row_id {
                     return Err(DbError::Storage("PDB6 row ID is outside the table allocator range".into()));
                 }
-                let position = table.rows.len();
-                if table.row_positions.insert(*row_id, position).is_some() {
-                    return Err(DbError::Storage("duplicate PDB6 row ID".into()));
-                }
-                table.rows.push(Row { row_id: *row_id, values });
             }
+            persisted_row_count = persisted_row_count.checked_add(row_ids.len())
+                .ok_or_else(|| DbError::Storage("PDB6 table row count overflow".into()))?;
             after = row_ids.last().copied();
             if row_ids.len() < 5_000 { break; }
         }
+        let mut table = Table {
+            columns,
+            rows: Vec::new(),
+            persisted_row_count,
+            rows_loaded: false,
+            next_row_id: catalog.next_row_id,
+            row_positions: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+        };
 
         for index in &catalog.indexes {
             let names = index.columns.iter().map(|ordinal| {
@@ -462,6 +458,32 @@ where
         }
         after = row_ids.last().copied();
         if row_ids.len() < batch_size { break; }
+    }
+    Ok(())
+}
+
+/// Loads row payloads only when a write/session needs a mutable table image.
+pub(super) fn hydrate_pdb6_rows(
+    path: &Path,
+    tables: &mut BTreeMap<String, Table>,
+) -> Result<(), DbError> {
+    for (table_name, table) in tables.iter_mut() {
+        if table.rows_loaded { continue; }
+        let mut rows = Vec::with_capacity(table.persisted_row_count);
+        scan_pdb6_table_rows(path, table_name, 512, |row| {
+            rows.push(row);
+            Ok(true)
+        })?;
+        if rows.len() != table.persisted_row_count {
+            return Err(DbError::Storage(format!(
+                "PDB6 table {table_name} row count changed during hydration: expected {}, found {}",
+                table.persisted_row_count, rows.len()
+            )));
+        }
+        table.rows = rows;
+        table.rebuild_row_positions();
+        table.rebuild_indexes();
+        table.rows_loaded = true;
     }
     Ok(())
 }

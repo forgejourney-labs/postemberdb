@@ -216,6 +216,10 @@ struct Index {
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Row>,
+    /// Durable row count retained when the PDB6 row cache is not resident.
+    persisted_row_count: usize,
+    /// False means row payloads must be fetched from PDB6 before a write transaction.
+    rows_loaded: bool,
     next_row_id: u64,
     row_positions: BTreeMap<u64, usize>,
     indexes: BTreeMap<String, Index>,
@@ -660,6 +664,25 @@ impl Database {
         Registry::open(PathBuf::from(path))
     }
 
+    fn hydrate_pdb6_rows(&mut self) -> Result<(), DbError> {
+        if !self.pdb6_mode { return Ok(()); }
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no storage path".into()))?;
+        storage::hydrate_pdb6_rows(path, &mut self.tables)
+    }
+
+    fn evict_pdb6_row_cache(&mut self) {
+        if !self.pdb6_mode { return; }
+        for table in self.tables.values_mut() {
+            table.rows.clear();
+            table.row_positions.clear();
+            table.rows_loaded = false;
+            for index in table.indexes.values_mut() {
+                index.entries.clear();
+            }
+        }
+    }
+
     fn append_ember_journal(&mut self, deltas: Option<Vec<EmberIndexDelta>>) {
         match deltas {
             Some(mut deltas) => self.ember_index_journal.append(&mut deltas),
@@ -669,6 +692,9 @@ impl Database {
 
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        if let Some(error) = &self.initialization_error {
+            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
+        }
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE")
             || starts_with_kw(statement, "CREATE INDEX")
@@ -709,21 +735,24 @@ impl Database {
 
     /// Start an owned optimistic session for a client connection.
     pub fn begin_session(&self) -> DatabaseSession {
+        let mut staged = Database {
+            tables: self.tables.clone(),
+            storage_path: self.storage_path.clone(),
+            wal_path: None,
+            _lock_file: None,
+            wal_sequence: self.wal_sequence,
+            revision: self.revision,
+            pdb6_mode: self.pdb6_mode,
+            ember_indexes_valid: false,
+            ember_index_journal: Vec::new(),
+            ember_journal_supported: true,
+        };
+        let initialization_error = staged.hydrate_pdb6_rows().err().map(|error| error.to_string());
         DatabaseSession {
             base_revision: self.revision,
-            staged: Database {
-                tables: self.tables.clone(),
-                storage_path: None,
-                wal_path: None,
-                _lock_file: None,
-                wal_sequence: self.wal_sequence,
-                revision: self.revision,
-                pdb6_mode: false,
-                ember_indexes_valid: false,
-                ember_index_journal: Vec::new(),
-                ember_journal_supported: true,
-            },
+            staged,
             statements: Vec::new(),
+            initialization_error,
         }
     }
 
@@ -768,6 +797,7 @@ impl Database {
         if !self.pdb6_mode {
             return Err(DbError::Constraint("SQL coordinator participation requires PDB6".into()));
         }
+        self.hydrate_pdb6_rows()?;
         let path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
         let (already_committed, encoded) = {
@@ -791,6 +821,7 @@ impl Database {
         self.tables = session.staged.tables;
         self.revision = self.revision.wrapping_add(1);
         self.ember_indexes_valid = false;
+        self.evict_pdb6_row_cache();
         Ok(())
     }
 
@@ -817,10 +848,14 @@ impl Database {
 
     /// Commit a previously staged session if no other writer changed the database.
     pub fn commit_session(&mut self, session: DatabaseSession) -> Result<(), DbError> {
+        if let Some(error) = session.initialization_error {
+            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
+        }
         if session.base_revision != self.revision {
             return Err(DbError::TransactionConflict);
         }
         if session.statements.is_empty() { return Ok(()); }
+        self.hydrate_pdb6_rows()?;
         if self.pdb6_mode {
             self.ensure_no_prepared_sql_transactions()?;
             let path = self.storage_path.as_deref()
@@ -848,6 +883,8 @@ impl Database {
                     previous_mirror_valid,
                 )
                 .unwrap_or(false);
+        } else {
+            self.evict_pdb6_row_cache();
         }
         Ok(())
     }
@@ -858,6 +895,7 @@ impl Database {
     where
         F: FnOnce(&mut Transaction<'_>) -> Result<T, DbError>,
     {
+        self.hydrate_pdb6_rows()?;
         let staged = Database {
             tables: self.tables.clone(),
             storage_path: None,
@@ -975,6 +1013,8 @@ impl Database {
         let mut table = Table {
             columns,
             rows: Vec::new(),
+            persisted_row_count: 0,
+            rows_loaded: true,
             next_row_id: 1,
             row_positions: BTreeMap::new(),
             indexes: BTreeMap::new(),
@@ -1082,6 +1122,7 @@ impl Database {
         table.next_row_id = table.next_row_id.checked_add(1)
             .ok_or_else(|| DbError::Storage("table row identifier space exhausted".into()))?;
         table.rows.push(Row { row_id, values });
+        table.persisted_row_count = table.rows.len();
         let row_index = table.rows.len() - 1;
         table.row_positions.insert(row_id, row_index);
         table.index_row(row_index);
@@ -1165,6 +1206,7 @@ impl Database {
                 .filter_map(|(index, row)| (!matches.contains(&index)).then_some(row))
                 .collect::<Vec<_>>();
             table.rows = retained;
+            table.persisted_row_count = table.rows.len();
             table.rebuild_row_positions();
             let removed = before - table.rows.len();
             let deltas = build_rows_index_deltas(&table_name, table, &old_rows, None, false)?;
@@ -1402,6 +1444,7 @@ pub struct DatabaseSession {
     base_revision: u64,
     staged: Database,
     statements: Vec<String>,
+    initialization_error: Option<String>,
 }
 
 impl DatabaseSession {
@@ -1486,6 +1529,8 @@ impl Transaction<'_> {
                     previous_mirror_valid,
                 )
                 .unwrap_or(false);
+        } else {
+            self.database.evict_pdb6_row_cache();
         }
         Ok(())
     }
