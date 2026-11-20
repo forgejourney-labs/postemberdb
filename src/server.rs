@@ -295,7 +295,7 @@ fn handle_client<S: Read + Write>(
                     Ok(mut store) => store.current_principal(&original.username),
                     Err(_) => {
                         let response = if jsonl_mode { json_error("authentication service lock poisoned") }
-                            else { "ERROR authentication service lock poisoned\\n".to_owned() };
+                            else { "ERROR authentication service lock poisoned\n".to_owned() };
                         reader.get_mut().write_all(response.as_bytes())?;
                         reader.get_mut().flush()?;
                         continue;
@@ -305,7 +305,7 @@ fn handle_client<S: Read + Write>(
                     Ok(current) => principal = current,
                     Err(error) => {
                         let response = if jsonl_mode { json_error(&error.to_string()) }
-                            else { format!("ERROR {error}\\n") };
+                            else { format!("ERROR {error}\n") };
                         reader.get_mut().write_all(response.as_bytes())?;
                         reader.get_mut().flush()?;
                         continue;
@@ -313,7 +313,7 @@ fn handle_client<S: Read + Write>(
                 }
             } else if principal.is_some() {
                 let response = if jsonl_mode { json_error("authentication service unavailable") }
-                    else { "ERROR authentication service unavailable\\n".to_owned() };
+                    else { "ERROR authentication service unavailable\n".to_owned() };
                 reader.get_mut().write_all(response.as_bytes())?;
                 reader.get_mut().flush()?;
                 continue;
