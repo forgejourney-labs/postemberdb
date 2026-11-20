@@ -133,7 +133,7 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 - [x] KSL bridge independently validates loopback destinations and refuses remote database hosts.
 - [x] Bounded client count, SQL line size, UTF-8 input, and socket timeouts.
 - [x] CLI recovery check and WAL checkpoint commands.
-- [x] Argon2id user authentication, persisted permission bitsets, enabled/disabled users, password rotation, and durable checksummed audit events for login outcomes and user administration; user mutations and their audit records share one atomic page-tree batch.
+- [x] Argon2id user authentication, persisted permission bitsets, enabled/disabled users, password rotation, named roles with durable membership and permission inheritance, and checksummed audit events for login outcomes and user/role administration; user/role mutations and their audit records share one atomic page-tree batch.
 - [ ] Named roles and role membership, actor-attributed administrative authorization, audit retention/export policy, and audit tamper-evidence beyond per-record checksums.
 - [ ] Mutual TLS and per-user rate/connection quotas.
 - [ ] Encryption at rest and managed key rotation.
