@@ -6,10 +6,13 @@ use rand_core::OsRng;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_PREFIX: &[u8] = b"AUTH/USER/";
+const ROLE_PREFIX: &[u8] = b"AUTH/ROLE/";
+const MEMBERSHIP_PREFIX: &[u8] = b"AUTH/MEMBER/";
 const AUDIT_COUNTER_KEY: &[u8] = b"AUTH/AUDIT/NEXT";
 const AUDIT_EVENT_PREFIX: &[u8] = b"AUTH/AUDIT/EVENT/";
 const RECORD_MAGIC: &[u8; 4] = b"PAU1";
 const AUDIT_MAGIC: &[u8; 4] = b"PAE1";
+const ROLE_MAGIC: &[u8; 4] = b"PAR1";
 const MAX_AUDIT_FIELD_BYTES: usize = 256;
 const MAX_AUDIT_PAGE_SIZE: usize = 10_000;
 const MAX_USERNAME_BYTES: usize = 64;
@@ -55,6 +58,8 @@ impl Permissions {
     }
 
     pub const fn bits(self) -> u32 { self.0 }
+
+    const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
 
     pub const fn allows(self, permission: Permission) -> bool {
         self.0 & Permission::Admin.mask() != 0 || self.0 & permission.mask() != 0
@@ -148,6 +153,31 @@ impl AuditEvent {
         let action = read_field(action_len)?;
         let subject = read_field(subject_len)?;
         Ok(Self { sequence, timestamp_unix_ms, actor, action, subject, succeeded: bytes[5] == 1 })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoleRecord {
+    permissions: Permissions,
+}
+
+impl RoleRecord {
+    fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(13);
+        out.extend_from_slice(ROLE_MAGIC);
+        out.push(1);
+        out.extend_from_slice(&self.permissions.bits().to_le_bytes());
+        let checksum = crc32(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        if bytes.len() != 13 || &bytes[..4] != ROLE_MAGIC || bytes[4] != 1
+            || u32::from_le_bytes(bytes[9..13].try_into().unwrap()) != crc32(&bytes[..9]) {
+            return Err(DbError::Storage("corrupt authentication role record".into()));
+        }
+        Ok(Self { permissions: Permissions::from_bits(u32::from_le_bytes(bytes[5..9].try_into().unwrap()))? })
     }
 }
 
@@ -311,8 +341,14 @@ impl AuthStore {
             self.commit_audited_mutation(&[], &[], username, "auth.login", username, false)?;
             return Ok(None);
         }
+        let mut effective_permissions = record.permissions;
+        for role in self.list_user_roles(username)? {
+            let bytes = self.users.get(&role_key(&role)?)?
+                .ok_or_else(|| DbError::Storage(format!("assigned authentication role '{role}' is missing")))?;
+            effective_permissions = effective_permissions.union(RoleRecord::decode(&bytes)?.permissions);
+        }
         self.commit_audited_mutation(&[], &[], username, "auth.login", username, true)?;
-        Ok(Some(Principal { username: username.to_ascii_lowercase(), permissions: record.permissions }))
+        Ok(Some(Principal { username: username.to_ascii_lowercase(), permissions: effective_permissions }))
     }
 
     /// Replace a user's password hash without exposing or returning password material.
@@ -356,6 +392,83 @@ impl AuthStore {
         Ok(true)
     }
 
+    /// Creates or replaces a named role with the supplied permission set.
+    pub fn create_role(&mut self, name: &str, permissions: Permissions) -> Result<(), DbError> {
+        let key = role_key(name)?;
+        self.commit_audited_mutation(
+            &[], &[(key, RoleRecord { permissions }.encode())],
+            "local-api", "role.create", name, true,
+        )
+    }
+
+    /// Replaces the permissions granted by a role. Existing memberships take
+    /// effect immediately on the next authentication.
+    pub fn set_role_permissions(&mut self, name: &str, permissions: Permissions) -> Result<(), DbError> {
+        let key = role_key(name)?;
+        if self.users.get(&key)?.is_none() {
+            return Err(DbError::Constraint("role does not exist".into()));
+        }
+        self.commit_audited_mutation(
+            &[], &[(key, RoleRecord { permissions }.encode())],
+            "local-api", "role.permissions.change", name, true,
+        )
+    }
+
+    /// Assigns an existing role to an existing user.
+    pub fn assign_role(&mut self, username: &str, role: &str) -> Result<(), DbError> {
+        let user = user_key(username)?;
+        let role_key_value = role_key(role)?;
+        if self.users.get(&user)?.is_none() {
+            return Err(DbError::Constraint("user does not exist".into()));
+        }
+        if self.users.get(&role_key_value)?.is_none() {
+            return Err(DbError::Constraint("role does not exist".into()));
+        }
+        let key = membership_key(username, role)?;
+        if self.users.get(&key)?.is_some() {
+            return Err(DbError::Constraint("role is already assigned to user".into()));
+        }
+        self.commit_audited_mutation(
+            &[], &[(key, vec![1])], "local-api", "role.assign",
+            &format!("{username}:{role}"), true,
+        )
+    }
+
+    /// Removes an existing user/role membership.
+    pub fn revoke_role(&mut self, username: &str, role: &str) -> Result<bool, DbError> {
+        let key = membership_key(username, role)?;
+        if self.users.get(&key)?.is_none() { return Ok(false); }
+        self.commit_audited_mutation(
+            &[key], &[], "local-api", "role.revoke",
+            &format!("{username}:{role}"), true,
+        )?;
+        Ok(true)
+    }
+
+    pub fn list_roles(&mut self) -> Result<Vec<String>, DbError> {
+        let entries = self.users.scan_prefix(ROLE_PREFIX, None)?;
+        entries.into_iter().map(|(key, value)| {
+            let name = String::from_utf8(key[ROLE_PREFIX.len()..].to_vec())
+                .map_err(|_| DbError::Storage("authentication role name is invalid UTF-8".into()))?;
+            RoleRecord::decode(&value)?;
+            Ok(name)
+        }).collect()
+    }
+
+    pub fn list_user_roles(&mut self, username: &str) -> Result<Vec<String>, DbError> {
+        let mut prefix = MEMBERSHIP_PREFIX.to_vec();
+        prefix.extend_from_slice(user_key(username)?[USER_PREFIX.len()..].as_ref());
+        prefix.push(b'/');
+        let entries = self.users.scan_prefix(&prefix, None)?;
+        entries.into_iter().map(|(key, value)| {
+            if value != [1] {
+                return Err(DbError::Storage("invalid authentication role membership record".into()));
+            }
+            String::from_utf8(key[prefix.len()..].to_vec())
+                .map_err(|_| DbError::Storage("authentication role membership name is invalid UTF-8".into()))
+        }).collect()
+    }
+
     pub fn list_users(&mut self) -> Result<Vec<String>, DbError> {
         let entries = self.users.scan_prefix(USER_PREFIX, None)?;
         entries.into_iter().map(|(key, _)| {
@@ -363,6 +476,31 @@ impl AuthStore {
                 .map_err(|_| DbError::Storage("authentication username key is invalid UTF-8".into()))
         }).collect()
     }
+}
+
+fn role_key(name: &str) -> Result<Vec<u8>, DbError> {
+    let identifier = normalized_identifier(name)?;
+    let mut key = ROLE_PREFIX.to_vec();
+    key.extend_from_slice(&identifier);
+    Ok(key)
+}
+
+fn membership_key(username: &str, role: &str) -> Result<Vec<u8>, DbError> {
+    let user = normalized_identifier(username)?;
+    let role = normalized_identifier(role)?;
+    let mut key = MEMBERSHIP_PREFIX.to_vec();
+    key.extend_from_slice(&user);
+    key.push(b'/');
+    key.extend_from_slice(&role);
+    Ok(key)
+}
+
+fn normalized_identifier(value: &str) -> Result<Vec<u8>, DbError> {
+    if value.is_empty() || value.len() > MAX_USERNAME_BYTES || !value.is_ascii()
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-@".contains(&byte)) {
+        return Err(DbError::Constraint("identifier must be 1..=64 ASCII letters, digits, '.', '_', '-' or '@'".into()));
+    }
+    Ok(value.to_ascii_lowercase().into_bytes())
 }
 
 fn audit_event_key(sequence: u64) -> Vec<u8> {
@@ -453,6 +591,37 @@ mod tests {
             }).flatten().copied().collect::<Vec<_>>();
             assert!(!encoded.windows(b"correct horse battery staple".len())
                 .any(|window| window == b"correct horse battery staple"));
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn named_roles_grant_and_revoke_permissions_durably() {
+        let path = path();
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            auth.create_user("role-user", "correct horse battery staple", Permissions::NONE).unwrap();
+            auth.create_role("builders", Permissions::READ_WRITE).unwrap();
+            auth.assign_role("role-user", "builders").unwrap();
+            let principal = auth.authenticate("role-user", "correct horse battery staple").unwrap().unwrap();
+            assert!(principal.allows(Permission::SqlWrite));
+            assert_eq!(auth.list_user_roles("role-user").unwrap(), vec!["builders"]);
+            auth.set_role_permissions("builders", Permissions::READ_ONLY).unwrap();
+            let principal = auth.authenticate("role-user", "correct horse battery staple").unwrap().unwrap();
+            assert!(principal.allows(Permission::SqlRead));
+            assert!(!principal.allows(Permission::SqlWrite));
+            assert!(auth.revoke_role("role-user", "builders").unwrap());
+            let principal = auth.authenticate("role-user", "correct horse battery staple").unwrap().unwrap();
+            assert!(!principal.allows(Permission::SqlRead));
+        }
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            assert_eq!(auth.list_roles().unwrap(), vec!["builders"]);
+            assert!(auth.list_user_roles("role-user").unwrap().is_empty());
+            assert!(auth.audit_events(0, 100).unwrap().iter().any(|event| event.action == "role.assign"));
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal"] {
             let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
