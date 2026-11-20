@@ -20,6 +20,8 @@ button.danger{padding:5px 9px;border:1px solid #b56d6d;background:#fff7f7;color:
 .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.detail-grid h3{font-size:13px;margin:3px 0 8px}.detail-list{margin:0;padding:0;list-style:none}.detail-list li{padding:6px 8px;border-bottom:1px solid #edf0f2}
 .toolbar{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}.field-grid{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:10px}.field{display:flex;flex-direction:column;gap:4px}.field label{font-weight:bold;color:#465767}.field input,.field select{padding:7px;border:1px solid #aeb8c2;background:#fff;font:inherit;min-width:0}.null-control{display:flex;gap:6px;align-items:center;color:#647586;font-weight:normal!important}
 .pager{display:flex;align-items:center;gap:9px;margin:9px 0;color:#536575}.inline-editor{border:1px solid #ccd4db;background:#fafbfc;padding:12px;margin-top:12px}.inline-editor h3{margin-top:0}
+.connection-grid{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:10px}.connection-field{display:flex;flex-direction:column;gap:4px}.connection-field label{font-weight:bold;color:#465767}.connection-field input,.connection-field select{padding:7px;border:1px solid #aeb8c2;background:#fff;font:inherit;min-width:0}.admin-tabs{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:12px}.admin-output{overflow:auto;margin-top:10px}.admin-form{border:1px solid #d5dbe0;background:#fafbfc;padding:12px;margin:10px 0}.admin-form h3{margin:0 0 10px;font-size:13px}.status-chip{display:inline-block;padding:3px 7px;background:#e9eef2;border:1px solid #d5dbe0;color:#536575;margin:4px 0}
+
 @media(max-width:760px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7;max-height:270px}.summary{grid-template-columns:1fr}.detail-grid,.field-grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -37,6 +39,36 @@ button.danger{padding:5px 9px;border:1px solid #b56d6d;background:#fff7f7;color:
 </aside>
 <main>
   <div class="breadcrumbs" id="breadcrumbs">Home » Overview</div>
+  <section class="panel" id="remote-panel">
+    <h2>Remote server connection · TLS</h2>
+    <div class="panel-body">
+      <div class="connection-grid">
+        <div class="connection-field"><label for="remote-address">Server address</label><input id="remote-address" value="127.0.0.1:7432" autocomplete="off"></div>
+        <div class="connection-field"><label for="remote-server-name">TLS certificate name</label><input id="remote-server-name" value="localhost" autocomplete="off"></div>
+        <div class="connection-field"><label for="remote-ca">Trusted CA PEM path</label><input id="remote-ca" value="server-ca.pem" autocomplete="off"></div>
+        <div class="connection-field"><label for="remote-user">Username</label><input id="remote-user" autocomplete="username"></div>
+        <div class="connection-field"><label for="remote-password">Password</label><input id="remote-password" type="password" autocomplete="current-password"></div>
+      </div>
+      <div class="toolbar">
+        <button class="action" id="remote-connect">Connect securely</button>
+        <button class="secondary" id="remote-disconnect" disabled>Disconnect</button>
+        <span class="muted" id="remote-state">Using the local embedded database</span>
+      </div>
+    </div>
+  </section>
+  <section class="panel" id="admin-panel" hidden>
+    <h2>Remote administration</h2>
+    <div class="panel-body">
+      <div class="admin-tabs">
+        <button class="secondary" data-admin-view="status">Server status</button>
+        <button class="secondary" data-admin-view="users">Users</button>
+        <button class="secondary" data-admin-view="roles">Roles</button>
+        <button class="secondary" data-admin-view="audit">Audit log</button>
+      </div>
+      <div id="admin-output"><span class="muted">Connect to a remote server, then choose an administration view. The server enforces the Admin permission.</span></div>
+    </div>
+  </section>
+
   <section class="panel" id="overview-panel">
     <h2>Database overview</h2>
     <div class="panel-body">
@@ -269,6 +301,191 @@ function exportRows(format){
   downloadFile(currentRows.table+'.page-'+page+'.csv','text/csv;charset=utf-8','\uFEFF'+lines.join('\r\n'));
  }
 }
+async function adminRequest(action,fields={}){
+ const response=await requestJson('/api/admin',{
+  method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...fields})
+ });
+ if(response.ok===false)throw new Error(response.error||'Administrative request failed');
+ return response.result??response;
+}
+function permissionSelect(id,value){
+ const select=document.createElement('select');select.id=id;
+ [['21','Read only'],['63','Read / write'],['2147483648','Administrator']].forEach(([bits,label])=>{
+  const option=document.createElement('option');option.value=bits;option.textContent=label;
+  if(String(value)===bits)option.selected=true;
+  select.append(option);
+ });
+ return select;
+}
+function showAdminMessage(message){
+ const output=document.getElementById('admin-output');output.replaceChildren(textNode('div',message,'muted'));
+}
+async function loadServerStatus(){
+ const status=await requestJson('/api/server/status');
+ const output=document.getElementById('admin-output');output.replaceChildren();
+ const table=document.createElement('table'),body=document.createElement('tbody');
+ for(const [key,value] of Object.entries(status)){
+  const row=document.createElement('tr');row.append(textNode('th',key),textNode('td',String(value)));body.append(row);
+ }
+ table.append(body);output.append(table);
+}
+async function loadUsers(){
+ const data=await adminRequest('users.list');
+ const output=document.getElementById('admin-output');output.replaceChildren();
+ const form=document.createElement('div');form.className='admin-form';
+ form.append(textNode('h3','Create user'));
+ const fields=document.createElement('div');fields.className='connection-grid';
+ const username=document.createElement('input');username.id='new-admin-username';username.placeholder='Username';
+ const password=document.createElement('input');password.id='new-admin-password';password.type='password';password.placeholder='Initial password (12+ characters)';
+ const permissions=permissionSelect('new-admin-permissions','21');
+ const labels=[['Username',username],['Initial password',password],['Direct permissions',permissions]];
+ for(const [label,control] of labels){const cell=document.createElement('div');cell.className='connection-field';cell.append(textNode('label',label));cell.append(control);fields.append(cell);}
+ form.append(fields);
+ const create=textNode('button','Create user','action');create.type='button';
+ create.addEventListener('click',async()=>{
+  try{
+   await adminRequest('users.create',{username:username.value,password:password.value,permissions:Number(permissions.value)});
+   password.value='';statusNode.textContent='User created';await loadUsers();
+  }catch(error){statusNode.textContent='Create user failed: '+error.message;}
+ });
+ form.append(create);output.append(form);
+ const table=document.createElement('table'),head=document.createElement('thead'),tr=document.createElement('tr'),body=document.createElement('tbody');
+ ['Username','Enabled','Permissions','Roles','Actions'].forEach(v=>tr.append(textNode('th',v)));head.append(tr);
+ for(const user of data.users||[]){
+  const row=document.createElement('tr');
+  row.append(textNode('td',user.username),textNode('td',user.enabled?'Yes':'No'),textNode('td',String(user.permissions)),textNode('td',(user.roles||[]).join(', ')||'—'));
+  const actions=document.createElement('td');
+  const toggle=textNode('button',user.enabled?'Disable':'Enable','secondary');toggle.type='button';
+  toggle.addEventListener('click',async()=>{
+   try{await adminRequest('users.enabled',{username:user.username,enabled:!user.enabled});await loadUsers();}
+   catch(error){statusNode.textContent=error.message;}
+  });
+  const setPermissions=permissionSelect('permissions-'+user.username,user.permissions);
+  const update=textNode('button','Apply rights','secondary');update.type='button';
+  update.addEventListener('click',async()=>{
+   try{await adminRequest('users.permissions',{username:user.username,permissions:Number(setPermissions.value)});await loadUsers();}
+   catch(error){statusNode.textContent=error.message;}
+  });
+  const remove=textNode('button','Delete','danger');remove.type='button';
+  remove.addEventListener('click',async()=>{
+   if(!window.confirm('Delete user '+user.username+' and revoke all role memberships?'))return;
+   try{await adminRequest('users.delete',{username:user.username});await loadUsers();}
+   catch(error){statusNode.textContent=error.message;}
+  });
+  actions.append(toggle,document.createTextNode(' '),setPermissions,document.createTextNode(' '),update,document.createTextNode(' '),remove);
+  row.append(actions);body.append(row);
+ }
+ table.append(head,body);output.append(table);
+}
+async function loadRoles(){
+ const data=await adminRequest('roles.list');
+ const output=document.getElementById('admin-output');output.replaceChildren();
+ const form=document.createElement('div');form.className='admin-form';form.append(textNode('h3','Create or replace role'));
+ const fields=document.createElement('div');fields.className='connection-grid';
+ const name=document.createElement('input');name.placeholder='Role name';
+ const permissions=permissionSelect('new-role-permissions','21');
+ const nameWrap=document.createElement('div');nameWrap.className='connection-field';nameWrap.append(textNode('label','Role name'),name);
+ const permWrap=document.createElement('div');permWrap.className='connection-field';permWrap.append(textNode('label','Permissions'),permissions);
+ fields.append(nameWrap,permWrap);form.append(fields);
+ const create=textNode('button','Save role','action');create.type='button';
+ create.addEventListener('click',async()=>{
+  try{await adminRequest('roles.create',{name:name.value,permissions:Number(permissions.value)});await loadRoles();}
+  catch(error){statusNode.textContent=error.message;}
+ });
+ form.append(create);output.append(form);
+ const assign=document.createElement('div');assign.className='admin-form';assign.append(textNode('h3','Assign role to user'));
+ const userInput=document.createElement('input');userInput.placeholder='Username';
+ const roleInput=document.createElement('input');roleInput.placeholder='Role name';
+ const assignButton=textNode('button','Assign','secondary');assignButton.type='button';
+ assignButton.addEventListener('click',async()=>{
+  try{await adminRequest('roles.assign',{username:userInput.value,role:roleInput.value});await loadRoles();}
+  catch(error){statusNode.textContent=error.message;}
+ });
+ assign.append(userInput,document.createTextNode(' '),roleInput,document.createTextNode(' '),assignButton);output.append(assign);
+ const table=document.createElement('table'),head=document.createElement('thead'),row=document.createElement('tr'),body=document.createElement('tbody');
+ ['Role','Permissions','Actions'].forEach(v=>row.append(textNode('th',v)));head.append(row);
+ for(const role of data.roles||[]){
+  const line=document.createElement('tr');line.append(textNode('td',role.name),textNode('td',String(role.permissions)));
+  const actions=document.createElement('td');
+  const rights=permissionSelect('role-rights-'+role.name,role.permissions);
+  const update=textNode('button','Apply','secondary');update.type='button';
+  update.addEventListener('click',async()=>{
+   try{await adminRequest('roles.permissions',{name:role.name,permissions:Number(rights.value)});await loadRoles();}
+   catch(error){statusNode.textContent=error.message;}
+  });
+  const remove=textNode('button','Delete','danger');remove.type='button';
+  remove.addEventListener('click',async()=>{
+   if(!window.confirm('Delete role '+role.name+' and revoke all memberships?'))return;
+   try{await adminRequest('roles.delete',{name:role.name});await loadRoles();}
+   catch(error){statusNode.textContent=error.message;}
+  });
+  actions.append(rights,document.createTextNode(' '),update,document.createTextNode(' '),remove);line.append(actions);body.append(line);
+ }
+ table.append(head,body);output.append(table);
+}
+async function loadAudit(){
+ const data=await adminRequest('audit.list',{after_sequence:0,limit:200});
+ const output=document.getElementById('admin-output');output.replaceChildren();
+ const events=data.events||[];
+ const table=document.createElement('table'),head=document.createElement('thead'),header=document.createElement('tr'),body=document.createElement('tbody');
+ ['Sequence','Time','Actor','Action','Subject','Success'].forEach(value=>header.append(textNode('th',value)));
+ head.append(header);
+ for(const event of events){
+  const row=document.createElement('tr');
+  row.append(textNode('td',String(event.sequence)),
+   textNode('td',new Date(event.timestamp_unix_ms).toLocaleString()),
+   textNode('td',event.actor),textNode('td',event.action),textNode('td',event.subject),
+   textNode('td',event.succeeded?'Yes':'No'));
+  body.append(row);
+ }
+ table.append(head,body);output.append(table);
+}
+async function showAdminView(view){
+ try{
+  statusNode.textContent='Loading '+view+'…';
+  if(view==='status')await loadServerStatus();
+  else if(view==='users')await loadUsers();
+  else if(view==='roles')await loadRoles();
+  else if(view==='audit')await loadAudit();
+  statusNode.textContent='Administration: '+view;
+ }catch(error){
+  showAdminMessage('Could not load '+view+': '+error.message);
+  statusNode.textContent='Administration failed: '+error.message;
+ }
+}
+async function connectRemote(){
+ statusNode.textContent='Connecting to remote server with verified TLS…';
+ try{
+  const result=await requestJson('/api/remote/connect',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    address:document.getElementById('remote-address').value,
+    server_name:document.getElementById('remote-server-name').value,
+    ca_bundle_path:document.getElementById('remote-ca').value,
+    username:document.getElementById('remote-user').value,
+    password:document.getElementById('remote-password').value
+   })
+  });
+  document.getElementById('remote-password').value='';
+  document.getElementById('remote-state').textContent='Connected over verified TLS as '+result.username;
+  document.getElementById('remote-disconnect').disabled=false;
+  document.getElementById('admin-panel').hidden=false;
+  await loadCatalog();
+  statusNode.textContent='Remote TLS connection established';
+ }catch(error){statusNode.textContent='Remote connection failed: '+error.message;}
+}
+async function disconnectRemote(){
+ try{
+  await requestJson('/api/remote/disconnect',{method:'POST'});
+  document.getElementById('remote-state').textContent='Using the local embedded database';
+  document.getElementById('remote-disconnect').disabled=true;
+  document.getElementById('admin-panel').hidden=true;
+  document.getElementById('admin-output').replaceChildren(textNode('span','Connect to a remote server to open remote administration.','muted'));
+  await loadCatalog();
+  statusNode.textContent='Remote session disconnected';
+ }catch(error){statusNode.textContent='Disconnect failed: '+error.message;}
+}
+
 async function runSQL(){
  statusNode.textContent='Executing…';resultsNode.replaceChildren();
  try{
@@ -278,6 +495,11 @@ async function runSQL(){
  }catch(error){statusNode.textContent='Query failed: '+error.message;}
 }
 document.getElementById('run').addEventListener('click',runSQL);
+document.getElementById('remote-connect').addEventListener('click',connectRemote);
+document.getElementById('remote-disconnect').addEventListener('click',disconnectRemote);
+document.querySelectorAll('[data-admin-view]').forEach(button=>{
+ button.addEventListener('click',()=>showAdminView(button.dataset.adminView));
+});
 document.getElementById('refresh-catalog').addEventListener('click',async()=>{try{await loadCatalog();statusNode.textContent='Catalog refreshed';}catch(error){statusNode.textContent='Catalog refresh failed: '+error.message;}});
 document.getElementById('overview-link').addEventListener('click',showOverview);
 document.getElementById('browse-rows').addEventListener('click',()=>loadRows(0).catch(error=>{statusNode.textContent='Could not load rows: '+error.message;}));
