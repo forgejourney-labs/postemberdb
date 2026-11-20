@@ -289,8 +289,38 @@ fn handle_client<S: Read + Write>(
             reader.get_mut().flush()?;
             continue;
         }
+        if auth_required {
+            if let (Some(original), Some(store)) = (principal.as_ref(), auth.as_ref()) {
+                let refreshed = match store.lock() {
+                    Ok(mut store) => store.current_principal(&original.username),
+                    Err(_) => {
+                        let response = if jsonl_mode { json_error("authentication service lock poisoned") }
+                            else { "ERROR authentication service lock poisoned\\n".to_owned() };
+                        reader.get_mut().write_all(response.as_bytes())?;
+                        reader.get_mut().flush()?;
+                        continue;
+                    }
+                };
+                match refreshed {
+                    Ok(current) => principal = current,
+                    Err(error) => {
+                        let response = if jsonl_mode { json_error(&error.to_string()) }
+                            else { format!("ERROR {error}\\n") };
+                        reader.get_mut().write_all(response.as_bytes())?;
+                        reader.get_mut().flush()?;
+                        continue;
+                    }
+                }
+            } else if principal.is_some() {
+                let response = if jsonl_mode { json_error("authentication service unavailable") }
+                    else { "ERROR authentication service unavailable\\n".to_owned() };
+                reader.get_mut().write_all(response.as_bytes())?;
+                reader.get_mut().flush()?;
+                continue;
+            }
+        }
         if auth_required && principal.is_none() {
-            let response = if jsonl_mode { json_error("authentication required") } else { "ERROR authentication required\n".to_owned() };
+            let response = if jsonl_mode { json_error("authentication required") } else { "ERROR authentication required\\n".to_owned() };
             reader.get_mut().write_all(response.as_bytes())?;
             reader.get_mut().flush()?;
             continue;
@@ -559,7 +589,7 @@ fn handle_binary_client<S: Read + Write>(
         } else {
             principal.clone()
         };
-        let principal = current_principal.as_ref();
+        let principal = current_principal;
         let response = match frame.kind {
             FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
             FrameKind::Catalog => {
