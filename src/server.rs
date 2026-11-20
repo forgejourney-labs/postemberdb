@@ -528,7 +528,7 @@ fn handle_binary_client<S: Read + Write>(
             FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
             FrameKind::Catalog => {
                 let permission = principal.as_ref().map(|value| value.require(Permission::SqlRead))
-                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                    .unwrap_or_else(|| if auth_required { Err(postemberdb::DbError::Constraint("authentication required".into())) } else { Ok(()) });
                 match permission {
                     Err(error) => binary_error(request_id, &error.to_string()),
                     Ok(()) => match database.lock() {
@@ -1283,7 +1283,11 @@ mod tests {
         let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            super::handle_client(stream, database, ef7, None, false).unwrap();
+            super::handle_client(
+            stream, database, ef7, None, false,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            std::time::Instant::now(),
+        ).unwrap();
         });
 
         let mut client = TcpStream::connect(address).unwrap();
