@@ -37,7 +37,7 @@ enum MetadataFailpoint {
 #[cfg(test)]
 std::thread_local! {
     static METADATA_FAILPOINT: std::cell::Cell<Option<MetadataFailpoint>> =
-        const { std::cell::Cell::new(None) };
+        std::cell::Cell::new(None)
 }
 
 #[cfg(test)]
