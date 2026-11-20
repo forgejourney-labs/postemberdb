@@ -522,7 +522,7 @@ pub(crate) fn recover(store: &mut ExtentFile, wal_path: &Path) -> Result<(), DbE
     for (page_id, payload) in pages {
         store.write_page(page_id, &payload)?;
     }
-    store.publish_root(Some(root_page_id))?;
+    store.publish_root((root_page_id != EMPTY_ROOT).then_some(root_page_id))?;
     validate_tree(store)?;
     file.set_len(0).map_err(storage_error)?;
     file.sync_all().map_err(storage_error)?;
@@ -1074,6 +1074,29 @@ mod tests {
             fs::remove_file(&path).unwrap();
             fs::remove_file(&wal).ok();
         }
+    }
+
+    #[test]
+    fn redo_recovery_restores_an_empty_root_after_interrupted_last_key_delete() {
+        let (path, wal) = paths("fault-recovery-empty-root");
+        {
+            let mut store = ExtentFile::open(&path).unwrap();
+            insert_or_replace(&mut store, &wal, b"only-key", b"only-value").unwrap();
+            COMMIT_FAILPOINT.with(|active| active.set(Some(FAIL_AFTER_WAL_SYNC)));
+            assert!(remove_many(&mut store, &wal, &[b"only-key".to_vec()]).is_err());
+            assert_eq!(COMMIT_FAILPOINT.with(|active| active.get()), None);
+        }
+
+        {
+            let mut reopened = ExtentFile::open(&path).unwrap();
+            recover(&mut reopened, &wal).unwrap();
+            assert_eq!(reopened.root_page_id(), None,
+                "the EMPTY_ROOT WAL sentinel must restore a genuinely empty tree");
+            assert_eq!(get(&mut reopened, b"only-key").unwrap(), None);
+        }
+
+        fs::remove_file(path).unwrap();
+        fs::remove_file(wal).ok();
     }
 
     #[test]
