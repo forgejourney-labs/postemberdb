@@ -1038,6 +1038,20 @@ fn page_tree_wal_file_path(path: &Path) -> PathBuf {
 /// This is intentionally not an automatic migration: callers must verify the
 /// PDB6 copy before switching the database's authoritative storage format.
 impl Database {
+    /// Reclaims obsolete persistent B+ tree node pages in a PDB6 database.
+    /// Overflow row pages and unrecognized page types are retained conservatively.
+    /// PDB6 currently has no retained-snapshot API; this operation relies on the
+    /// store's exclusive process lock and must not be treated as snapshot vacuum.
+    pub fn vacuum_pdb6(&mut self) -> Result<u64, DbError> {
+        if !self.pdb6_mode {
+            return Err(DbError::Storage("PDB6 vacuum requires a database migrated to PDB6".into()));
+        }
+        let path = self.storage_path.as_deref()
+            .ok_or_else(|| DbError::Storage("PDB6 vacuum requires a persistent database".into()))?;
+        let mut store = Pdb6Store::open(path, 128)?;
+        store.vacuum_unreachable_tree_pages()
+    }
+
     pub fn migrate_to_pdb6(&mut self) -> Result<(), DbError> {
         let database_path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 migration requires a persistent database opened with Database::open".into()))?;
