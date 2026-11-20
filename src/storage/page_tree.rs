@@ -211,14 +211,7 @@ pub(crate) fn apply_mutations(
     if removed_count == 0 && inserted_count == 0 {
         return Ok((0, 0));
     }
-    let frame = encode_wal(root.unwrap_or(EMPTY_ROOT), &staged)?;
-    write_wal(wal_path, &frame)?;
-    for (page_id, payload) in &staged {
-        store.write_page(*page_id, payload)?;
-    }
-    store.publish_root(root)?;
-    validate_tree(store)?;
-    truncate_wal(wal_path)?;
+    commit_staged_tree(store, wal_path, root, &staged)?;
     Ok((removed_count, inserted_count))
 }
 
