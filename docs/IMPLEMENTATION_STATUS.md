@@ -268,9 +268,10 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 
 ## Vacuum and snapshots
 
-- [x] Current-root reachability for B+ Tree nodes and conservative release/reuse of unreachable tree-node pages.
-- [x] Descriptor-aware overflow-page reachability; live row extents are validated and pinned during each vacuum pass, and orphaned overflow pages are reclaimed.
-- [ ] Named snapshot roots, active reader epochs/pins, crash-safe vacuum progress, and safe reuse across retained snapshots remain unimplemented.
+- [x] Current-root and named-snapshot-root reachability for B+ Tree nodes; durable `PSN1` snapshot registry uses checksummed records and atomic temp-file replacement with file and parent-directory sync.
+- [x] `Database::{create_pdb6_snapshot, list_pdb6_snapshots, delete_pdb6_snapshot}` manage persistent named roots. Vacuum preserves tree pages reachable from every retained root.
+- [x] Descriptor-aware overflow-page reachability for the current root. While any named snapshot exists, Vacuum conservatively retains every P6R1 overflow page because old snapshot descriptors are not yet independently enumerated; after the final snapshot is deleted, orphan overflow pages can be reclaimed.
+- [ ] Active reader epochs/pins, per-snapshot overflow descriptor tracing (to reclaim safe orphans while snapshots exist), crash-safe vacuum progress, and subprocess fault injection across allocator release remain pending. PDB6's exclusive file lock currently serializes page-store access; concurrent shared readers are not supported.
 
 
 - [x] Coordinator ABORT recovery now retries each prepared participant's idempotent rollback, syncs a per-participant ROLLED_BACK acknowledgement, and exposes aborted transactions still needing cleanup.
