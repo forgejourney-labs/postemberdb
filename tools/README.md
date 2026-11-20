@@ -15,3 +15,7 @@ Both use the Rust PostemberDB library for embedded/local access. Remote connecti
 - Do not expose development protocols to untrusted networks.
 - Remote support requires TLS, authentication, authorization, bounded requests, and explicit permission checks.
 - Neither application silently migrates a database or runs destructive maintenance operations.
+
+## Implementation status
+
+The first local SQL-execution slices are present in both applications. Their full database explorer and administration workflows are not complete yet; see each application's README for explicit gaps. CI compiles both independent Cargo manifests.
