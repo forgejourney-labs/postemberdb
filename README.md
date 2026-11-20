@@ -45,9 +45,9 @@ The project is at an early development stage. The first prototype provides:
 - temporary-file writes followed by rename when checkpointing the database;
 - an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
 - atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
-- a loopback-only TCP server with versioned JSONL/1 and initial framed Binary/1 protocols for the optional KSL addon.
+- a loopback-only unauthenticated development server and a TLS-enabled authenticated server with JSONL/1 compatibility and versioned Binary/1 remote operator support.
 
-**Current limitations:** SQL table rows and catalog metadata are still stored in memory after snapshot/WAL replay; the page cache, lazy row-page access, and page-backed SQL table storage are not implemented. The persistent SQL index mirror is derived and rebuilt on open; unsupported index-key encodings use the in-memory fallback. KV and Registry use separate page/WAL sidecars and are not part of the SQL transaction's cross-domain atomic commit. Large values need an overflow-page/blob layer. The server protocol remains loopback-only and has no TLS, authentication, or authorization. Binary/1 supports SQL statements, ping/pong, and single-frame EF7 chunk CRUD up to 8 MiB per frame; the Kotlin client exposes opt-in framed SQL/chunk methods. Multi-frame streaming, transaction frames, range scans, and cross-domain transactions are not implemented. JSONL/1 is an initial loopback-only integration protocol, not a secure remote protocol. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
+**Current limitations:** SQL table rows and catalog metadata are still stored in memory after snapshot/WAL replay; the page cache, lazy row-page access, and page-backed SQL table storage are not implemented. The persistent SQL index mirror is derived and rebuilt on open; unsupported index-key encodings use the in-memory fallback. KV and Registry use separate page/WAL sidecars and are not part of the SQL transaction's cross-domain atomic commit. Large values need an overflow-page/blob layer. The plain `server` command remains loopback-only and unauthenticated. Remote access is available only through `server-tls`, which uses TLS, password authentication, RBAC, and the versioned Binary/1 operator protocol. The bundled Rust RemoteClient validates the configured CA bundle and TLS server name; there is no insecure certificate-validation option. Binary/1 supports SQL, catalog reads, bounded table pages, SQL write batches, server status, remote user/role/audit administration, ping/pong, and single-frame EF7 chunk CRUD up to 8 MiB per frame. Multi-frame streaming, multiplexing, request cancellation, mutual TLS, per-user quotas, and cross-domain transaction batches are not implemented. JSONL/1 remains a loopback/development compatibility protocol and must not be exposed to untrusted networks. Composite primary-key uniqueness is supported. The SQL parser is deliberately small; this is not yet a production database, and the server protocol is not yet suitable for untrusted networks; it has no TLS, authentication, or authorization.
 
 ## CLI
 
@@ -69,7 +69,15 @@ cargo bench --no-run
 cargo run -- server 127.0.0.1:7432
 ```
 
-The server opens the specified database file (default: `postemberdb.pbd`) and persists successful writes automatically. The development protocol accepts one SQL statement per line and supports `BEGIN`, `COMMIT`, `ROLLBACK`, and `QUIT`. The server supports JSONL/1 and the opt-in Binary/1 handshake. JSONL/1 remains the default KSL service path; Binary/1 can be selected through the client's explicit binary methods. Neither protocol is JDBC or suitable for untrusted networks.
+The plain `server` command opens the specified database file (default: `postemberdb.pbd`) and binds only to loopback. It is intended for local development and accepts SQL line commands including `BEGIN`, `COMMIT`, and `ROLLBACK`.
+
+For remote authenticated connections, start the TLS server with a certificate and private key:
+
+~~~bash
+cargo run -- server-tls 0.0.0.0:7432 ./data/postemberdb.pbd ./cert.pem ./key.pem
+~~~
+
+Provision a user with `postemberdb user add`, then connect with a client that trusts the certificate authority and verifies the certificate's DNS name. The Rust Browser and Admin operator tools use Binary/1 through the verified TLS client. The KSL addon retains its existing JSONL/1 compatibility path; it is not the secure remote operator client or a JDBC driver.
 
 ## Use as an embedded library
 
@@ -117,4 +125,4 @@ Two separate Rust tools are being developed under [`tools/`](tools/README.md):
 - **[PostemberDB Browser](tools/browser/README.md)** — a native desktop SQL browser with a compact classic 2014–2015-style interface.
 - **[PostemberDB Admin](tools/admin/README.md)** — a local phpMyAdmin-inspired web administration panel.
 
-The initial milestone supports local embedded database access and SQL execution. Remote server connections, catalog explorers, and administrative security screens are gated on stable core introspection APIs and an authenticated TLS protocol. The web Admin currently binds to loopback only.
+Both tools support local embedded access, live catalog browsing, paging, SQL, and remote TLS connections through the authenticated Binary/1 client. Browser also supports row forms and transactional updates; Admin provides remote server status, user/role management, password reset, and audit browsing. The web Admin listener itself remains loopback-only and must not be published through a reverse proxy.

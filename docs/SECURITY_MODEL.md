@@ -2,60 +2,72 @@
 
 ## Current posture
 
-PostemberDB is experimental and is not production-ready. The development TCP protocol has no authentication, TLS, authorization model, or stable framing. The current binary therefore restricts binding to explicit loopback IP addresses. Do not expose it to a LAN or the public internet.
+PostemberDB remains experimental and is not production-ready. It has two distinct listener modes:
 
-The server also enforces a maximum of 128 active client threads, a 64 KiB SQL-line limit, 30-second socket read/write timeouts, UTF-8 validation, and bounded per-connection request parsing. These controls are not a substitute for authentication or a production protocol.
+- The plain server command is an unauthenticated development listener restricted to explicit loopback addresses.
+- The server-tls command loads a PEM certificate/private key, enables TLS, and requires password authentication before SQL, EF7, or Binary/1 requests. Non-loopback binds are permitted only for this TLS mode.
+
+Remote TLS clients must validate the server certificate chain against a trusted CA and verify the expected server name. The bundled Rust RemoteClient has no insecure certificate-validation switch. The server currently uses server-authenticated TLS without mutual TLS; user identity is established through Argon2id password authentication inside the TLS channel.
+
+The web PostemberDB Admin tool is a separate operator application. It binds to loopback only. Its local Rust backend can establish a remote TLS session; Admin is not a remotely hosted web service and must not be exposed through a reverse proxy or public interface.
+
+The server enforces a maximum of 128 active client threads, 64 KiB SQL line limits, 30-second socket timeouts, UTF-8 validation, bounded frame sizes, and bounded per-connection request parsing. These controls are not a substitute for a production security review.
 
 ## Threat model
 
 The production design must account for malformed SQL and protocol frames; oversized lengths, integer overflow, allocation and decompression bombs; clients exhausting threads, memory, disk, WAL space, or query time; corrupt/truncated/reordered storage records; concurrent writers and stale snapshots; backup tampering; and secrets leaking into logs or crash reports.
 
-## Required controls
+## Implemented network and identity controls
 
-### Network and identity
-- TLS with certificate validation for remote connections.
-- Authentication through pluggable credential providers; never log plaintext passwords.
-- Role-based authorization for databases, schemas, tables, and operations.
-- Per-user connection, query, memory, and disk quotas.
-- Query deadlines, cancellation, bounded result streaming, and backpressure.
-- Protocol version negotiation and strict frame-size limits.
+- TLS server mode with rustls and PEM certificate/private-key parsing.
+- Client-side certificate-chain validation against an explicit PEM CA bundle and hostname validation.
+- Argon2id password hashes stored in the .auth sidecar; password hashes are never returned by user-list or administration endpoints.
+- Authenticated Binary/1 requests with request-ID and frame-kind validation.
+- RBAC enforcement for SQL reads/writes, EF7 reads/writes, catalog browsing, table pages, transaction batches, server status, and administrative operations.
+- SQL write batches are bounded and committed through one SQL transaction.
+- Remote user, role, and audit operations require an authenticated Admin principal and execute inside AuthStore::as_admin for actor-attributed audit records.
+- Password reset events are audited without recording passwords or hashes.
+- Administrative changes that would leave no enabled administrator are rejected.
+- The plain server listener remains loopback-only and unauthenticated for local development.
+- The web Admin listener remains loopback-only; its remote backend uses the verified TLS client.
 
-### Storage integrity
+## Remaining network and identity gaps
+
+- Mutual TLS and certificate-to-user mapping are not implemented.
+- Authentication rate limiting, account lockout policy, password rotation policy enforcement, per-user connection/query/memory/disk quotas, query deadlines, and request cancellation are not implemented.
+- Database/schema/table-scoped grants and finer-grained audit permissions are not implemented.
+- Admin's local HTTP interface is designed for loopback use only. It has no remote web login or CSRF token flow; do not publish or reverse-proxy it.
+- Audit retention/export policy and tamper evidence beyond per-record checksums remain future work.
+- Binary/1 requests are sequential per connection; multiplexing, streaming results, backpressure, and bounded server-side query cancellation remain future work.
+
+## Storage integrity
+
 - Validate every length, offset, page ID, generation, and count before allocating or seeking.
 - Checksums detect accidental corruption; authenticated encryption is separate.
 - WAL records are framed, sequenced, checksummed, and synced before commit acknowledgement.
-- Recovery is idempotent and tested with fault injection at every write/sync/rename boundary.
-- Metadata-root publication and torn-page protection are atomic and recoverable.
-- Backup manifests and restored pages are verified before the database is made available.
+- Recovery is idempotent and tested with fault injection at write/sync/rename boundaries.
+- Metadata-root publication and torn-page protection must remain atomic and recoverable.
+- Backup manifests and restored pages must be verified before the database is made available.
 
-### Cryptography and keys
+## Cryptography and keys
+
 - Encryption at rest is planned as an opt-in feature using a vetted AEAD construction and OS/key-management integration.
 - Encryption keys are never stored beside the encrypted database.
 - Key rotation uses wrapped data-encryption keys and a recoverable migration procedure.
 - No custom cryptographic algorithms.
 
-### Resource safety
+## Resource safety
+
 - Explicit budgets for page cache, indexes, query operators, WAL staging, and connections.
 - Maximum row, value, page, frame, batch, and decompressed sizes.
 - No unbounded per-client threads or unbounded queues.
 - Manual compaction by default; operators inspect fragmentation and schedule bounded work.
 - Resource exhaustion returns typed errors without corrupting committed state.
 
-## Security test suite
+## Security test suite and release gates
 
-Release gates include SQL-parser and protocol fuzzing, property tests for page/WAL codecs, corrupted-file tests, decompression-limit tests, concurrency stress, permission tests, and backup/restore drills. A green unit-test run alone does not establish production security.
-
-
-## Implemented transport authentication and RBAC
-
-- The legacy `server` command remains loopback-only and unauthenticated for local development.
-- `server-tls` loads a PEM certificate/private key, enables TLS, and requires authentication before SQL or EF7 operations. Non-loopback binds are rejected unless this TLS mode is active.
-- Provision accounts with `postemberdb user add <data-file> <username> <admin|read-only|read-write>`; passwords are prompted without terminal echo and stored as Argon2id PHC hashes in the `.auth` sidecar.
-- SQL read/write and EF7 read/write permissions are enforced for authenticated connections. Unknown SQL/EF7 command classes are denied by default.
-- TLS uses rustls and PEM certificate/private-key parsing. Clients must validate the server certificate; mutual TLS and certificate-to-user mapping are not yet implemented.
-- Authentication audit events are durable, checksummed, sequence-addressable, and exclude password/hash material. `AuthStore::as_admin` requires an authenticated Admin principal and records that actor for administrative mutations; direct legacy local API calls remain labeled `local-api`. Audit retention/export, tamper-evidence beyond per-record checksums, per-user connection/query quotas, authentication rate limiting, password rotation policy enforcement, and database/schema/table-scoped grants remain future work.
-
+Release gates include SQL-parser and protocol fuzzing, property tests for page/WAL codecs, corrupted-file tests, decompression-limit tests, TLS certificate/name-mismatch tests, RBAC permission matrix tests, concurrency stress, and backup/restore drills. A green unit-test run alone does not establish production security.
 
 ## JDBC driver
 
-The standalone `jdbc-driver/` Maven module provides a JDBC 4.2 driver over the versioned JSONL/1 server transport. Use `jdbc:postemberdb://host:7432` with `ssl=true` (default) for TLS, and supply `user`/`password` properties for RBAC. For loopback-only development servers, set `ssl=false` and omit credentials. The driver implements Connection, Statement, PreparedStatement, ResultSet and metadata basics. PreparedStatement currently performs client-side, quote-aware parameter binding; server-side prepared statement frames, streaming ResultSets, generated keys, savepoints, batch execution, and full metadata discovery are not yet supported.
+The standalone jdbc-driver Maven module provides a JDBC 4.2 driver over the versioned JSONL/1 server transport. Use jdbc:postemberdb://host:7432 with ssl=true (default) and user/password properties for TLS/RBAC. The desktop Browser and web Admin use the verified TLS Binary/1 client; the JDBC driver remains a separate protocol implementation.

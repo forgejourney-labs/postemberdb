@@ -5,6 +5,8 @@ A separate native desktop application inspired by SQLite Browser and classic dat
 ## Implemented
 
 - Open local .pbd or legacy .db files.
+- Connect to remote PostemberDB servers through TLS-enabled Binary/1.
+- Require an explicit trusted CA PEM bundle and TLS server name; certificate validation cannot be disabled.
 - Inspect tables, columns, types, nullability, indexes, uniqueness, and row counts.
 - Browse table rows in bounded pages of 100 records.
 - Navigate previous/next pages without materializing a full table.
@@ -21,7 +23,7 @@ From the repository root:
 
     cargo run --manifest-path tools/browser/Cargo.toml
 
-Enter a database path and select Open for local access. For remote access, enter the server address, certificate DNS name, trusted CA bundle path, username, and password, then select **Connect securely**. Click a table in Explorer to browse its rows.
+For local access, enter a database path and select Open. For remote access, enter the server address, certificate DNS name, trusted CA bundle path, username, and password, then select Connect securely. Click a table in Explorer to browse its rows.
 
 CSV and JSON exports are saved in the current working directory.
 
@@ -29,12 +31,11 @@ CSV and JSON exports are saved in the current working directory.
 
 - The form validates integer, text, boolean, and NULL values against the catalog.
 - Editing/deleting requires a unique key; key columns are locked in the form.
-- Multiple changed non-key fields are committed in one database transaction.
+- Multiple changed non-key fields are committed in one transaction (local Database transaction or remote Binary/1 batch).
 - Tables without a unique key can still be browsed and inserted into, but row edits/deletes remain disabled.
 
 ## Current limitations
 
-- Remote TLS connections are available through Binary/1. Supply a trusted PEM CA bundle and a TLS server name; certificate validation is mandatory and there is no insecure mode.
 - No automatic migration, vacuum, or destructive maintenance actions.
-- The file path is entered manually; a native file picker is a later UI improvement.
+- The file path and CA bundle path are entered manually; native file pickers are a later UI improvement.
 - Sorting/filtering and full-table streaming exports are later improvements.

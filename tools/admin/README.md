@@ -1,18 +1,20 @@
 # PostemberDB Admin
 
-A separate Rust web application with a phpMyAdmin-inspired administration layout.
+A separate Rust web application with a phpMyAdmin-inspired administration layout. The web listener is deliberately loopback-only; it is an operator console for the local machine.
 
 ## Implemented
 
 - Starts a local HTTP interface and opens it in a browser.
-- Opens one local PostemberDB file in embedded mode.
-- Provides a live catalog with tables, row counts, columns, data types, nullability, indexes, and uniqueness.
+- Opens one local PostemberDB file in embedded mode by default.
+- Connects to a remote PostemberDB server from the Rust backend using TLS-enabled Binary/1, a trusted CA PEM bundle, and server-name validation.
+- Uses remote catalog, table-page, SQL, and row CRUD operations after a remote connection is established.
 - Provides bounded row paging (50 rows per page by default, up to 200 per request).
 - Allows inserting rows and editing/deleting individual rows when the table has a UNIQUE index or PRIMARY KEY.
-- Edits one cell per request, with type/null validation performed by the server and core engine.
-- Includes tests for typed JSON conversion, SQL literal escaping, unique-key targeting, and rejection of edits without a unique index.
 - Exports the current visible page as CSV or JSON.
-- Shows a classic left-hand table navigator, database overview, structure inspector, SQL console, and result grids.
+- Provides remote server status, user list/create/enable/disable/delete/password reset, role create/permission updates/assignment/revocation/deletion, and audit-event browsing.
+- All remote administrative actions are checked by the database server for the Admin permission; mutations are attributed to the authenticated principal in the durable audit log.
+- Server-side RBAC changes are rejected if they would leave no enabled administrator.
+- Shows a classic left-hand table navigator, database overview, structure inspector, SQL console, results, and administration workspace.
 
 ## Run
 
@@ -26,21 +28,26 @@ An optional bind address may be supplied, but it must be loopback-only:
 
     cargo run --manifest-path tools/admin/Cargo.toml -- ./data/postemberdb.pbd 127.0.0.1:7480
 
+## Remote connection setup
+
+Start the PostemberDB server with TLS on the database host:
+
+    cargo run -- server-tls 0.0.0.0:7432 ./data/postemberdb.pbd ./cert.pem ./key.pem
+
+Provision an account with the CLI user command. In Admin, enter the server address, the DNS name covered by the certificate, the PEM CA bundle trusted by the client, the username, and password, then select Connect securely.
+
+The password is submitted to the Admin backend over its loopback-only HTTP listener and is then used for authentication inside the verified TLS connection. It is not stored in browser local storage or returned by the API. Do not expose Admin through a reverse proxy or public interface.
+
 ## Editing safety
 
 - Insert validates the value count and every column type.
 - Update/delete require a UNIQUE index or PRIMARY KEY and verify exactly one row is affected.
 - Tables without a unique index remain browseable and read-only through row actions.
-- The Admin service remains loopback-only and limits JSON request bodies.
-
-## Security
-
-This initial panel is deliberately local-only. It has no remote login flow and must not be exposed through a reverse proxy or public interface. Remote administration requires a stable authenticated protocol, TLS certificate validation, RBAC enforcement for every operation, CSRF protection, request limits, and audit integration.
+- The remote server independently applies SQL permissions and Admin authorization.
 
 ## Current limitations
 
-- One database file per process.
-- User/role management and server metrics are not implemented.
-- Remote server mode and authentication are not implemented.
-- CSV/JSON exports apply to the currently visible page, not a full-table streamed dump.
+- One local database file per process, plus one optional remote session.
+- Admin's web listener is not designed to be hosted on a remote machine.
+- Mutual TLS, query cancellation/deadlines, per-user quotas, schema/table grants, and full-table streaming exports are not implemented.
 - No automatic migration or destructive maintenance actions.

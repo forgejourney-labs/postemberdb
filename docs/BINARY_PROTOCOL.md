@@ -1,16 +1,20 @@
 # PostemberDB Binary Protocol v1
 
-Binary/1 is an initial framed transport for trusted loopback clients. It is not a secure remote protocol: the server still binds to loopback only and does not implement TLS, authentication, authorization, or encryption.
+Binary/1 is the framed client/server protocol used by the TLS-enabled PostemberDB server. Remote clients must establish TLS, validate the server certificate against a trusted CA bundle, and verify the expected server name before authenticating. The bundled Rust client has no insecure certificate-validation mode.
 
-## Negotiation
+The plain server command remains a loopback-only development listener. For remote connections, use server-tls with a PEM certificate and private key.
 
-The server retains the legacy text greeting. A client sends this ASCII line as its first command:
+## Connection sequence
 
-```text
-POSTEMBERDB BINARY/1
-```
+1. The client opens TCP and completes TLS certificate-chain and server-name verification.
+2. The server sends its text greeting (PostemberDB version).
+3. The client sends AUTH with username and password inside the TLS session.
+4. The server verifies the Argon2id password hash and returns an authentication result.
+5. The authenticated client sends POSTEMBERDB BINARY/1.
+6. The server acknowledges with a Pong frame, request ID 0, and payload postemberdb-binary/1-ready.
+7. The connection is binary-only until closed.
 
-The server responds with one binary frame: kind `Pong`, request ID `0`, payload `postemberdb-binary/1-ready`. After this acknowledgement, the connection is binary-only.
+The server currently uses server-authenticated TLS without mutual TLS. User identity is established by password authentication inside the TLS channel.
 
 ## Frame layout
 
@@ -18,15 +22,15 @@ Every frame begins with a 24-byte little-endian header:
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 4 | ASCII magic `PDBF` |
-| 4 | 1 | protocol version (`1`) |
+| 0 | 4 | ASCII magic PDBF |
+| 4 | 1 | protocol version (1) |
 | 5 | 1 | frame kind |
 | 6 | 2 | flags (must be zero in v1) |
 | 8 | 8 | request ID |
 | 16 | 4 | payload length |
 | 20 | 4 | CRC32 of payload |
 
-The current maximum payload is 8 MiB per frame. Length is validated before allocation. CRC32 detects accidental transmission corruption; it is not cryptographic authentication. Unknown kinds, unsupported flags/versions, oversized lengths, truncated frames, and checksum mismatches are rejected. Clean EOF is distinguished from a partial frame.
+The maximum payload is 8 MiB per frame. Length is validated before allocation. CRC32 detects accidental transmission corruption; it is not cryptographic authentication. TLS provides channel encryption and peer authentication. Unknown kinds, unsupported flags/versions, oversized lengths, truncated frames, and checksum mismatches are rejected. Clean EOF is distinguished from a partial frame.
 
 ## Frame kinds
 
@@ -36,19 +40,47 @@ The current maximum payload is 8 MiB per frame. Length is validated before alloc
 | QueryResult | 2 | server → client | UTF-8 JSON result |
 | Error | 3 | server → client | UTF-8 error text |
 | Ping / Pong | 4 / 5 | both | opaque bytes echoed by server |
+| Catalog / CatalogResult | 6 / 7 | client → server / server → client | Empty request; serialized SQL catalog snapshot |
+| TablePage / TablePageResult | 8 / 9 | client → server / server → client | JSON table, offset, limit; bounded table-page result |
+| ServerStatus / ServerStatusResult | 10 / 11 | client → server / server → client | Empty request; status JSON (Admin permission) |
+| AdminRequest / AdminResponse | 12 / 13 | client → server / server → client | Bounded JSON administrative action and result |
+| BatchQuery / BatchQueryResult | 14 / 15 | client → server / server → client | JSON statement array; transactional SQL write batch |
 | ChunkPut | 16 | client → server | namespace u64 LE, X i32 LE, Z i32 LE, then payload |
 | ChunkGet | 17 | client → server | namespace u64 LE, X i32 LE, Z i32 LE |
 | ChunkDelete | 18 | client → server | namespace u64 LE, X i32 LE, Z i32 LE |
-| ChunkData | 19 | server → client | empty when missing; otherwise namespace/X/Z header followed by raw bytes |
+| ChunkData | 19 | server → client | Empty when missing; otherwise namespace/X/Z header followed by raw bytes |
+| ChunkScan / ChunkScanResult | 20 / 21 | client → server / server → client | Reserved for bounded chunk-range scans |
 
-Each response carries the same request ID as its request. SQL query frames execute one statement. Transaction-control statements are rejected in this initial transport version; JSONL/1 remains the transaction-capable development path.
+Every response carries the same request ID as its request. Responses are validated against the expected frame kind by the Rust client.
 
-## Current limits and deliberate gaps
+## Authorization
+
+On a TLS listener, every request is checked against the authenticated principal:
+
+- Query, Catalog, and TablePage require the appropriate SQL read/write permission.
+- SQL command classes not covered by the RBAC policy are denied.
+- BatchQuery requires SqlWrite, accepts 1–500 non-empty SQL write statements, and commits them through one Database transaction. A batch containing a read, unsupported command, or transaction-control statement is rejected.
+- ServerStatus requires Admin.
+- AdminRequest requires Admin and executes user, role, and audit actions inside AuthStore::as_admin, so durable audit entries identify the authenticated actor.
+
+Supported remote administrative actions include users.list, users.create, users.permissions, users.enabled, users.delete, users.password, roles.list, roles.create, roles.permissions, roles.assign, roles.revoke, roles.delete, and audit.list.
+
+Administrative responses never contain password hashes. Password-reset commands do not return the new password. RBAC changes that would leave no enabled administrator are rejected.
+
+## Rust client
+
+The library exposes RemoteClient::connect(address, server_name, ca_bundle_path, username, password). The CA bundle must be PEM and trusted by the client; the TLS server name must match the certificate. The client has bounded connect/read/write timeouts and validates request IDs and response frame kinds.
+
+Desktop Browser uses this client for remote catalog browsing, SQL, paging, and transactional edits. Web Admin uses it behind its own loopback-only HTTP interface.
+
+## Limits and gaps
 
 - Single-frame chunk transfers are limited by the 8 MiB frame cap.
-- Native EF7 records/chunks remain limited to 64 MiB.
-- Multi-frame upload/download streams, chunk-range scans, chunk batches, flow-control windows, request cancellation, and multiplexed concurrent requests are not implemented yet.
-- The server processes requests sequentially per connection. The optional Kotlin addon includes opt-in `queryBinary`, `putChunkBinary`, `getChunkBinary`, and `deleteChunkBinary` methods with asynchronous variants; the existing default service remains on JSONL/1 until an application opts into these methods.
-- The protocol is loopback-only and must not be exposed to untrusted networks.
-
-The next transport milestone is a bounded multi-frame stream protocol with declared total length, per-stream IDs, aggregate in-flight byte budgets, explicit commit/abort, and backpressure. The frame codec is separated from the server dispatcher so that this can be added without changing the 24-byte frame header.
+- Native EF7 records/chunks remain limited to 64 MiB; multi-frame streaming is not implemented.
+- Remote table pages are capped at 1,000 rows.
+- SQL transaction batches are capped at 500 statements.
+- Administrative request frames are capped at 64 KiB; remote audit requests are capped at 500 events.
+- The server processes requests sequentially per connection. Multiplexing, request cancellation, query deadlines, per-user quotas, flow-control windows, and backpressure are not implemented.
+- Mutual TLS, certificate-to-user mapping, authentication rate limiting, and password rotation policy remain future work.
+- Binary/1 transaction batches cover SQL only; they do not combine SQL, KV, Registry, and EF7 into one transaction.
+- Legacy JSONL/1 remains a development/compatibility protocol and must not be exposed to untrusted networks.
