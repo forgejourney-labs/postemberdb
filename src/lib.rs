@@ -26,9 +26,9 @@ pub use storage::transaction_coordinator::{CoordinatorParticipant, RecoveredTran
 pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Stats, EmberForge7Store};
 
 use sql::{
-    apply_upsert, bind_parameters, find_kw, normalize_ident, parse_equality_predicates,
-    parse_value, split_csv, starts_with_kw, take_parenthesized, value_to_sql,
-    validate_value,
+    apply_upsert, bind_parameters, find_kw, find_unquoted_keyword, normalize_ident,
+    parse_equality_predicates, parse_order_by, parse_value, split_csv, starts_with_kw,
+    take_parenthesized, value_to_sql, validate_value,
 };
 
 /// Runtime statistics for the bounded fixed-page buffer pool.
@@ -210,6 +210,32 @@ struct Index {
     unique: bool,
     /// Stable table-local row identifiers; never vector positions.
     entries: BPlusTree<IndexKey, Vec<u64>>,
+}
+
+fn compare_sql_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+        (Value::Integer(_), _) => Ordering::Less,
+        (Value::Text(_), Value::Boolean(_)) => Ordering::Less,
+        (Value::Text(_), Value::Integer(_)) => Ordering::Greater,
+        (Value::Boolean(_), _) => Ordering::Greater,
+    }
+}
+
+fn compare_rows_by_order(left: &Row, right: &Row, order: &[(usize, bool)]) -> std::cmp::Ordering {
+    for (column, descending) in order {
+        let ordering = compare_sql_values(&left.values[*column], &right.values[*column]);
+        if ordering != std::cmp::Ordering::Equal {
+            return if *descending { ordering.reverse() } else { ordering };
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 #[derive(Debug, Clone)]
@@ -1222,6 +1248,7 @@ impl Database {
         table_name: &str,
         projection: &str,
         predicate: Option<&str>,
+        order_by: Option<&str>,
         limit: Option<usize>,
     ) -> Result<QueryResult, DbError> {
         let table = self.tables.get(table_name)
@@ -1232,6 +1259,11 @@ impl Database {
             .map(|value| parse_equality_predicates(&table.columns, value))
             .transpose()?
             .unwrap_or_default();
+        let order = order_by.map(|value| parse_order_by(&table.columns, value))
+            .transpose()?.unwrap_or_default();
+        if is_count && !order.is_empty() {
+            return Err(DbError::Unsupported("ORDER BY with COUNT(*) is not supported yet".into()));
+        }
         let projection_indices = if is_count {
             Vec::new()
         } else if projection == "*" {
@@ -1254,9 +1286,9 @@ impl Database {
         };
         let path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 database has no storage path".into()))?;
-        let mut rows = Vec::new();
+        let mut matched_rows = Vec::new();
         let mut matched = 0usize;
-        if limit != Some(0) {
+        if limit != Some(0) || is_count {
             storage::scan_pdb6_table_rows(path, table_name, 512, |row| {
                 if !predicates.iter().all(|(column, value)| row.values[*column] == *value) {
                     return Ok(true);
@@ -1264,19 +1296,27 @@ impl Database {
                 matched = matched.checked_add(1)
                     .ok_or_else(|| DbError::Storage("SQL result row count overflow".into()))?;
                 if !is_count {
-                    rows.push(Row {
-                        row_id: row.row_id,
-                        values: projection_indices.iter()
-                            .map(|column| row.values[*column].clone())
-                            .collect(),
-                    });
+                    matched_rows.push(row);
                 }
-                Ok(is_count || limit.is_none_or(|maximum| matched < maximum))
+                Ok(is_count || !order.is_empty() || limit.is_none_or(|maximum| matched < maximum))
             })?;
         }
         if is_count {
-            rows.push(Row { row_id: 0, values: vec![Value::Integer(matched as i64)] });
+            matched_rows.push(Row { row_id: 0, values: vec![Value::Integer(matched as i64)] });
+        } else {
+            if !order.is_empty() {
+                matched_rows.sort_by(|left, right| compare_rows_by_order(left, right, &order));
+            }
+            if let Some(maximum) = limit {
+                matched_rows.truncate(maximum);
+            }
+            for row in &mut matched_rows {
+                row.values = projection_indices.iter()
+                    .map(|column| row.values[*column].clone())
+                    .collect();
+            }
         }
+        let rows = matched_rows;
         Ok(QueryResult {
             message: format!("{} row(s)", rows.len()),
             rows,
@@ -1292,7 +1332,7 @@ impl Database {
         let tail = sql[from + 6..].trim();
         let upper_tail = tail.to_ascii_uppercase();
 
-        let (query_tail, limit) = if let Some(position) = upper_tail.rfind(" LIMIT ") {
+        let (without_limit, limit) = if let Some(position) = find_unquoted_keyword(tail, " LIMIT ") {
             let limit_text = tail[position + 7..].trim();
             if limit_text.split_whitespace().count() != 1 {
                 return Err(DbError::Parse("LIMIT expects one non-negative integer".into()));
@@ -1304,8 +1344,12 @@ impl Database {
             (tail, None)
         };
 
-        let query_upper = query_tail.to_ascii_uppercase();
-        let where_pos = query_upper.find(" WHERE ");
+        let order_pos = find_unquoted_keyword(without_limit, " ORDER BY ");
+        let (query_tail, order_by) = match order_pos {
+            Some(position) => (&without_limit[..position], Some(without_limit[position + 10..].trim())),
+            None => (without_limit, None),
+        };
+        let where_pos = find_unquoted_keyword(query_tail, " WHERE ");
         let (table_part, predicate) = match where_pos {
             Some(position) => (&query_tail[..position], Some(query_tail[position + 7..].trim())),
             None => (query_tail, None),
@@ -1313,12 +1357,17 @@ impl Database {
         let table_name = normalize_ident(table_part.split_whitespace().next().unwrap_or(""));
         let table = self.tables.get(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
         if self.pdb6_mode {
-            return self.select_pdb6_from_disk(&table_name, projection, predicate, limit);
+            return self.select_pdb6_from_disk(&table_name, projection, predicate, order_by, limit);
         }
 
         let projection_upper = projection.to_ascii_uppercase();
         let is_count = projection_upper.starts_with("COUNT(*)");
-        let selection_limit = if is_count { None } else { limit };
+        let order = order_by.map(|value| parse_order_by(&table.columns, value))
+            .transpose()?.unwrap_or_default();
+        if is_count && !order.is_empty() {
+            return Err(DbError::Unsupported("ORDER BY with COUNT(*) is not supported yet".into()));
+        }
+        let selection_limit = if is_count || !order.is_empty() { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_equality_predicates(&table.columns, predicate)?;
             let columns = predicates.iter().map(|(index, _)| *index).collect::<Vec<_>>();
@@ -1375,11 +1424,18 @@ impl Database {
             }).collect::<Result<Vec<_>, _>>()?
         };
         let columns = projection_indices.iter().map(|index| table.columns[*index].name.clone()).collect();
-        let rows = selected_rows.into_iter().filter_map(|row_index| {
-            table.rows.get(row_index).map(|row| Row {
-                row_id: row.row_id,
-                values: projection_indices.iter().map(|column_index| row.values[*column_index].clone()).collect()
-            })
+        let mut source_rows = selected_rows.into_iter().filter_map(|row_index| {
+            table.rows.get(row_index).cloned()
+        }).collect::<Vec<_>>();
+        if !order.is_empty() {
+            source_rows.sort_by(|left, right| compare_rows_by_order(left, right, &order));
+        }
+        if let Some(maximum) = limit {
+            source_rows.truncate(maximum);
+        }
+        let rows = source_rows.into_iter().map(|row| Row {
+            row_id: row.row_id,
+            values: projection_indices.iter().map(|column_index| row.values[*column_index].clone()).collect()
         }).collect::<Vec<_>>();
         Ok(QueryResult {
             message: format!("{} row(s)", rows.len()),
@@ -1760,6 +1816,21 @@ mod tests {
         assert_eq!(db.execute("SELECT * FROM counters").unwrap().rows.len(), 0);
     }
 
+
+    #[test]
+    fn select_supports_order_by_ascending_descending_and_multiple_keys() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE ordered_rows (category TEXT, score INTEGER)").unwrap();
+        db.execute("INSERT INTO ordered_rows VALUES ('b', 10)").unwrap();
+        db.execute("INSERT INTO ordered_rows VALUES ('a', 10)").unwrap();
+        db.execute("INSERT INTO ordered_rows VALUES ('c', 30)").unwrap();
+        let descending = db.execute("SELECT category, score FROM ordered_rows ORDER BY score DESC, category ASC LIMIT 2").unwrap();
+        assert_eq!(descending.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Text("c".into()), Value::Text("a".into())]);
+        let ascending = db.execute("SELECT category FROM ordered_rows ORDER BY score ASC, category DESC").unwrap();
+        assert_eq!(ascending.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Text("b".into()), Value::Text("a".into()), Value::Text("c".into())]);
+    }
 
     #[test]
     fn persistent_wal_replays_committed_sql_transaction() {

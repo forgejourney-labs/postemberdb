@@ -111,6 +111,61 @@ pub(super) fn apply_upsert(table: &mut Table, values: &[Value], clause: &str) ->
     Ok(true)
 }
 
+pub(super) fn find_unquoted_keyword(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let needle = keyword.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() { return None; }
+    let mut quote = None;
+    let mut cursor = 0usize;
+    while cursor + needle.len() <= bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(active) = quote {
+            if byte == active {
+                if bytes.get(cursor + 1) == Some(&active) {
+                    cursor += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor..cursor + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+pub(super) fn parse_order_by(columns: &[Column], clause: &str) -> Result<Vec<(usize, bool)>, DbError> {
+    let parts = split_csv(clause);
+    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+        return Err(DbError::Parse("ORDER BY requires at least one column".into()));
+    }
+    parts.into_iter().map(|part| {
+        let tokens = part.split_whitespace().collect::<Vec<_>>();
+        if tokens.is_empty() || tokens.len() > 2 {
+            return Err(DbError::Parse(format!("invalid ORDER BY item: {part}")));
+        }
+        let name = normalize_ident(tokens[0]);
+        let descending = match tokens.get(1).map(|value| value.to_ascii_uppercase()) {
+            None => false,
+            Some(direction) if direction == "ASC" => false,
+            Some(direction) if direction == "DESC" => true,
+            Some(_) => return Err(DbError::Parse(format!("ORDER BY direction must be ASC or DESC: {part}"))),
+        };
+        let index = columns.iter().position(|column| column.name == name)
+            .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
+        Ok((index, descending))
+    }).collect()
+}
+
 pub(super) fn parse_equality_predicates(columns: &[Column], predicate: &str) -> Result<Vec<(usize, Value)>, DbError> {
     let conditions = split_and_conditions(predicate);
     if conditions.is_empty() {
