@@ -1,8 +1,10 @@
-use postemberdb::{AuthStore, Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, Permission, Principal, QueryResult, Value};
+use postemberdb::{AuthStore, Database, DatabaseSession, EmberForge7Namespace, EmberForge7NamespaceKind, EmberForge7PlayerProfile, EmberForge7Store, KeyValueStore, Permission, Principal, QueryResult, Registry, TransactionCoordinator, Value};
 use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
 use postemberdb::version::version_string;
+use std::ffi::OsString;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -93,21 +95,59 @@ pub(crate) fn run_server_tls(address: &str, data_path: &str, cert_path: &str, ke
     run_server_inner(address, data_path, Some(load_tls_config(cert_path, key_path)?))
 }
 
+fn append_sidecar_suffix(path: &str, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path);
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<ServerConfig>>) -> io::Result<()> {
     let tls_enabled = tls_config.is_some();
     let socket_address = validate_bind_address(address, tls_enabled)?;
+
+    // Open every durable participant before accepting clients. A committed
+    // coordinator decision must be replayed across all domains before writes
+    // are allowed; PREPARING transactions remain in-doubt and fail closed.
+    let mut database_handle = Database::open(data_path)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut kv_store = KeyValueStore::open(append_sidecar_suffix(data_path, ".kv"))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut registry_store = Registry::open(append_sidecar_suffix(data_path, ".registry"))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut ef7_handle = EmberForge7Store::open(data_path, 256)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut coordinator = TransactionCoordinator::open(append_sidecar_suffix(data_path, ".coordinator"))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    {
+        let mut participants: [&mut dyn postemberdb::CoordinatorParticipant; 4] = [
+            &mut database_handle, &mut kv_store, &mut registry_store, &mut ef7_handle,
+        ];
+        coordinator.recover_pending(&mut participants)
+            .map_err(|error| io::Error::other(format!("coordinator recovery failed: {error}")))?;
+    }
+    let in_doubt = coordinator.in_doubt();
+    if !in_doubt.is_empty() {
+        let ids = in_doubt.iter().map(|transaction| transaction.transaction_id)
+            .collect::<Vec<_>>();
+        return Err(io::Error::other(format!(
+            "server startup blocked: coordinator transactions remain in-doubt (no durable COMMIT/ABORT decision): {ids:?}"
+        )));
+    }
+
+    let database = Arc::new(std::sync::Mutex::new(database_handle));
+    let ef7_store = Arc::new(std::sync::Mutex::new(ef7_handle));
+    // Keep all participant handles and the coordinator lock alive for the
+    // server lifetime so a second process cannot race recovery or open them.
+    let _kv_store = kv_store;
+    let _registry_store = registry_store;
+    let _coordinator = coordinator;
+
     let listener = TcpListener::bind(socket_address)?;
     if tls_enabled {
         println!("{} — TLS server listening on {socket_address}; authentication required", version_string());
     } else {
         println!("{} — development server listening on loopback {socket_address}", version_string());
     }
-    let database = Arc::new(std::sync::Mutex::new(
-        Database::open(data_path).map_err(|error| io::Error::other(error.to_string()))?
-    ));
-    let ef7_store = Arc::new(std::sync::Mutex::new(
-        EmberForge7Store::open(data_path, 256).map_err(|error| io::Error::other(error.to_string()))?
-    ));
     let auth_store = if tls_enabled {
         Some(Arc::new(std::sync::Mutex::new(
             AuthStore::open(format!("{data_path}.auth")).map_err(|error| io::Error::other(error.to_string()))?
