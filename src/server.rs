@@ -1284,7 +1284,7 @@ fn format_result(result: QueryResult) -> String {
 mod tests {
     use super::{append_sidecar_suffix, open_recovered_stores, read_bounded_line, validate_bind_address};
     use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
-    use postemberdb::{Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, QueryResult, Registry, TransactionCoordinator, Value};
+    use postemberdb::{AuthStore, Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, Permissions, QueryResult, Registry, TransactionCoordinator, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -1618,6 +1618,43 @@ mod tests {
             let mut sidecar = ef7_path.as_os_str().to_os_string();
             sidecar.push(suffix);
             let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+    }
+
+    #[test]
+    fn rbac_changes_never_remove_the_last_enabled_administrator() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-admin-invariant-{}-{}.auth",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            auth.create_user("primary-admin", "primary admin secure password", Permissions::ADMIN).unwrap();
+
+            assert_eq!(super::active_admin_count_after(&mut auth, None, None, None, None, None).unwrap(), 1);
+            assert!(super::require_active_admin_after(
+                &mut auth, Some("primary-admin"), None, None, None, None,
+            ).is_err());
+
+            auth.create_user("backup-admin", "backup admin secure password", Permissions::ADMIN).unwrap();
+            assert_eq!(super::active_admin_count_after(&mut auth, None, None, None, None, None).unwrap(), 2);
+            assert!(super::require_active_admin_after(
+                &mut auth, Some("primary-admin"), None, None, None, None,
+            ).is_ok());
+
+            auth.create_role("secondary-admin-role", Permissions::ADMIN).unwrap();
+            auth.assign_role("role-admin", "secondary-admin-role").err();
+            auth.create_user("role-admin", "role admin secure password", Permissions::READ_ONLY).unwrap();
+            auth.assign_role("role-admin", "secondary-admin-role").unwrap();
+            assert_eq!(super::active_admin_count_after(&mut auth, None, None, None, None, None).unwrap(), 3);
+            assert!(super::require_active_admin_after(
+                &mut auth, None, Some("secondary-admin-role"), None, None, None,
+            ).is_ok());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = std::fs::remove_file(candidate);
         }
     }
 
