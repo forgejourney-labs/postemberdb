@@ -1644,7 +1644,6 @@ mod tests {
             ).is_ok());
 
             auth.create_role("secondary-admin-role", Permissions::ADMIN).unwrap();
-            auth.assign_role("role-admin", "secondary-admin-role").err();
             auth.create_user("role-admin", "role admin secure password", Permissions::READ_ONLY).unwrap();
             auth.assign_role("role-admin", "secondary-admin-role").unwrap();
             assert_eq!(super::active_admin_count_after(&mut auth, None, None, None, None, None).unwrap(), 3);
