@@ -206,6 +206,16 @@ fn sql_like_matches(value: &str, pattern: &str) -> bool {
     previous[value.len()]
 }
 
+fn estimate_row_values_heap_bytes(values: &[Value]) -> usize {
+    std::mem::size_of_val(values).saturating_add(values.iter().fold(0usize, |total, value| {
+        let owned_bytes = match value {
+            Value::Text(text) => text.capacity(),
+            Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
+        };
+        total.saturating_add(owned_bytes)
+    }))
+}
+
 fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let Some(value) = values.get(predicate.column_index) else { return false; };
@@ -850,6 +860,10 @@ impl Database {
     fn execute_pdb6_bounded_dml(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         const SCAN_BATCH: usize = 512;
         const MAX_CHANGED_ROWS: usize = 5_000;
+        // Bound decoded row values retained by one statement independently of
+        // the row-count limit. Large TEXT rows must not turn a 5,000-row cap
+        // into an effectively unbounded allocation.
+        const MAX_STAGED_ROW_BYTES: usize = 128 * 1024 * 1024;
 
         self.ensure_no_prepared_sql_transactions()?;
         let path = self.storage_path.clone()
@@ -1028,6 +1042,7 @@ impl Database {
                     .map(|text| parse_where_predicates(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
                 let mut changed = Vec::<(Row, Vec<Value>)>::new();
+                let mut staged_row_bytes = 0usize;
                 let mut matched_count = 0usize;
                 let mut after = None;
                 loop {
@@ -1049,6 +1064,25 @@ impl Database {
                             if changed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
+                                )));
+                            }
+                            let old_row_bytes = estimate_row_values_heap_bytes(&values);
+                            let replaced_value_bytes = match &values[target_index] {
+                                Value::Text(text) => text.capacity(),
+                                Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
+                            };
+                            let replacement_value_bytes = match value {
+                                Value::Text(text) => text.capacity(),
+                                Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
+                            };
+                            let retained_bytes = old_row_bytes.saturating_mul(2)
+                                .saturating_sub(replaced_value_bytes)
+                                .saturating_add(replacement_value_bytes);
+                            staged_row_bytes = staged_row_bytes.checked_add(retained_bytes)
+                                .ok_or_else(|| DbError::Storage("SQL UPDATE staging byte count overflow".into()))?;
+                            if staged_row_bytes > MAX_STAGED_ROW_BYTES {
+                                return Err(DbError::Constraint(format!(
+                                    "PDB6 bounded UPDATE exceeds the {MAX_STAGED_ROW_BYTES}-byte staging budget; split it into smaller statements"
                                 )));
                             }
                             let mut new_values = values.clone();
@@ -1111,6 +1145,7 @@ impl Database {
                     .map(|text| parse_where_predicates(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
                 let mut removed = Vec::<Row>::new();
+                let mut staged_row_bytes = 0usize;
                 let mut after = None;
                 loop {
                     let ids = store.scan_row_ids(table_id, after, SCAN_BATCH)?;
@@ -1123,6 +1158,13 @@ impl Database {
                             if removed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded DELETE matches more than {MAX_CHANGED_ROWS} rows; split it into smaller statements"
+                                )));
+                            }
+                            staged_row_bytes = staged_row_bytes.checked_add(estimate_row_values_heap_bytes(&values))
+                                .ok_or_else(|| DbError::Storage("SQL DELETE staging byte count overflow".into()))?;
+                            if staged_row_bytes > MAX_STAGED_ROW_BYTES {
+                                return Err(DbError::Constraint(format!(
+                                    "PDB6 bounded DELETE exceeds the {MAX_STAGED_ROW_BYTES}-byte staging budget; split it into smaller statements"
                                 )));
                             }
                             removed.push(Row { row_id: *row_id, values });
@@ -3053,6 +3095,19 @@ mod tests {
         std::fs::remove_file(format!("{}.wal", path.display())).unwrap();
     }
 
+
+    #[test]
+    fn row_staging_memory_estimate_accounts_for_owned_text_capacity() {
+        let compact = vec![Value::Integer(7), Value::Boolean(true)];
+        let text = "a".repeat(4_096);
+        let with_text = vec![Value::Integer(7), Value::Text(text)];
+
+        assert!(
+            estimate_row_values_heap_bytes(&with_text)
+                >= estimate_row_values_heap_bytes(&compact) + 4_096,
+            "the staging budget must account for heap-owned TEXT payloads"
+        );
+    }
 
     #[test]
     fn sql_supports_column_inserts_projections_updates_and_deletes() {
