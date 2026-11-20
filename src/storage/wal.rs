@@ -39,6 +39,7 @@ impl Database {
         // Only one bounded (maximum 64 MiB) transaction payload is resident.
         let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(storage_error)?;
         let mut offset = 0u64;
+        let mut last_frame_sequence = 0u64;
         let mut truncated_tail = false;
         // Stage the entire recovery pass once. This keeps recovery atomic while
         // avoiding a full database clone for every WAL frame.
@@ -86,6 +87,13 @@ impl Database {
             if checksum(&payload) != expected {
                 return Err(DbError::Storage(format!("WAL checksum mismatch at byte {offset}")));
             }
+            if sequence == 0 || sequence <= last_frame_sequence {
+                return Err(DbError::Storage(format!(
+                    "WAL sequence is zero or not strictly increasing at byte {offset}: previous {}, found {sequence}",
+                    last_frame_sequence
+                )));
+            }
+            last_frame_sequence = sequence;
             let mut decoder = Decoder { bytes: &payload, offset: 0 };
             let count = decoder.count()?;
             let mut statements = Vec::with_capacity(count);
@@ -94,9 +102,11 @@ impl Database {
                 return Err(DbError::Storage("trailing bytes in WAL transaction".into()));
             }
             if sequence > staged.wal_sequence {
-                if sequence != staged.wal_sequence + 1 {
+                let expected_sequence = staged.wal_sequence.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("WAL sequence exhausted during recovery".into()))?;
+                if sequence != expected_sequence {
                     return Err(DbError::Storage(format!(
-                        "WAL sequence gap: expected {}, found {sequence}", staged.wal_sequence + 1
+                        "WAL sequence gap: expected {expected_sequence}, found {sequence}"
                     )));
                 }
                 // Each frame is a transaction. If any statement fails, the
@@ -173,6 +183,63 @@ mod tests {
         let error = recovered.replay_wal().unwrap_err();
         assert!(error.to_string().contains("sequence gap"));
         assert!(!recovered.tables.contains_key("gap_guard"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_sequence_even_when_snapshot_already_covers_it() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-duplicate-sequence-{}-{nonce}.wal",
+            std::process::id()
+        ));
+
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE duplicate_guard (value INTEGER)".into(),
+        ]).unwrap();
+
+        let frame = fs::read(&path).unwrap();
+        let mut duplicated = frame.clone();
+        duplicated.extend_from_slice(&frame);
+        fs::write(&path, duplicated).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        let error = recovered.replay_wal().unwrap_err();
+        assert!(error.to_string().contains("not strictly increasing"));
+        assert!(!recovered.tables.contains_key("duplicate_guard"));
+        assert_eq!(recovered.wal_sequence, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_zero_sequence() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-wal-zero-sequence-{}-{nonce}.wal",
+            std::process::id()
+        ));
+
+        let mut writer = Database::new();
+        writer.wal_path = Some(path.clone());
+        writer.append_wal_transaction(&[
+            "CREATE TABLE zero_guard (value INTEGER)".into(),
+        ]).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[4..12].copy_from_slice(&0u64.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let mut recovered = Database::new();
+        recovered.wal_path = Some(path.clone());
+        let error = recovered.replay_wal().unwrap_err();
+        assert!(error.to_string().contains("not strictly increasing"));
+        assert!(!recovered.tables.contains_key("zero_guard"));
         assert_eq!(recovered.wal_sequence, 0);
 
         fs::remove_file(path).unwrap();
