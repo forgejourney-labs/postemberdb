@@ -1464,7 +1464,11 @@ mod tests {
         let ef7 = Arc::new(Mutex::new(EmberForge7Store::open(&ef7_path, 16).unwrap()));
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            super::handle_client(stream, database, ef7, None, false).unwrap();
+            super::handle_client(
+                stream, database, ef7, None, false,
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                std::time::Instant::now(),
+            ).unwrap();
         });
 
         let mut client = TcpStream::connect(address).unwrap();
