@@ -1,16 +1,26 @@
 //! Bounded LRU cache for validated fixed-page payloads.
 
 use crate::PageCacheStats;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 pub(crate) const DEFAULT_PAGE_CACHE_CAPACITY: usize = 128;
 pub(crate) const MAX_PAGE_CACHE_CAPACITY: usize = 65_536;
+
+#[derive(Debug, Clone, Copy)]
+struct RecencyLinks {
+    previous: Option<u64>,
+    next: Option<u64>,
+}
 
 #[derive(Debug)]
 pub(crate) struct PageCache {
     capacity_pages: usize,
     pages: BTreeMap<u64, Vec<u8>>,
-    recency: VecDeque<u64>,
+    // Intrusive LRU links indexed by page ID. BTreeMap remains the ordered
+    // directory for range scans; the hash index makes hits and touches O(1).
+    recency: HashMap<u64, RecencyLinks>,
+    oldest_page_id: Option<u64>,
+    newest_page_id: Option<u64>,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -26,7 +36,9 @@ impl PageCache {
         Ok(Self {
             capacity_pages,
             pages: BTreeMap::new(),
-            recency: VecDeque::new(),
+            recency: HashMap::new(),
+            oldest_page_id: None,
+            newest_page_id: None,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -47,14 +59,16 @@ impl PageCache {
         if self.capacity_pages == 0 {
             return;
         }
-        self.pages.insert(page_id, payload);
-        self.touch(page_id);
-        while self.pages.len() > self.capacity_pages {
-            let Some(oldest) = self.recency.pop_front() else { break; };
-            if self.pages.remove(&oldest).is_some() {
-                self.evictions = self.evictions.saturating_add(1);
-            }
+        let existed = self.pages.insert(page_id, payload).is_some();
+        if existed {
+            self.touch(page_id);
+        } else {
+            self.append_newest(page_id);
         }
+        while self.pages.len() > self.capacity_pages {
+            self.evict_oldest();
+        }
+        debug_assert_eq!(self.pages.len(), self.recency.len());
     }
 
     pub(crate) fn remove_range(&mut self, start_page_id: u64, end_page_id: u64) {
@@ -64,17 +78,11 @@ impl PageCache {
         let removed = self.pages.range(start_page_id..end_page_id)
             .map(|(page_id, _)| *page_id)
             .collect::<Vec<_>>();
-        for page_id in &removed {
-            self.pages.remove(page_id);
+        for page_id in removed {
+            self.pages.remove(&page_id);
+            self.detach(page_id);
         }
-        if !removed.is_empty() {
-            // Every cached ID in this half-open range was removed above.
-            // Comparing bounds is O(1) per LRU node; Vec::contains here made
-            // range invalidation O(cache_capacity * removed_pages).
-            self.recency.retain(|page_id| {
-                *page_id < start_page_id || *page_id >= end_page_id
-            });
-        }
+        debug_assert_eq!(self.pages.len(), self.recency.len());
     }
 
     pub(crate) fn set_capacity(&mut self, capacity_pages: usize) -> Result<(), crate::DbError> {
@@ -85,11 +93,9 @@ impl PageCache {
         }
         self.capacity_pages = capacity_pages;
         while self.pages.len() > self.capacity_pages {
-            let Some(oldest) = self.recency.pop_front() else { break; };
-            if self.pages.remove(&oldest).is_some() {
-                self.evictions = self.evictions.saturating_add(1);
-            }
+            self.evict_oldest();
         }
+        debug_assert_eq!(self.pages.len(), self.recency.len());
         Ok(())
     }
 
@@ -105,8 +111,63 @@ impl PageCache {
     }
 
     fn touch(&mut self, page_id: u64) {
-        self.recency.retain(|existing| *existing != page_id);
-        self.recency.push_back(page_id);
+        if self.newest_page_id == Some(page_id) {
+            return;
+        }
+        if self.detach(page_id) {
+            self.append_newest(page_id);
+        }
+    }
+
+    fn append_newest(&mut self, page_id: u64) {
+        debug_assert!(!self.recency.contains_key(&page_id));
+        let previous = self.newest_page_id;
+        self.recency.insert(page_id, RecencyLinks { previous, next: None });
+
+        if let Some(previous_id) = previous {
+            if let Some(previous_links) = self.recency.get_mut(&previous_id) {
+                previous_links.next = Some(page_id);
+            } else {
+                debug_assert!(false, "newest LRU node must be present");
+                self.oldest_page_id = Some(page_id);
+            }
+        } else {
+            self.oldest_page_id = Some(page_id);
+        }
+        self.newest_page_id = Some(page_id);
+    }
+
+    fn detach(&mut self, page_id: u64) -> bool {
+        let Some(links) = self.recency.remove(&page_id) else {
+            return false;
+        };
+
+        if let Some(previous_id) = links.previous {
+            if let Some(previous_links) = self.recency.get_mut(&previous_id) {
+                previous_links.next = links.next;
+            }
+        } else {
+            self.oldest_page_id = links.next;
+        }
+
+        if let Some(next_id) = links.next {
+            if let Some(next_links) = self.recency.get_mut(&next_id) {
+                next_links.previous = links.previous;
+            }
+        } else {
+            self.newest_page_id = links.previous;
+        }
+        true
+    }
+
+    fn evict_oldest(&mut self) {
+        let Some(oldest) = self.oldest_page_id else {
+            debug_assert!(self.pages.is_empty(), "non-empty page map must have an LRU head");
+            return;
+        };
+        self.pages.remove(&oldest);
+        self.detach(oldest);
+        self.evictions = self.evictions.saturating_add(1);
     }
 }
 
@@ -177,6 +238,19 @@ mod tests {
         assert_eq!(cache.get(13), Some(b"thirteen".to_vec()));
         assert_eq!(cache.get(14), Some(b"fourteen".to_vec()));
         assert_eq!(cache.stats().resident_pages, 3);
+    }
+
+    #[test]
+    fn updating_a_cached_page_refreshes_its_lru_position() {
+        let mut cache = PageCache::new(2).unwrap();
+        cache.insert(1, b"one".to_vec());
+        cache.insert(2, b"two".to_vec());
+        cache.insert(1, b"one-updated".to_vec());
+        cache.insert(3, b"three".to_vec());
+
+        assert_eq!(cache.get(1), Some(b"one-updated".to_vec()));
+        assert_eq!(cache.get(2), None);
+        assert_eq!(cache.get(3), Some(b"three".to_vec()));
     }
 
     #[test]
