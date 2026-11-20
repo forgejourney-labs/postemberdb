@@ -1728,6 +1728,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn create_pdb6_starts_with_disk_backed_sql_and_refuses_overwrite() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-create-pdb6-{}-{}.pbd",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::create_pdb6(&path).unwrap();
+            assert!(db.pdb6_mode);
+            assert!(Database::create_pdb6(&path).is_err());
+            db.execute("CREATE TABLE disk_rows (id INTEGER PRIMARY KEY, value TEXT)").unwrap();
+            db.execute("INSERT INTO disk_rows VALUES (1, 'stored')").unwrap();
+            assert!(!db.tables["disk_rows"].rows_loaded);
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert!(db.pdb6_mode);
+            assert!(!db.tables["disk_rows"].rows_loaded);
+            let result = db.execute("SELECT value FROM disk_rows WHERE id = 1").unwrap();
+            assert_eq!(result.rows[0].values[0], Value::Text("stored".into()));
+            assert!(!db.tables["disk_rows"].rows_loaded);
+        }
+        for suffix in ["", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
+
+    #[test]
     fn pdb6_manifest_becomes_live_sql_authority_after_reopen() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-pdb6-live-{}-{}.pbd",
