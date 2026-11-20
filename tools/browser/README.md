@@ -8,6 +8,8 @@ A separate native desktop application inspired by SQLite Browser and classic dat
 - Connect to remote PostemberDB servers through TLS-enabled Binary/1.
 - Require an explicit trusted CA PEM bundle and TLS server name; certificate validation cannot be disabled.
 - Inspect tables, columns, types, nullability, indexes, uniqueness, and row counts.
+- Filter the Explorer table list immediately by table name.
+- Keep the last 20 successfully executed SQL statements in a session-local query history and restore one into the editor.
 - Browse table rows in bounded pages of 100 records.
 - Navigate previous/next pages without materializing a full table.
 - Insert rows through schema-aware forms.

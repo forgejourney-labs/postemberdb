@@ -43,3 +43,7 @@ jobs:
         run: cargo check --manifest-path tools/admin/Cargo.toml
       - name: Test web Admin
         run: cargo test --manifest-path tools/admin/Cargo.toml
+      - name: Check Admin inline JavaScript
+        run: |
+          python3 tools/admin/scripts/extract_inline_js.py
+          node --check /tmp/postemberdb-admin-inline.js
