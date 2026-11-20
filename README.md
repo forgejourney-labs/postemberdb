@@ -109,3 +109,12 @@ Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STA
 
 
 See [JDBC Driver](docs/JDBC_DRIVER.md) for Maven setup, TLS configuration, connection properties and current JDBC feature limits.
+
+## Operator applications
+
+Two separate Rust tools are being developed under [`tools/`](tools/README.md):
+
+- **[PostemberDB Browser](tools/browser/README.md)** — a native desktop SQL browser with a compact classic 2014–2015-style interface.
+- **[PostemberDB Admin](tools/admin/README.md)** — a local phpMyAdmin-inspired web administration panel.
+
+The initial milestone supports local embedded database access and SQL execution. Remote server connections, catalog explorers, and administrative security screens are gated on stable core introspection APIs and an authenticated TLS protocol. The web Admin currently binds to loopback only.
