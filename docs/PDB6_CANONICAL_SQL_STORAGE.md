@@ -78,7 +78,8 @@ PDB5 migration must use a side-by-side target file or a new versioned sidecar, p
 - [ ] PDB5 read-only compatibility and restartable migration.
 - [ ] Database DML routed through page-backed rows; SQL snapshot no longer stores full row vectors.
 - [ ] Lazy point reads, bounded scans, and shared buffer pool.
-- [ ] Vacuum/reclamation with active-reader safety.
+- [x] Durable named snapshot roots and tree-page reachability across retained snapshots; PDB6's exclusive page-store lock serializes store access.
+- [ ] Active-reader epochs/pins, per-snapshot overflow-descriptor tracing, and crash-safe vacuum progress.
 - [ ] Recovery, migration, and large Minecraft workload benchmarks.
 
 Until these gates pass, PostemberDB must not describe its SQL tables as disk-native or production-ready.
@@ -115,3 +116,17 @@ tables is not supported by the PDB6 transition writer.
 
 
 Existing PDB5 databases are migrated explicitly with `postemberdb migrate-pdb6 <data-file>`. The migration is non-destructive: the PDB5 snapshot/WAL remain in place, and the new PDB6 manifest becomes the SQL authority. Opening an unmigrated PDB5 database does not silently change its format.
+
+
+## Named PDB6 snapshots and Vacuum protection
+
+PDB6 exposes explicit named-root operations on a PDB6-backed `Database`:
+
+- `create_pdb6_snapshot(name)` durably records the currently published immutable root.
+- `list_pdb6_snapshots()` returns the retained names in lexical order.
+- `delete_pdb6_snapshot(name)` removes the root reference; it does not immediately free pages.
+- `vacuum_pdb6()` reclaims unreachable tree pages only after tracing the current root and every retained snapshot root.
+
+The registry is stored in the `.pdb6.snapshots` sidecar using the versioned `PSN1` format, bounded names/counts, a checksum, and atomic temporary-file replacement. The file and its parent directory are synced before a registry mutation reports success. A malformed or oversized registry fails closed rather than being silently discarded.
+
+Overflow-page reclamation is deliberately more conservative: while any named snapshot exists, Vacuum retains all `P6R1` pages because old row descriptors are not yet enumerated independently from every snapshot root. After the final snapshot is deleted, a later Vacuum can reclaim orphaned overflow pages using the current-root descriptor scan. Unknown page kinds are always retained. PDB6 currently serializes page-store access with an exclusive file lock and does not support concurrent shared readers; reader epochs/pins, per-snapshot overflow tracing, and crash-resumable Vacuum progress remain future work.
