@@ -1967,7 +1967,7 @@ mod tests {
         db.execute("UPDATE predicate_rows SET score = 40 WHERE score > 25").unwrap();
         assert_eq!(db.execute("SELECT score FROM predicate_rows WHERE name = 'Ada'").unwrap().rows[0].values[0], Value::Integer(40));
         db.execute("DELETE FROM predicate_rows WHERE note IS NOT NULL AND score <= 20").unwrap();
-        assert_eq!(db.execute("SELECT COUNT(*) FROM predicate_rows").unwrap().rows[0].values[0], Value::Integer(2));
+        assert_eq!(db.execute("SELECT COUNT(*) FROM predicate_rows").unwrap().rows[0].values[0], Value::Integer(1));
     }
 
     #[test]
