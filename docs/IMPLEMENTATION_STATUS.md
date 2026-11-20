@@ -36,6 +36,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
 - [x] Native B+ tree node splitting, point lookup, inclusive in-memory range scan, and structural validation; SQL equality indexes now use this tree.
 - [x] SELECT ORDER BY ASC/DESC with multiple sort keys; disk-backed PDB6 scans sort matching result rows.
+- [x] WHERE predicates support equality/inequality and ordered comparisons, `IS NULL`, `IS NOT NULL`, and case-sensitive `LIKE` with `%` / `_` wildcards; predicates combine with `AND`. SQL comparisons to NULL do not match rows.
 - [ ] User-defined general composite indexes, indexed range scans, and a cost-aware index planner.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
@@ -55,6 +56,7 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] PDB6 PDM1 manifest is published by the SQL migration/commit path and validated during `Database::open`.
 - [x] Initial shared Pdb6Store over one ExtentFile/EmberTree root, with keyspace validation, atomic mixed mutation batches, bounded prefix scans, manifest access, and reopen tests.
 - [x] PDB6 P6R1 overflow row pages + P6D1 descriptors are used by SQL migration/load/commit, with checksummed reads, 64 MiB per-row / 256 MiB per-batch bounds, keyset scans, and shared CoW root publication for row/catalog/index mutations.
+- [x] Explicit `Database::create_pdb6` API and `create-pdb6` CLI create new PDB6 databases without overwriting existing files; new server databases initialize as PDB6, while existing PDB5 files remain compatible.
 - [x] PDB6 open loads catalog metadata and row counts without hydrating row payloads; SELECT and table-page reads stream validated rows from disk in bounded batches.
 - [x] PDB6 LIMIT stops disk reads early when ordering is not requested; COUNT(*) counts by streaming and does not materialize row payloads in its result.
 - [x] Committed PDB6 DML evicts temporary row caches; write transactions hydrate tables only when the first write is executed.
