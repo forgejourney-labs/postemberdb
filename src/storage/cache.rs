@@ -68,7 +68,12 @@ impl PageCache {
             self.pages.remove(page_id);
         }
         if !removed.is_empty() {
-            self.recency.retain(|page_id| !removed.contains(page_id));
+            // Every cached ID in this half-open range was removed above.
+            // Comparing bounds is O(1) per LRU node; Vec::contains here made
+            // range invalidation O(cache_capacity * removed_pages).
+            self.recency.retain(|page_id| {
+                *page_id < start_page_id || *page_id >= end_page_id
+            });
         }
     }
 
@@ -145,6 +150,33 @@ mod tests {
         cache.insert(3, b"three".to_vec());
         assert_eq!(cache.get(3), None);
         assert_eq!(cache.stats().resident_pages, 0);
+    }
+
+    #[test]
+    fn range_removal_keeps_lru_order_consistent_for_reinserted_pages() {
+        let mut cache = PageCache::new(3).unwrap();
+        cache.insert(10, b"ten".to_vec());
+        cache.insert(11, b"eleven".to_vec());
+        cache.insert(12, b"twelve".to_vec());
+
+        assert_eq!(cache.get(10), Some(b"ten".to_vec()));
+        cache.remove_range(11, 13);
+
+        assert_eq!(cache.get(11), None);
+        assert_eq!(cache.get(12), None);
+        assert_eq!(cache.get(10), Some(b"ten".to_vec()));
+
+        // Reusing a page ID after invalidation must create exactly one fresh
+        // recency entry rather than being shadowed by a stale queue entry.
+        cache.insert(12, b"twelve-new".to_vec());
+        cache.insert(13, b"thirteen".to_vec());
+        cache.insert(14, b"fourteen".to_vec());
+
+        assert_eq!(cache.get(10), None);
+        assert_eq!(cache.get(12), Some(b"twelve-new".to_vec()));
+        assert_eq!(cache.get(13), Some(b"thirteen".to_vec()));
+        assert_eq!(cache.get(14), Some(b"fourteen".to_vec()));
+        assert_eq!(cache.stats().resident_pages, 3);
     }
 
     #[test]
