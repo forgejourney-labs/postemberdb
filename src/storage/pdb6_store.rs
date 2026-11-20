@@ -19,6 +19,9 @@ const MAX_ROW_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const ROW_PAGE_MAGIC: &[u8; 4] = b"P6R1";
 const ROW_DESCRIPTOR_MAGIC: &[u8; 4] = b"P6D1";
 const ROW_PAGE_HEADER_BYTES: usize = 48;
+const SNAPSHOT_MAGIC: &[u8; 4] = b"PSN1";
+const MAX_SNAPSHOTS: usize = 10_000;
+const MAX_SNAPSHOT_NAME_BYTES: usize = 128;
 const ROW_CHUNK_BYTES: usize = extent::page_payload_size() - ROW_PAGE_HEADER_BYTES;
 const MAX_ROW_PAGES: usize = (MAX_ROW_BYTES + ROW_CHUNK_BYTES - 1) / ROW_CHUNK_BYTES;
 
@@ -76,6 +79,7 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 pub(crate) struct Pdb6Store {
     pages: ExtentFile,
     wal_path: PathBuf,
+    snapshot_path: PathBuf,
     _lock_file: File,
 }
 
@@ -96,7 +100,35 @@ impl Pdb6Store {
         let mut pages = ExtentFile::open_with_cache_capacity(pages_path, cache_capacity_pages)?;
         page_tree::recover(&mut pages, &wal_path)?;
         page_tree::validate_tree(&mut pages)?;
-        Ok(Self { pages, wal_path, _lock_file: lock_file })
+        Ok(Self { pages, wal_path, snapshot_path: sidecar(path, ".pdb6.snapshots"), _lock_file: lock_file })
+    }
+
+    /// Creates a durable named snapshot of the current immutable CoW root.
+    /// The snapshot registry is atomically replaced and synced before success is returned.
+    pub(crate) fn create_snapshot(&mut self, name: &str) -> Result<(), DbError> {
+        validate_snapshot_name(name)?;
+        let mut snapshots = read_snapshots(&self.snapshot_path)?;
+        if snapshots.contains_key(name) {
+            return Err(DbError::Constraint("PDB6 snapshot already exists".into()));
+        }
+        if snapshots.len() >= MAX_SNAPSHOTS {
+            return Err(DbError::Constraint("PDB6 snapshot registry is full".into()));
+        }
+        snapshots.insert(name.to_string(), self.pages.root_page_id());
+        write_snapshots(&self.snapshot_path, &snapshots)
+    }
+
+    /// Deletes a named snapshot. Pages remain allocated until a subsequent vacuum.
+    pub(crate) fn delete_snapshot(&mut self, name: &str) -> Result<bool, DbError> {
+        validate_snapshot_name(name)?;
+        let mut snapshots = read_snapshots(&self.snapshot_path)?;
+        if snapshots.remove(name).is_none() { return Ok(false); }
+        write_snapshots(&self.snapshot_path, &snapshots)?;
+        Ok(true)
+    }
+
+    pub(crate) fn list_snapshots(&self) -> Result<Vec<String>, DbError> {
+        Ok(read_snapshots(&self.snapshot_path)?.into_keys().collect())
     }
 
     pub(crate) fn prepare_participant_batch(
@@ -362,7 +394,15 @@ impl Pdb6Store {
     /// allocated. The exclusive PDB6 lock prevents another process publishing
     /// a root during this pass; retained snapshots/readers are not yet supported.
     pub(crate) fn vacuum_unreachable_tree_pages(&mut self) -> Result<u64, DbError> {
-        let reachable = page_tree::reachable_page_ids(&mut self.pages)?;
+        let snapshots = read_snapshots(&self.snapshot_path)?;
+        let mut reachable = page_tree::reachable_page_ids(&mut self.pages)?;
+        for root in snapshots.values().flatten().copied() {
+            reachable.extend(page_tree::reachable_page_ids_from_root(&mut self.pages, root)?);
+        }
+        // Snapshot roots can retain older row descriptors. Until descriptor
+        // traversal is available for arbitrary roots, conservatively retain every
+        // overflow page whenever at least one named snapshot exists.
+        let retain_all_overflow = !snapshots.is_empty();
         let row_prefix = [KEY_ROW];
         let mut live_overflow = BTreeSet::new();
         let mut cursor: Option<Vec<u8>> = None;
@@ -415,7 +455,7 @@ impl Pdb6Store {
             for page_id in start..end {
                 if reachable.contains(&page_id) || live_overflow.contains(&page_id) { continue; }
                 let payload = self.pages.read_page(page_id)?;
-                if payload.starts_with(b"EBL1") || payload.starts_with(b"EBI1") || payload.starts_with(ROW_PAGE_MAGIC) {
+                if payload.starts_with(b"EBL1") || payload.starts_with(b"EBI1") || (!retain_all_overflow && payload.starts_with(ROW_PAGE_MAGIC)) {
                     dead.push(page_id);
                 }
             }
@@ -532,6 +572,79 @@ impl Pdb6Store {
         )?;
         Ok(())
     }
+}
+
+fn validate_snapshot_name(name: &str) -> Result<(), DbError> {
+    if name.is_empty() || name.len() > MAX_SNAPSHOT_NAME_BYTES
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) {
+        return Err(DbError::Constraint("snapshot names must contain 1..=128 ASCII letters, digits, dots, underscores or hyphens".into()));
+    }
+    Ok(())
+}
+
+fn read_snapshots(path: &Path) -> Result<BTreeMap<String, Option<u64>>, DbError> {
+    if !path.exists() { return Ok(BTreeMap::new()); }
+    let bytes = fs::read(path).map_err(storage_error)?;
+    if bytes.len() < 16 || &bytes[..4] != SNAPSHOT_MAGIC {
+        return Err(DbError::Storage("invalid PDB6 snapshot registry header".into()));
+    }
+    let stored_checksum = u64::from_le_bytes(bytes[bytes.len()-8..].try_into().unwrap());
+    if super::checksum(&bytes[..bytes.len()-8]) != stored_checksum {
+        return Err(DbError::Storage("PDB6 snapshot registry checksum mismatch".into()));
+    }
+    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if count > MAX_SNAPSHOTS { return Err(DbError::Storage("PDB6 snapshot registry exceeds its entry limit".into())); }
+    let mut cursor = 8usize;
+    let mut snapshots = BTreeMap::new();
+    for _ in 0..count {
+        if cursor + 2 > bytes.len()-8 { return Err(DbError::Storage("truncated PDB6 snapshot name length".into())); }
+        let name_len = u16::from_le_bytes(bytes[cursor..cursor+2].try_into().unwrap()) as usize;
+        cursor += 2;
+        if name_len == 0 || name_len > MAX_SNAPSHOT_NAME_BYTES || cursor + name_len + 8 > bytes.len()-8 {
+            return Err(DbError::Storage("invalid PDB6 snapshot registry entry length".into()));
+        }
+        let name = std::str::from_utf8(&bytes[cursor..cursor+name_len])
+            .map_err(|_| DbError::Storage("PDB6 snapshot name is not UTF-8".into()))?.to_string();
+        validate_snapshot_name(&name)?;
+        cursor += name_len;
+        let root = u64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap());
+        cursor += 8;
+        if snapshots.insert(name, (root != u64::MAX).then_some(root)).is_some() {
+            return Err(DbError::Storage("duplicate PDB6 snapshot name".into()));
+        }
+    }
+    if cursor != bytes.len()-8 { return Err(DbError::Storage("trailing bytes in PDB6 snapshot registry".into())); }
+    Ok(snapshots)
+}
+
+fn write_snapshots(path: &Path, snapshots: &BTreeMap<String, Option<u64>>) -> Result<(), DbError> {
+    if snapshots.len() > MAX_SNAPSHOTS { return Err(DbError::Constraint("PDB6 snapshot registry is full".into())); }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(SNAPSHOT_MAGIC);
+    bytes.extend_from_slice(&(snapshots.len() as u32).to_le_bytes());
+    for (name, root) in snapshots {
+        validate_snapshot_name(name)?;
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&root.unwrap_or(u64::MAX).to_le_bytes());
+    }
+    let checksum = super::checksum(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    let mut temp_name = path.as_os_str().to_os_string();
+    temp_name.push(format!(".tmp-{}", std::process::id()));
+    let temp = PathBuf::from(temp_name);
+    let result = (|| {
+        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&temp).map_err(storage_error)?;
+        file.write_all(&bytes).map_err(storage_error)?;
+        file.sync_all().map_err(storage_error)?;
+        fs::rename(&temp, path).map_err(storage_error)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            File::open(parent).and_then(|directory| directory.sync_all()).map_err(storage_error)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temp); }
+    result
 }
 
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
