@@ -327,7 +327,7 @@ mod tests {
             "/path/that/does/not/exist/ca.pem",
             "admin",
             "a valid test password",
-        ).unwrap_err();
+        ).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         let error = RemoteClient::connect(
