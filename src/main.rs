@@ -13,6 +13,16 @@ fn main() {
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             server::run_server(&address, &data_path)
         }
+        Some("create-pdb6") => {
+            let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
+            match Database::create_pdb6(&data_path) {
+                Ok(_database) => {
+                    println!("Created a new PDB6 database at {data_path}; SQL rows use the page-backed PDB6 store.");
+                    Ok(())
+                }
+                Err(error) => Err(std::io::Error::other(error.to_string())),
+            }
+        }
         Some("migrate-pdb6") => {
             let data_path = args.next().unwrap_or_else(|| "postemberdb.pbd".into());
             match Database::open(&data_path).and_then(|mut database| database.migrate_to_pdb6()) {
@@ -119,6 +129,7 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  postemberdb server [127.0.0.1:7432] [data-file]");
     eprintln!("  postemberdb server-tls [0.0.0.0:7432] [data-file] [cert.pem] [key.pem]");
+    eprintln!("  postemberdb create-pdb6 [data-file]");
     eprintln!("  postemberdb migrate-pdb6 [data-file]");
     eprintln!("  postemberdb user add <data-file> <username> <admin|read-only|read-write>");
     eprintln!("  postemberdb check [data-file]");

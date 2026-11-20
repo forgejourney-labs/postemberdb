@@ -51,6 +51,8 @@ The project is at an early development stage. The first prototype provides:
 
 ## CLI
 
+Create a new page-backed SQL database with `cargo run -- create-pdb6 ./data/postemberdb.pbd`. Existing PDB5 databases can be explicitly promoted with `cargo run -- migrate-pdb6 ./data/postemberdb.pbd`; the original PDB5 snapshot is retained.
+
 See [docs/CLI.md](docs/CLI.md) for available commands and the planned operator command groups.
 
 ## Build and test

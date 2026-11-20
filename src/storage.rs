@@ -37,7 +37,26 @@ const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING: usize = 64 * 1024 * 1024;
 
 impl Database {
-    /// Open a persistent database. A missing file creates a new empty database.
+    /// Creates a new empty PDB6 database and makes its page store the SQL authority.
+    ///
+    /// Existing database files and PDB6 sidecars are never overwritten. Use
+    /// migrate_to_pdb6 for an existing PDB5 database.
+    pub fn create_pdb6(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
+        let mut pages_path = path.as_os_str().to_os_string();
+        pages_path.push(".pdb6.pages");
+        if path.exists() || PathBuf::from(pages_path).exists() {
+            return Err(DbError::Storage(
+                "refusing to create PDB6 over an existing database or PDB6 page store".into()
+            ));
+        }
+        let mut database = Self::open(path)?;
+        database.migrate_to_pdb6()?;
+        Ok(database)
+    }
+
+    /// Open a persistent database. A missing file creates a new legacy PDB5 database.
+    /// Use create_pdb6 for new page-backed databases; existing PDB5 files remain readable.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
