@@ -749,6 +749,75 @@ struct BatchQueryRequest {
     statements: Vec<String>,
 }
 
+fn active_admin_count_after(
+    store: &mut AuthStore,
+    excluded_user: Option<&str>,
+    excluded_role: Option<&str>,
+    excluded_membership: Option<(&str, &str)>,
+    user_permissions_override: Option<(&str, u32)>,
+    role_permissions_override: Option<(&str, u32)>,
+) -> Result<usize, postemberdb::DbError> {
+    let admin_bit = 1u32 << Permission::Admin as u8;
+    let roles = store.list_role_details()?.into_iter()
+        .map(|role| (role.name, role.permissions))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let users = store.list_user_details()?;
+    let mut active_admins = 0usize;
+    for user in users {
+        if !user.enabled || excluded_user.is_some_and(|name| name.eq_ignore_ascii_case(&user.username)) {
+            continue;
+        }
+        let direct = user_permissions_override
+            .filter(|(name, _)| name.eq_ignore_ascii_case(&user.username))
+            .map(|(_, permissions)| permissions)
+            .unwrap_or(user.permissions);
+        let direct_admin = direct & admin_bit != 0;
+        let role_admin = user.roles.iter().any(|role_name| {
+            if excluded_role.is_some_and(|name| name.eq_ignore_ascii_case(role_name)) {
+                return false;
+            }
+            if excluded_membership.is_some_and(|(username, role)| {
+                username.eq_ignore_ascii_case(&user.username) && role.eq_ignore_ascii_case(role_name)
+            }) {
+                return false;
+            }
+            let bits = role_permissions_override
+                .filter(|(name, _)| name.eq_ignore_ascii_case(role_name))
+                .map(|(_, permissions)| permissions)
+                .or_else(|| roles.get(role_name).copied())
+                .unwrap_or(0);
+            bits & admin_bit != 0
+        });
+        if direct_admin || role_admin {
+            active_admins += 1;
+        }
+    }
+    Ok(active_admins)
+}
+
+fn require_active_admin_after(
+    store: &mut AuthStore,
+    excluded_user: Option<&str>,
+    excluded_role: Option<&str>,
+    excluded_membership: Option<(&str, &str)>,
+    user_permissions_override: Option<(&str, u32)>,
+    role_permissions_override: Option<(&str, u32)>,
+) -> Result<(), postemberdb::DbError> {
+    if active_admin_count_after(
+        store,
+        excluded_user,
+        excluded_role,
+        excluded_membership,
+        user_permissions_override,
+        role_permissions_override,
+    )? == 0 {
+        return Err(postemberdb::DbError::Constraint(
+            "operation rejected: it would leave PostemberDB without an enabled administrator".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn handle_binary_admin_request(
     payload: &[u8],
     auth: Option<&Arc<std::sync::Mutex<AuthStore>>>,
@@ -781,7 +850,8 @@ fn handle_binary_admin_request(
             "users.create" => {
                 let username = text("username")?;
                 let password = text("password")?;
-                store.create_user(&username, &password, permission_set()?)?;
+                let permissions = permission_set()?;
+                store.create_user(&username, &password, permissions)?;
                 Ok(json!({"created": true, "username": username}))
             }
             "users.permissions" => {
@@ -789,7 +859,9 @@ fn handle_binary_admin_request(
                 if username.eq_ignore_ascii_case(&principal.username) {
                     return Err(postemberdb::DbError::Constraint("an administrator may not change their own direct permissions through this session".into()));
                 }
-                store.set_permissions(&username, permission_set()?)?;
+                let permissions = permission_set()?;
+                require_active_admin_after(store, None, None, None, Some((&username, permissions.bits())), None)?;
+                store.set_permissions(&username, permissions)?;
                 Ok(json!({"updated": true, "username": username}))
             }
             "users.enabled" => {
@@ -799,6 +871,9 @@ fn handle_binary_admin_request(
                 if username.eq_ignore_ascii_case(&principal.username) && !enabled {
                     return Err(postemberdb::DbError::Constraint("an administrator may not disable their own account through this session".into()));
                 }
+                if !enabled {
+                    require_active_admin_after(store, Some(&username), None, None, None, None)?;
+                }
                 store.set_enabled(&username, enabled)?;
                 Ok(json!({"updated": true, "username": username, "enabled": enabled}))
             }
@@ -807,6 +882,7 @@ fn handle_binary_admin_request(
                 if username.eq_ignore_ascii_case(&principal.username) {
                     return Err(postemberdb::DbError::Constraint("an administrator may not delete their own account through this session".into()));
                 }
+                require_active_admin_after(store, Some(&username), None, None, None, None)?;
                 let deleted = store.delete_user(&username)?;
                 Ok(json!({"deleted": deleted, "username": username}))
             }
@@ -816,9 +892,20 @@ fn handle_binary_admin_request(
                 store.create_role(&name, permission_set()?)?;
                 Ok(json!({"created": true, "name": name}))
             }
+            "users.password" => {
+                let username = text("username")?;
+                let password = text("password")?;
+                if username.eq_ignore_ascii_case(&principal.username) {
+                    return Err(postemberdb::DbError::Constraint("use the authenticated password-change flow to rotate your own password".into()));
+                }
+                store.change_password(&username, &password)?;
+                Ok(json!({"updated": true, "username": username, "password_changed": true}))
+            }
             "roles.permissions" => {
                 let name = text("name")?;
-                store.set_role_permissions(&name, permission_set()?)?;
+                let permissions = permission_set()?;
+                require_active_admin_after(store, None, None, None, None, Some((&name, permissions.bits())))?;
+                store.set_role_permissions(&name, permissions)?;
                 Ok(json!({"updated": true, "name": name}))
             }
             "roles.assign" => {
@@ -830,11 +917,13 @@ fn handle_binary_admin_request(
             "roles.revoke" => {
                 let username = text("username")?;
                 let role = text("role")?;
+                require_active_admin_after(store, None, None, Some((&username, &role)), None, None)?;
                 let revoked = store.revoke_role(&username, &role)?;
                 Ok(json!({"revoked": revoked, "username": username, "role": role}))
             }
             "roles.delete" => {
                 let name = text("name")?;
+                require_active_admin_after(store, None, Some(&name), None, None, None)?;
                 let deleted = store.delete_role(&name)?;
                 Ok(json!({"deleted": deleted, "name": name}))
             }
