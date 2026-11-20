@@ -445,7 +445,9 @@ impl ExtentFile {
         // interrupts the mirror, the first slot already contains the new one.
         #[cfg(test)]
         if take_metadata_failpoint(MetadataFailpoint::AfterPartialPrimaryWrite) {
-            let partial_len = PAGE_SIZE / 2;
+            // Tear the metadata inside its checksum-covered header. A half-page write
+            // would include the entire compact metadata record and could be valid.
+            let partial_len = 24;
             if let Err(error) = write_at(
                 &mut self.file,
                 first_slot * PAGE_SIZE as u64,
