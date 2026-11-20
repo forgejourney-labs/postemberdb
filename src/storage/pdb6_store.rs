@@ -23,6 +23,7 @@ const ROW_PAGE_HEADER_BYTES: usize = 48;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PSN1";
 const MAX_SNAPSHOTS: usize = 10_000;
 const MAX_SNAPSHOT_NAME_BYTES: usize = 128;
+const MAX_SNAPSHOT_REGISTRY_BYTES: usize = 8 + MAX_SNAPSHOTS * (2 + MAX_SNAPSHOT_NAME_BYTES + 8) + 8;
 const ROW_CHUNK_BYTES: usize = extent::page_payload_size() - ROW_PAGE_HEADER_BYTES;
 const MAX_ROW_PAGES: usize = (MAX_ROW_BYTES + ROW_CHUNK_BYTES - 1) / ROW_CHUNK_BYTES;
 
@@ -585,6 +586,10 @@ fn validate_snapshot_name(name: &str) -> Result<(), DbError> {
 
 fn read_snapshots(path: &Path) -> Result<BTreeMap<String, Option<u64>>, DbError> {
     if !path.exists() { return Ok(BTreeMap::new()); }
+    let metadata = fs::metadata(path).map_err(storage_error)?;
+    if metadata.len() > MAX_SNAPSHOT_REGISTRY_BYTES as u64 {
+        return Err(DbError::Storage("PDB6 snapshot registry exceeds its byte limit".into()));
+    }
     let bytes = fs::read(path).map_err(storage_error)?;
     if bytes.len() < 16 || &bytes[..4] != SNAPSHOT_MAGIC {
         return Err(DbError::Storage("invalid PDB6 snapshot registry header".into()));
