@@ -62,7 +62,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] PDB6 LIMIT stops disk reads early when ordering is not requested; COUNT(*) counts by streaming and does not materialize row payloads in its result.
 - [x] Committed PDB6 DML evicts temporary row caches; write transactions hydrate only the existing table addressed by each write, leaving unrelated tables disk-backed.
 - [x] The fixed-page cache uses an indexed intrusive LRU: cache hits and recency updates are O(1), while ordered page-range invalidation remains supported.
-- [ ] Bounded INSERT/UPDATE/DELETE staging without hydrating the complete affected table; shared bounded SQL row cache and page pinning remain unfinished.
+- [x] Supported plain INSERT and single-column UPDATE/DELETE statements stage changes without hydrating the complete affected table; UPDATE/DELETE enforce both a 5,000-row ceiling and a 128 MiB retained-row-value budget.
+- [ ] Shared bounded SQL row cache and page pinning across SQL operations remain unfinished.
 - [x] Mirrored EAM3 allocator metadata with durable root-page publication; EAM2 metadata remains readable and is migrated on the next metadata commit, one damaged copy is repaired from the valid copy, and two invalid copies fail closed.
 - [x] First-fit contiguous extent allocation, adjacent free-range coalescing, reuse, and reopen tests.
 - [x] Backward-compatible reads for earlier raw PDB1/PDB2/PDB3 snapshots plus current PDB4 payloads inside PPG1 page files.
