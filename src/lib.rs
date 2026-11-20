@@ -1444,7 +1444,8 @@ impl Database {
         }
 
         let inserted = batch.len();
-        if self.pdb6_mode && !table.rows_loaded {
+        let rows_loaded = table.rows_loaded;
+        if self.pdb6_mode && !rows_loaded {
             return self.insert_many_pdb6(&normalized, batch);
         }
         self.transaction(|transaction| {
@@ -2302,6 +2303,9 @@ mod tests {
                 Value::Integer(index),
             ]).collect::<Vec<_>>();
             assert_eq!(db.insert_many("players", rows).unwrap(), 2_000);
+            assert!(!db.tables["players"].rows_loaded,
+                "PDB6 insert_many must not hydrate the table cache");
+            assert_eq!(db.catalog().tables[0].row_count, 2_000);
         }
 
         {
