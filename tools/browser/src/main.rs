@@ -122,7 +122,10 @@ impl BrowserApp {
             return;
         }
 
-        let base_name = self.selected_table.as_deref().unwrap_or("query-results");
+        let raw_name = self.selected_table.as_deref().unwrap_or("query-results");
+        let base_name = raw_name.chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' { ch } else { '_' })
+            .collect::<String>();
         let filename = if self.browsing_table {
             format!("{base_name}.page-{}.{}", self.page_offset / PAGE_SIZE + 1, format)
         } else {
