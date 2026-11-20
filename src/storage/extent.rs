@@ -32,6 +32,8 @@ const FORMAT_VERSION: u32 = 3;
 enum MetadataFailpoint {
     AfterPrimarySync,
     AfterMirrorSync,
+    AfterPartialPrimaryWrite,
+    AfterFileExtension,
 }
 
 #[cfg(test)]
@@ -229,6 +231,13 @@ impl ExtentFile {
             if let Err(error) = self.file.sync_data() {
                 self.poisoned = true;
                 return Err(storage_error(error));
+            }
+            #[cfg(test)]
+            if take_metadata_failpoint(MetadataFailpoint::AfterFileExtension) {
+                self.poisoned = true;
+                return Err(DbError::Storage(
+                    "injected failure after allocator file extension".into(),
+                ));
             }
         }
         self.commit_metadata(next)?;
@@ -434,6 +443,27 @@ impl ExtentFile {
         // the acknowledged generation. If a crash interrupts the first write,
         // the untouched slot still contains the previous generation; if it
         // interrupts the mirror, the first slot already contains the new one.
+        #[cfg(test)]
+        if take_metadata_failpoint(MetadataFailpoint::AfterPartialPrimaryWrite) {
+            let partial_len = PAGE_SIZE / 2;
+            if let Err(error) = write_at(
+                &mut self.file,
+                first_slot * PAGE_SIZE as u64,
+                &encoded[..partial_len],
+            ) {
+                self.poisoned = true;
+                return Err(error);
+            }
+            if let Err(error) = self.file.sync_all() {
+                self.poisoned = true;
+                return Err(storage_error(error));
+            }
+            self.poisoned = true;
+            return Err(DbError::Storage(
+                "injected failure after partial primary allocator metadata write".into(),
+            ));
+        }
+
         if let Err(error) = write_at(&mut self.file, first_slot * PAGE_SIZE as u64, &encoded) {
             self.poisoned = true;
             return Err(error);
@@ -905,6 +935,51 @@ mod tests {
         assert_eq!(reopened.stats().next_page_id, 2);
         assert_eq!(reopened.stats().allocated_pages, 2);
         assert_eq!(reopened.allocate_extent(1).unwrap(), 2);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn torn_primary_metadata_write_recovers_previous_generation() {
+        use super::{set_metadata_failpoint, MetadataFailpoint};
+
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        let first = store.allocate_extent(1).unwrap();
+        assert_eq!(first, 0);
+
+        set_metadata_failpoint(Some(MetadataFailpoint::AfterPartialPrimaryWrite));
+        let error = store.allocate_extent(2).unwrap_err();
+        assert!(error.to_string().contains("partial primary allocator metadata"));
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.stats().next_page_id, 1);
+        assert_eq!(reopened.stats().allocated_pages, 1);
+        // The torn reservation was never committed and can safely be retried.
+        assert_eq!(reopened.allocate_extent(2).unwrap(), 1);
+        assert_eq!(reopened.stats().next_page_id, 3);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn crash_after_file_extension_does_not_publish_uncommitted_page_ids() {
+        use super::{set_metadata_failpoint, MetadataFailpoint};
+
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        set_metadata_failpoint(Some(MetadataFailpoint::AfterFileExtension));
+        let error = store.allocate_extent(4).unwrap_err();
+        assert!(error.to_string().contains("file extension"));
+        assert!(store.allocate_extent(1).is_err());
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.stats().next_page_id, 0);
+        assert_eq!(reopened.stats().allocated_pages, 0);
+        // Existing trailing bytes are harmless; the same IDs remain available.
+        assert_eq!(reopened.allocate_extent(1).unwrap(), 0);
         drop(reopened);
         fs::remove_file(path).unwrap();
     }
