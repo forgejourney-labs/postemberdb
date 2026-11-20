@@ -37,7 +37,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Unique composite primary-key indexes for SQL PRIMARY KEY constraints.
 - [x] Native B+ tree node splitting, point lookup, inclusive in-memory range scan, and structural validation; SQL equality indexes now use this tree.
 - [x] SELECT ORDER BY ASC/DESC with multiple sort keys; disk-backed PDB6 scans sort matching result rows.
-- [x] WHERE predicates support equality/inequality and ordered comparisons, `IS NULL`, `IS NOT NULL`, and case-sensitive `LIKE` with `%` / `_` wildcards; predicates combine with `AND`. SQL comparisons to NULL do not match rows.
+- [x] WHERE predicates support equality/inequality and ordered comparisons, `IS NULL`, `IS NOT NULL`, and case-sensitive `LIKE` with `%` / `_` wildcards; top-level `AND` / `OR` are supported with SQL precedence (`AND` before `OR`). SQL comparisons to NULL do not match rows.
+- [ ] Parenthesized boolean expressions, `NOT`, `IN`, `BETWEEN`, and full SQL three-valued boolean semantics remain unfinished.
 - [ ] User-defined general composite indexes, indexed range scans, and a cost-aware index planner.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
