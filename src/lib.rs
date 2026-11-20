@@ -1557,13 +1557,19 @@ mod tests {
         }
         {
             let mut db = Database::open(&path).unwrap();
+            assert!(!db.tables["players"].rows_loaded, "PDB6 open must not hydrate row payloads");
+            assert!(db.tables["players"].rows.is_empty());
+            assert_eq!(db.catalog().tables[0].row_count, 2);
             assert_eq!(db.execute("SELECT * FROM players WHERE uuid = 'player-a'").unwrap().rows.len(), 1);
+            assert!(!db.tables["players"].rows_loaded, "SELECT must keep the table row cache cold");
             db.execute("UPDATE players SET coins = 99 WHERE uuid = 'player-a'").unwrap();
+            assert!(!db.tables["players"].rows_loaded, "committed DML must evict its temporary full-table staging cache");
             db.execute("DELETE FROM players WHERE uuid = 'player-b'").unwrap();
             db.execute("INSERT INTO players VALUES ('player-c', 30)").unwrap();
         }
         {
             let mut db = Database::open(&path).unwrap();
+            assert!(!db.tables["players"].rows_loaded);
             let rows = db.execute("SELECT * FROM players").unwrap().rows;
             assert_eq!(rows.len(), 2);
             assert!(rows.iter().any(|row| row.values == vec![Value::Text("player-a".into()), Value::Integer(99)]));

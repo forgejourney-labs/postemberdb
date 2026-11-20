@@ -4,7 +4,7 @@
 
 PDB6 is the canonical SQL persistence format after explicit `Database::migrate_to_pdb6()`. `Database::open` detects and loads its published manifest; committed SQL writes publish catalog, row descriptors, index mutations and the manifest through one PDB6 CoW root. PDB5 remains the compatibility format for databases that have not been migrated.
 
-The current SQL executor still reconstructs complete table row vectors into RAM when opening PDB6 and stages full table state for writes. PDB6 `SELECT` and table-page reads now fetch validated row payloads directly from disk in bounded row-ID batches; `LIMIT` stops scanning early and `COUNT(*)` does not build a result vector of every row. This is an incremental disk-read improvement, not yet a fully lazy disk-native executor.
+PDB6 open now loads table schemas, index definitions and row counts without reading row payloads into RAM. PDB6 `SELECT` and table-page reads fetch validated row payloads directly from disk in bounded row-ID batches; `LIMIT` stops scanning early and `COUNT(*)` does not build a result vector of every row. Write transactions hydrate full table state temporarily to preserve existing constraint/index semantics, publish the PDB6 root, then evict that row cache before returning. This removes eager full-database RAM loading, but bounded DML staging and a shared bounded row cache are still required for a fully disk-native executor.
 
 ## Implemented PDB6 row-payload primitive
 
@@ -80,8 +80,10 @@ PDB5 migration must use a side-by-side target file or a new versioned sidecar, p
 - [ ] PDB5 read-only compatibility and restartable migration.
 - [x] PDB6 SQL commit path publishes row payloads, catalog and index changes through one CoW root after explicit migration.
 - [x] PDB6 SELECT and table-page reads stream row payloads from disk in bounded batches.
-- [ ] Remove eager PDB6 row reconstruction on open; replace full Vec<Row> with a bounded row cache and stable-ID disk accessor.
-- [ ] Stage INSERT/UPDATE/DELETE in bounded page batches without cloning whole tables; preserve unique-index validation and one-root atomic publication.
+- [x] Remove eager PDB6 row reconstruction on open; load catalog metadata and row counts only.
+- [x] Use stable-ID disk scans for SELECT/table-page reads and evict temporary full-table caches after committed DML.
+- [ ] Stage INSERT/UPDATE/DELETE in bounded page batches without hydrating/cloning whole tables; preserve unique-index validation and one-root atomic publication.
+- [ ] Add a shared bounded SQL row cache with explicit capacity, pinning and observable hit/miss/eviction metrics.
 - [ ] Lazy point reads, bounded scans, and shared buffer pool.
 - [x] Durable named snapshot roots and tree-page reachability across retained snapshots; PDB6's exclusive page-store lock serializes store access.
 - [ ] Active-reader epochs/pins, per-snapshot overflow-descriptor tracing, and crash-safe vacuum progress.

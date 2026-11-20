@@ -10,7 +10,7 @@ The current implementation has useful building blocks, but they are not yet one 
 
 - PDB5 remains the compatibility snapshot/WAL format for databases not explicitly migrated.
 - Explicitly migrated PDB6 databases use the shared CoW page tree, P6R1 overflow row pages, P6D1 descriptors, catalog/index keyspaces and one-root SQL commit publication.
-- PDB6 SELECT and table-page reads now fetch rows directly from disk in bounded batches, but Database::open still reconstructs full Table.rows vectors and DML still stages full table copies in RAM.
+- PDB6 open now loads metadata and row counts without hydrating row payloads. SELECT and table-page reads stream from disk in bounded batches; DML temporarily hydrates complete table state for validation/staging and evicts it after commit.
 - KV, Registry, RecordStore and EF7 still have sidecar storage domains; cross-domain atomicity must use the coordinator participant protocol.
 - page_tree retains replaced/deleted pages until reachability-aware vacuum proves safe reuse.
 - The server has verified TLS, authentication, RBAC and audit for Binary/1 remote sessions; the Admin web panel remains loopback-only.
