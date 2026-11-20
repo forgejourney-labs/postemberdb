@@ -4,7 +4,7 @@ use postemberdb::version::version_string;
 use std::ffi::OsString;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -106,8 +106,11 @@ fn append_sidecar_suffix(path: &str, suffix: &str) -> PathBuf {
 fn open_recovered_stores(
     data_path: &str,
 ) -> io::Result<(Database, KeyValueStore, Registry, EmberForge7Store, TransactionCoordinator)> {
-    let mut database = Database::open(data_path)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut database = if Path::new(data_path).exists() {
+        Database::open(data_path)
+    } else {
+        Database::create_pdb6(data_path)
+    }.map_err(|error| io::Error::other(error.to_string()))?;
     let mut kv = KeyValueStore::open(append_sidecar_suffix(data_path, ".kv"))
         .map_err(|error| io::Error::other(error.to_string()))?;
     let mut registry = Registry::open(append_sidecar_suffix(data_path, ".registry"))
