@@ -259,7 +259,14 @@ function renderRows(response){
   if(response.editable){
    const actions=document.createElement('td');
    const edit=textNode('button','Edit','secondary');edit.type='button';edit.addEventListener('click',()=>showRowEditor(row));
-   const remove=textNode('button','Delete','danger');remove.type='button';
+   const reset=textNode('button','Reset password','secondary');reset.type='button';
+  reset.addEventListener('click',async()=>{
+   const password=window.prompt('New password for '+user.username+' (at least 12 characters):');
+   if(password===null)return;
+   try{await adminRequest('users.password',{username:user.username,password});statusNode.textContent='Password changed for '+user.username;}
+   catch(error){statusNode.textContent='Password reset failed: '+error.message;}
+  });
+  const remove=textNode('button','Delete','danger');remove.type='button';
    remove.addEventListener('click',async()=>{
     if(!window.confirm('Delete row #'+row.row_id+'?'))return;
     try{
@@ -372,7 +379,7 @@ async function loadUsers(){
    try{await adminRequest('users.delete',{username:user.username});await loadUsers();}
    catch(error){statusNode.textContent=error.message;}
   });
-  actions.append(toggle,document.createTextNode(' '),setPermissions,document.createTextNode(' '),update,document.createTextNode(' '),remove);
+  actions.append(toggle,document.createTextNode(' '),setPermissions,document.createTextNode(' '),update,document.createTextNode(' '),reset,document.createTextNode(' '),remove);
   row.append(actions);body.append(row);
  }
  table.append(head,body);output.append(table);
