@@ -732,24 +732,21 @@ impl Database {
 
     /// Start an owned optimistic session for a client connection.
     pub fn begin_session(&self) -> DatabaseSession {
-        let mut staged = Database {
-            tables: self.tables.clone(),
-            storage_path: self.storage_path.clone(),
-            wal_path: None,
-            _lock_file: None,
-            wal_sequence: self.wal_sequence,
-            revision: self.revision,
-            pdb6_mode: self.pdb6_mode,
-            ember_indexes_valid: false,
-            ember_index_journal: Vec::new(),
-            ember_journal_supported: true,
-        };
-        let initialization_error = staged.hydrate_pdb6_rows().err().map(|error| error.to_string());
         DatabaseSession {
             base_revision: self.revision,
-            staged,
+            staged: Database {
+                tables: self.tables.clone(),
+                storage_path: self.storage_path.clone(),
+                wal_path: None,
+                _lock_file: None,
+                wal_sequence: self.wal_sequence,
+                revision: self.revision,
+                pdb6_mode: self.pdb6_mode,
+                ember_indexes_valid: false,
+                ember_index_journal: Vec::new(),
+                ember_journal_supported: true,
+            },
             statements: Vec::new(),
-            initialization_error,
         }
     }
 
@@ -845,9 +842,6 @@ impl Database {
 
     /// Commit a previously staged session if no other writer changed the database.
     pub fn commit_session(&mut self, session: DatabaseSession) -> Result<(), DbError> {
-        if let Some(error) = session.initialization_error {
-            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
-        }
         if session.base_revision != self.revision {
             return Err(DbError::TransactionConflict);
         }
@@ -892,15 +886,14 @@ impl Database {
     where
         F: FnOnce(&mut Transaction<'_>) -> Result<T, DbError>,
     {
-        self.hydrate_pdb6_rows()?;
         let staged = Database {
             tables: self.tables.clone(),
-            storage_path: None,
+            storage_path: self.storage_path.clone(),
             wal_path: None,
             _lock_file: None,
             wal_sequence: self.wal_sequence,
             revision: self.revision,
-            pdb6_mode: false,
+            pdb6_mode: self.pdb6_mode,
             ember_indexes_valid: false,
             ember_index_journal: Vec::new(),
             ember_journal_supported: true,
@@ -910,8 +903,19 @@ impl Database {
             staged,
             statements: Vec::new(),
         };
-        let value = operation(&mut transaction)?;
-        transaction.commit()?;
+        let value = match operation(&mut transaction) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(transaction);
+                self.evict_pdb6_row_cache();
+                return Err(error);
+            }
+        };
+        let commit_result = transaction.commit();
+        if commit_result.is_err() {
+            self.evict_pdb6_row_cache();
+        }
+        commit_result?;
         Ok(value)
     }
 
@@ -1441,20 +1445,19 @@ pub struct DatabaseSession {
     base_revision: u64,
     staged: Database,
     statements: Vec<String>,
-    initialization_error: Option<String>,
 }
 
 impl DatabaseSession {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
-        if let Some(error) = &self.initialization_error {
-            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
-        }
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE")
             || starts_with_kw(statement, "CREATE INDEX")
             || starts_with_kw(statement, "INSERT INTO")
             || starts_with_kw(statement, "UPDATE")
             || starts_with_kw(statement, "DELETE FROM");
+        if is_write {
+            self.staged.hydrate_pdb6_rows()?;
+        }
         let result = self.staged.execute_inner(statement)?;
         if is_write { self.statements.push(statement.to_owned()); }
         Ok(result)
@@ -1484,6 +1487,10 @@ impl Transaction<'_> {
             || starts_with_kw(statement, "INSERT INTO")
             || starts_with_kw(statement, "UPDATE")
             || starts_with_kw(statement, "DELETE FROM");
+        if is_write && self.database.pdb6_mode {
+            self.database.hydrate_pdb6_rows()?;
+            self.staged.hydrate_pdb6_rows()?;
+        }
         let result = self.staged.execute_inner(statement)?;
         if is_write {
             self.statements.push(statement.to_owned());
@@ -1500,6 +1507,7 @@ impl Transaction<'_> {
     /// Commit all staged writes as one WAL transaction.
     pub fn commit(self) -> Result<(), DbError> {
         if self.statements.is_empty() {
+            self.database.evict_pdb6_row_cache();
             return Ok(());
         }
         if self.database.pdb6_mode {
