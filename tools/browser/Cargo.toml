@@ -8,3 +8,5 @@ description = "Classic native desktop browser for PostemberDB"
 [dependencies]
 postemberdb = { path = "../.." }
 eframe = "0.29"
+
+serde_json = "1"

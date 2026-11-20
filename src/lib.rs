@@ -582,8 +582,8 @@ impl Database {
         let name = normalize_ident(table_name);
         let table = self.tables.get(&name)
             .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
-        let rows = table.rows.iter()
-            .skip(offset)
+        let page = table.rows.get(offset..).unwrap_or(&[]);
+        let rows = page.iter()
             .take(limit)
             .map(|row| Row { row_id: row.row_id, values: row.values.clone() })
             .collect::<Vec<_>>();

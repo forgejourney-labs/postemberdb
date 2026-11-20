@@ -273,7 +273,7 @@ async function runSQL(){
  statusNode.textContent='Executing…';resultsNode.replaceChildren();
  try{
   const result=await requestJson('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sqlNode.value})});
-  statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected;
+  statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected';
   renderResult(result);await loadCatalog();if(selectedTable)await loadRows(currentRows?currentRows.offset:0);
  }catch(error){statusNode.textContent='Query failed: '+error.message;}
 }

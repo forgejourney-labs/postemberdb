@@ -1,5 +1,7 @@
 use eframe::egui;
-use postemberdb::{CatalogSnapshot, Database, QueryResult};
+use postemberdb::{CatalogSnapshot, Database, QueryResult, Value};
+
+const PAGE_SIZE: usize = 100;
 
 struct BrowserApp {
     database_path: String,
@@ -7,6 +9,8 @@ struct BrowserApp {
     database: Option<Database>,
     catalog: CatalogSnapshot,
     selected_table: Option<String>,
+    page_offset: usize,
+    browsing_table: bool,
     result: Option<QueryResult>,
     status: String,
 }
@@ -19,6 +23,8 @@ impl Default for BrowserApp {
             database: None,
             catalog: CatalogSnapshot::default(),
             selected_table: None,
+            page_offset: 0,
+            browsing_table: false,
             result: None,
             status: "No database opened".into(),
         }
@@ -27,9 +33,7 @@ impl Default for BrowserApp {
 
 impl BrowserApp {
     fn refresh_catalog(&mut self) {
-        self.catalog = self.database.as_ref()
-            .map(Database::catalog)
-            .unwrap_or_default();
+        self.catalog = self.database.as_ref().map(Database::catalog).unwrap_or_default();
     }
 
     fn open_database(&mut self) {
@@ -38,6 +42,8 @@ impl BrowserApp {
                 self.catalog = database.catalog();
                 self.database = Some(database);
                 self.selected_table = None;
+                self.page_offset = 0;
+                self.browsing_table = false;
                 self.result = None;
                 self.status = format!("Opened {}", self.database_path.trim());
             }
@@ -45,6 +51,7 @@ impl BrowserApp {
                 self.database = None;
                 self.catalog = CatalogSnapshot::default();
                 self.selected_table = None;
+                self.browsing_table = false;
                 self.result = None;
                 self.status = format!("Open failed: {error}");
             }
@@ -56,13 +63,12 @@ impl BrowserApp {
             self.status = "Open a database first".into();
             return;
         };
-
-        let result = database.execute(self.sql.trim());
-        self.refresh_catalog();
-        match result {
+        self.browsing_table = false;
+        match database.execute(self.sql.trim()) {
             Ok(result) => {
                 self.status = result.message.clone();
                 self.result = Some(result);
+                self.refresh_catalog();
             }
             Err(error) => {
                 self.result = None;
@@ -71,10 +77,92 @@ impl BrowserApp {
         }
     }
 
+    fn load_table_page(&mut self, offset: usize) {
+        let Some(table_name) = self.selected_table.clone() else {
+            self.status = "Choose a table in Explorer first".into();
+            return;
+        };
+        let Some(database) = self.database.as_ref() else {
+            self.status = "Open a database first".into();
+            return;
+        };
+        match database.read_table_page(&table_name, offset, PAGE_SIZE) {
+            Ok(result) => {
+                self.page_offset = offset;
+                self.browsing_table = true;
+                self.status = result.message.clone();
+                self.result = Some(result);
+            }
+            Err(error) => {
+                self.result = None;
+                self.status = format!("Could not load table page: {error}");
+            }
+        }
+    }
+
     fn browse_table(&mut self, table_name: &str) {
         self.selected_table = Some(table_name.to_owned());
-        self.sql = format!("SELECT * FROM {table_name} LIMIT 100;");
-        self.execute_sql();
+        self.load_table_page(0);
+    }
+
+    fn total_rows(&self) -> usize {
+        self.selected_table.as_ref()
+            .and_then(|name| self.catalog.tables.iter().find(|table| &table.name == name))
+            .map(|table| table.row_count)
+            .unwrap_or(0)
+    }
+
+    fn export_result(&mut self, format: &str) {
+        let Some(result) = self.result.as_ref() else {
+            self.status = "There are no results to export".into();
+            return;
+        };
+        if result.columns.is_empty() {
+            self.status = "The current result has no rows or columns to export".into();
+            return;
+        }
+
+        let base_name = self.selected_table.as_deref().unwrap_or("query-results");
+        let filename = if self.browsing_table {
+            format!("{base_name}.page-{}.{}", self.page_offset / PAGE_SIZE + 1, format)
+        } else {
+            format!("{base_name}.{format}")
+        };
+
+        let content = if format == "csv" {
+            let mut lines = Vec::with_capacity(result.rows.len() + 1);
+            lines.push(result.columns.iter().map(|value| csv_cell(value)).collect::<Vec<_>>().join(","));
+            for row in &result.rows {
+                lines.push(row.values.iter().map(|value| csv_cell(&value.to_string())).collect::<Vec<_>>().join(","));
+            }
+            format!("\u{feff}{}", lines.join("\r\n"))
+        } else {
+            let rows = result.rows.iter().map(|row| {
+                let mut object = serde_json::Map::new();
+                for (column, value) in result.columns.iter().zip(row.values.iter()) {
+                    object.insert(column.clone(), value_to_json(value));
+                }
+                serde_json::Value::Object(object)
+            }).collect::<Vec<_>>();
+            serde_json::to_string_pretty(&rows).unwrap_or_else(|error| format!("JSON export failed: {error}"))
+        };
+
+        match std::fs::write(&filename, content) {
+            Ok(()) => self.status = format!("Exported {}", filename),
+            Err(error) => self.status = format!("Export failed: {error}"),
+        }
+    }
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(value) => serde_json::json!(value),
+        Value::Text(value) => serde_json::json!(value),
+        Value::Boolean(value) => serde_json::json!(value),
     }
 }
 
@@ -153,6 +241,7 @@ impl eframe::App for BrowserApp {
                 if ui.button("Clear").clicked() {
                     self.sql.clear();
                     self.result = None;
+                    self.browsing_table = false;
                 }
                 if let Some(table) = &self.selected_table {
                     ui.separator();
@@ -161,6 +250,23 @@ impl eframe::App for BrowserApp {
             });
             ui.separator();
             ui.heading("Results");
+            if self.browsing_table {
+                let total = self.total_rows();
+                let shown = self.result.as_ref().map(|result| result.rows.len()).unwrap_or(0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(self.page_offset > 0, egui::Button::new("◀ Previous")).clicked() {
+                        self.load_table_page(self.page_offset.saturating_sub(PAGE_SIZE));
+                    }
+                    if ui.add_enabled(self.page_offset + shown < total, egui::Button::new("Next ▶")).clicked() {
+                        self.load_table_page(self.page_offset.saturating_add(PAGE_SIZE));
+                    }
+                    ui.label(format!("Rows {}–{} of {}", if shown == 0 {0} else {self.page_offset + 1}, self.page_offset + shown, total));
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Export CSV").clicked() { self.export_result("csv"); }
+                if ui.button("Export JSON").clicked() { self.export_result("json"); }
+            });
             if let Some(result) = &self.result {
                 ui.label(format!("{} row(s) returned · {} affected", result.rows.len(), result.affected_rows));
                 if !result.columns.is_empty() {
