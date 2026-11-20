@@ -27,7 +27,7 @@ pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, E
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, find_unquoted_keyword, normalize_ident,
-    parse_equality_predicates, parse_order_by, parse_value, parse_where_predicates,
+    parse_order_by, parse_value, parse_where_predicates,
     split_csv, starts_with_kw, take_parenthesized, value_to_sql, validate_value,
 };
 
@@ -1260,7 +1260,10 @@ impl Database {
 
             let matching = if let Some(predicate) = predicate {
                 let predicates = parse_where_predicates(&table.columns, predicate)?;
-                if predicates.iter().all(|item| item.operator == ComparisonOperator::Equal) {
+                if predicates.iter().all(|item| {
+                    item.operator == ComparisonOperator::Equal
+                        && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
+                }) {
                     let equality = predicates.iter().map(|item| {
                         Ok((item.column_index, item.value.clone()
                             .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
@@ -1310,7 +1313,10 @@ impl Database {
             let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             let matches = if let Some(predicate) = predicate {
                 let predicates = parse_where_predicates(&table.columns, predicate)?;
-                let positions = if predicates.iter().all(|item| item.operator == ComparisonOperator::Equal) {
+                let positions = if predicates.iter().all(|item| {
+                    item.operator == ComparisonOperator::Equal
+                        && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
+                }) {
                     let equality = predicates.iter().map(|item| {
                         Ok((item.column_index, item.value.clone()
                             .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
@@ -1471,7 +1477,10 @@ impl Database {
         let selection_limit = if is_count || !order.is_empty() { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_where_predicates(&table.columns, predicate)?;
-            let equality = predicates.iter().all(|item| item.operator == ComparisonOperator::Equal);
+            let equality = predicates.iter().all(|item| {
+                item.operator == ComparisonOperator::Equal
+                    && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
+            });
             if equality {
                 let equality_values = predicates.iter().map(|item| {
                     Ok((item.column_index, item.value.clone()
@@ -1949,6 +1958,7 @@ mod tests {
 
         let nulls = db.execute("SELECT name FROM predicate_rows WHERE note IS NULL").unwrap();
         assert_eq!(nulls.rows[0].values[0], Value::Text("Ada".into()));
+        assert!(db.execute("SELECT name FROM predicate_rows WHERE score = NULL").unwrap().rows.is_empty());
 
         let not_equal = db.execute("SELECT name FROM predicate_rows WHERE score <> 20 ORDER BY score DESC").unwrap();
         assert_eq!(not_equal.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),

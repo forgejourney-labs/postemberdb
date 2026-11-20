@@ -202,30 +202,20 @@ pub(super) fn parse_where_predicates(
         let column_index = columns.iter().position(|column| column.name == column_name)
             .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
         if let Some(value) = &value {
-            validate_value(&columns[column_index], value)?;
+            if !matches!(value, Value::Null) {
+                validate_value(&columns[column_index], value)?;
+            }
         }
-        if operator == ComparisonOperator::Like && columns[column_index].data_type != DataType::Text {
+        if operator == ComparisonOperator::Like
+            && !matches!(value, Some(Value::Null))
+            && columns[column_index].data_type != DataType::Text
+        {
             return Err(DbError::TypeMismatch {
                 column: column_name,
                 expected: DataType::Text,
             });
         }
         Ok(SqlPredicate { column_index, operator, value })
-    }).collect()
-}
-
-pub(super) fn parse_equality_predicates(columns: &[Column], predicate: &str) -> Result<Vec<(usize, Value)>, DbError> {
-    let conditions = split_and_conditions(predicate);
-    if conditions.is_empty() {
-        return Err(DbError::Parse("empty WHERE predicate".into()));
-    }
-    conditions.into_iter().map(|condition| {
-        let equals = condition.find('=').ok_or_else(|| DbError::Parse("expected '=' in equality predicate".into()))?;
-        let column_name = normalize_ident(condition[..equals].trim());
-        let value = parse_value(condition[equals + 1..].trim())?;
-        let column_index = columns.iter().position(|column| column.name == column_name)
-            .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
-        Ok((column_index, value))
     }).collect()
 }
 
