@@ -819,10 +819,352 @@ impl Database {
             || starts_with_kw(statement, "INSERT INTO")
             || starts_with_kw(statement, "UPDATE")
             || starts_with_kw(statement, "DELETE FROM");
+        if self.pdb6_mode
+            && (starts_with_kw(statement, "INSERT INTO")
+                || starts_with_kw(statement, "UPDATE")
+                || starts_with_kw(statement, "DELETE FROM"))
+            && !statement.to_ascii_uppercase().contains("ON CONFLICT")
+            && !statement.to_ascii_uppercase().contains("ON DUPLICATE KEY")
+        {
+            return self.execute_pdb6_bounded_dml(statement);
+        }
         if is_write {
             return self.transaction(|transaction| transaction.execute(statement));
         }
         self.execute_inner(statement)
+    }
+
+    /// Executes one PDB6 DML statement with bounded row staging.
+    ///
+    /// Only rows matched by UPDATE/DELETE are retained in memory (up to the
+    /// storage transaction limit). Row payloads are read in stable-ID batches;
+    /// row descriptors, index entries, catalog counters and the manifest are
+    /// then published through one copy-on-write root.
+    fn execute_pdb6_bounded_dml(&mut self, statement: &str) -> Result<QueryResult, DbError> {
+        const SCAN_BATCH: usize = 512;
+        const MAX_CHANGED_ROWS: usize = 5_000;
+
+        self.ensure_no_prepared_sql_transactions()?;
+        let path = self.storage_path.clone()
+            .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
+        let generation = self.wal_sequence.checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
+
+        let (table_name, operation) = if starts_with_kw(statement, "INSERT INTO") {
+            let rest = statement["INSERT INTO".len()..].trim();
+            let values_pos = find_kw(rest, "VALUES")
+                .ok_or_else(|| DbError::Parse("expected VALUES".into()))?;
+            let target = rest[..values_pos].trim();
+            let (name, columns) = if let Some(open) = target.find('(') {
+                let (columns_text, _) = take_parenthesized(&target[open..])?;
+                (normalize_ident(target[..open].trim()), Some(
+                    split_csv(columns_text).into_iter().map(normalize_ident).collect::<Vec<_>>()
+                ))
+            } else {
+                (normalize_ident(target), None)
+            };
+            let (values_text, upsert_clause) = take_parenthesized(rest[values_pos + "VALUES".len()..].trim())?;
+            if !upsert_clause.trim().is_empty() {
+                return Err(DbError::Unsupported(
+                    "PDB6 bounded DML currently requires plain INSERT; UPSERT uses the compatibility transaction path".into()
+                ));
+            }
+            let supplied = split_csv(values_text).into_iter().map(parse_value).collect::<Result<Vec<_>, _>>()?;
+            (name, Pdb6DmlOperation::Insert { columns, supplied })
+        } else if starts_with_kw(statement, "UPDATE") {
+            let rest = statement["UPDATE".len()..].trim();
+            let set_pos = find_kw(rest, "SET")
+                .ok_or_else(|| DbError::Parse("expected SET in UPDATE".into()))?;
+            let name = normalize_ident(rest[..set_pos].trim());
+            let after_set = rest[set_pos + 3..].trim();
+            let where_pos = find_unquoted_keyword(after_set, " WHERE ");
+            let (assignment, predicate) = match where_pos {
+                Some(position) => (&after_set[..position], Some(after_set[position + 7..].trim())),
+                None => (after_set, None),
+            };
+            let equals = assignment.find('=')
+                .ok_or_else(|| DbError::Parse("expected '=' in UPDATE assignment".into()))?;
+            let column = normalize_ident(assignment[..equals].trim());
+            let value = parse_value(assignment[equals + 1..].trim())?;
+            (name, Pdb6DmlOperation::Update { column, value, predicate: predicate.map(str::to_owned) })
+        } else {
+            let rest = statement["DELETE FROM".len()..].trim();
+            let where_pos = find_unquoted_keyword(rest, " WHERE ");
+            let (table_part, predicate) = match where_pos {
+                Some(position) => (&rest[..position], Some(rest[position + 7..].trim())),
+                None => (rest, None),
+            };
+            (normalize_ident(table_part), Pdb6DmlOperation::Delete {
+                predicate: predicate.map(str::to_owned)
+            })
+        };
+
+        let table_schema = self.tables.get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?.clone();
+        if table_schema.rows_loaded {
+            return Err(DbError::Storage(
+                "PDB6 bounded DML expected a cold table cache; refusing an unsafe mixed cache write".into()
+            ));
+        }
+
+        let mut store = storage::pdb6_store::Pdb6Store::open(&path, 128)?;
+        let mut manifest = store.manifest()?
+            .ok_or_else(|| DbError::Storage("PDB6 SQL manifest is missing".into()))?;
+        let mut catalog = None;
+        for table_id in 1..=u64::from(manifest.table_count) {
+            let encoded = store.get(&storage::pdb6::table_key(table_id)?)?
+                .ok_or_else(|| DbError::Storage(format!("PDB6 manifest references missing table {table_id}")))?;
+            let candidate = storage::pdb6::CatalogTable::decode(&encoded)?;
+            if candidate.name == table_name {
+                catalog = Some(candidate);
+                break;
+            }
+        }
+        let mut catalog = catalog.ok_or_else(|| DbError::Storage(format!(
+            "PDB6 catalog does not contain table {table_name}"
+        )))?;
+        let table_id = catalog.table_id;
+        if catalog.columns.len() != table_schema.columns.len()
+            || catalog.indexes.len() != table_schema.indexes.len()
+        {
+            return Err(DbError::Storage("PDB6 catalog and in-memory SQL schema disagree".into()));
+        }
+
+        let index_definitions = table_schema.indexes.iter().enumerate()
+            .map(|(offset, (name, index))| (name.clone(), (offset as u64) + 1, index.column_indices.clone(), index.unique))
+            .collect::<Vec<_>>();
+
+        let mut row_upserts = Vec::<(u64, u64, Vec<u8>)>::new();
+        let mut row_removals = Vec::<Vec<u8>>::new();
+        let mut index_upserts = Vec::<(Vec<u8>, Vec<u8>)>::new();
+        let mut index_removals = Vec::<Vec<u8>>::new();
+        let affected_rows;
+
+        match operation {
+            Pdb6DmlOperation::Insert { columns, supplied } => {
+                let values = if let Some(names) = columns {
+                    if names.len() != supplied.len() {
+                        return Err(DbError::Constraint(format!(
+                            "{} insert columns but {} values", names.len(), supplied.len()
+                        )));
+                    }
+                    let mut row = vec![Value::Null; table_schema.columns.len()];
+                    let mut assigned = std::collections::BTreeSet::new();
+                    for (name, value) in names.iter().zip(supplied.into_iter()) {
+                        let index = table_schema.columns.iter().position(|column| column.name == *name)
+                            .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
+                        if !assigned.insert(index) {
+                            return Err(DbError::Constraint(format!("column listed more than once: {name}")));
+                        }
+                        row[index] = value;
+                    }
+                    row
+                } else {
+                    if supplied.len() != table_schema.columns.len() {
+                        return Err(DbError::Constraint(format!(
+                            "expected {} values, received {}", table_schema.columns.len(), supplied.len()
+                        )));
+                    }
+                    supplied
+                };
+                for (column, value) in table_schema.columns.iter().zip(&values) {
+                    validate_value(column, value)?;
+                }
+                for (_, index_id, columns, unique) in &index_definitions {
+                    if !unique { continue; }
+                    let encoded = storage::index_codec::encode_index_key(
+                        &IndexKey::from_columns(&values, columns)
+                    )?;
+                    let prefix = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                    if !store.scan_prefix(&prefix, 1)?.is_empty() {
+                        return Err(DbError::Constraint("duplicate key for unique SQL index".into()));
+                    }
+                }
+                let row_id = catalog.next_row_id;
+                catalog.next_row_id = catalog.next_row_id.checked_add(1)
+                    .ok_or_else(|| DbError::Storage("table row identifier space exhausted".into()))?;
+                let payload = storage::sql_rows::SqlRowStore::encode_values(&values, table_schema.columns.len())?;
+                row_upserts.push((table_id, row_id, payload));
+                for (_, index_id, columns, _) in &index_definitions {
+                    let encoded = storage::index_codec::encode_index_key(
+                        &IndexKey::from_columns(&values, columns)
+                    )?;
+                    let mut key = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                    key.extend_from_slice(&row_id.to_be_bytes());
+                    if key.len() > 1_024 {
+                        return Err(DbError::Constraint("PDB6 index key exceeds 1,024 bytes".into()));
+                    }
+                    index_upserts.push((key, Vec::new()));
+                }
+                affected_rows = 1;
+            }
+            Pdb6DmlOperation::Update { column, value, predicate } => {
+                let target_index = table_schema.columns.iter().position(|item| item.name == column)
+                    .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
+                validate_value(&table_schema.columns[target_index], &value)?;
+                let predicates = predicate.as_deref()
+                    .map(|text| parse_where_predicates(&table_schema.columns, text))
+                    .transpose()?.unwrap_or_default();
+                let mut changed = Vec::<Row>::new();
+                let mut after = None;
+                loop {
+                    let ids = store.scan_row_ids(table_id, after, SCAN_BATCH)?;
+                    if ids.is_empty() { break; }
+                    for row_id in &ids {
+                        let payload = store.get_row_payload(table_id, *row_id)?
+                            .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for row {row_id}")))?;
+                        let values = storage::sql_rows::SqlRowStore::decode_values(&payload, table_schema.columns.len())?;
+                        for (column, value) in table_schema.columns.iter().zip(&values) {
+                            validate_value(column, value)?;
+                        }
+                        if matches_sql_predicates(&values, &predicates) && values[target_index] != value {
+                            if changed.len() == MAX_CHANGED_ROWS {
+                                return Err(DbError::Constraint(format!(
+                                    "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
+                                )));
+                            }
+                            let mut new_values = values.clone();
+                            new_values[target_index] = value.clone();
+                            changed.push(Row { row_id: *row_id, values: new_values });
+                            // Keep old values in a side map for index maintenance.
+                            // The key is stable row ID, independent of page placement.
+                        }
+                    }
+                    after = ids.last().copied();
+                    if ids.len() < SCAN_BATCH { break; }
+                }
+                let changing_ids = changed.iter().map(|row| row.row_id).collect::<std::collections::BTreeSet<_>>();
+                for (_, index_id, columns, unique) in &index_definitions {
+                    if !unique || !columns.contains(&target_index) { continue; }
+                    let mut seen = std::collections::BTreeSet::new();
+                    for row in &changed {
+                        let encoded = storage::index_codec::encode_index_key(
+                            &IndexKey::from_columns(&row.values, columns)
+                        )?;
+                        if !seen.insert(encoded.clone()) {
+                            return Err(DbError::Constraint("UPDATE would create duplicate values in a unique index".into()));
+                        }
+                        let prefix = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                        for (key, _) in store.scan_prefix(&prefix, 5_000)? {
+                            if key.len() < 8 {
+                                return Err(DbError::Storage("invalid PDB6 SQL index row reference".into()));
+                            }
+                            let existing_id = u64::from_be_bytes(key[key.len()-8..].try_into().unwrap());
+                            if !changing_ids.contains(&existing_id) {
+                                return Err(DbError::Constraint("UPDATE conflicts with an existing unique index value".into()));
+                            }
+                        }
+                    }
+                }
+                for row in &changed {
+                    let old_payload = store.get_row_payload(table_id, row.row_id)?
+                        .ok_or_else(|| DbError::Storage("PDB6 row disappeared during bounded UPDATE".into()))?;
+                    let old_values = storage::sql_rows::SqlRowStore::decode_values(&old_payload, table_schema.columns.len())?;
+                    row_upserts.push((table_id, row.row_id,
+                        storage::sql_rows::SqlRowStore::encode_values(&row.values, table_schema.columns.len())?));
+                    for (_, index_id, columns, _) in &index_definitions {
+                        let old_key = storage::index_codec::encode_index_key(
+                            &IndexKey::from_columns(&old_values, columns)
+                        )?;
+                        let new_key = storage::index_codec::encode_index_key(
+                            &IndexKey::from_columns(&row.values, columns)
+                        )?;
+                        if old_key == new_key { continue; }
+                        let mut old_key = storage::pdb6::index_key(table_id, *index_id, &old_key)?;
+                        old_key.extend_from_slice(&row.row_id.to_be_bytes());
+                        index_removals.push(old_key);
+                        let mut new_key = storage::pdb6::index_key(table_id, *index_id, &new_key)?;
+                        new_key.extend_from_slice(&row.row_id.to_be_bytes());
+                        if new_key.len() > 1_024 {
+                            return Err(DbError::Constraint("PDB6 index key exceeds 1,024 bytes".into()));
+                        }
+                        index_upserts.push((new_key, Vec::new()));
+                    }
+                }
+                affected_rows = changed.len();
+            }
+            Pdb6DmlOperation::Delete { predicate } => {
+                let predicates = predicate.as_deref()
+                    .map(|text| parse_where_predicates(&table_schema.columns, text))
+                    .transpose()?.unwrap_or_default();
+                let mut removed = Vec::<Row>::new();
+                let mut after = None;
+                loop {
+                    let ids = store.scan_row_ids(table_id, after, SCAN_BATCH)?;
+                    if ids.is_empty() { break; }
+                    for row_id in &ids {
+                        let payload = store.get_row_payload(table_id, *row_id)?
+                            .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for row {row_id}")))?;
+                        let values = storage::sql_rows::SqlRowStore::decode_values(&payload, table_schema.columns.len())?;
+                        if matches_sql_predicates(&values, &predicates) {
+                            if removed.len() == MAX_CHANGED_ROWS {
+                                return Err(DbError::Constraint(format!(
+                                    "PDB6 bounded DELETE matches more than {MAX_CHANGED_ROWS} rows; split it into smaller statements"
+                                )));
+                            }
+                            removed.push(Row { row_id: *row_id, values });
+                        }
+                    }
+                    after = ids.last().copied();
+                    if ids.len() < SCAN_BATCH { break; }
+                }
+                for row in &removed {
+                    row_removals.push(storage::pdb6::row_key(table_id, row.row_id)?);
+                    for (_, index_id, columns, _) in &index_definitions {
+                        let encoded = storage::index_codec::encode_index_key(
+                            &IndexKey::from_columns(&row.values, columns)
+                        )?;
+                        let mut key = storage::pdb6::index_key(table_id, *index_id, &encoded)?;
+                        key.extend_from_slice(&row.row_id.to_be_bytes());
+                        index_removals.push(key);
+                    }
+                }
+                affected_rows = removed.len();
+            }
+        }
+
+        if affected_rows == 0 {
+            return Ok(QueryResult {
+                columns: Vec::new(), rows: Vec::new(), affected_rows: 0,
+                message: match statement.get(..6) {
+                    Some(prefix) if prefix.eq_ignore_ascii_case("UPDATE") => "0 row(s) updated".into(),
+                    _ => "0 row(s) deleted".into(),
+                },
+            });
+        }
+
+        manifest.generation = generation;
+        manifest.last_tx_id = manifest.last_tx_id.checked_add(1)
+            .ok_or_else(|| DbError::Storage("PDB6 transaction ID space exhausted".into()))?;
+        let catalog_bytes = catalog.encode()?;
+        let root_bytes = manifest.encode()?;
+        let mut metadata_upserts = vec![
+            (storage::pdb6::table_key(table_id)?, catalog_bytes),
+            (storage::pdb6::database_root_key(), root_bytes),
+        ];
+        metadata_upserts.append(&mut index_upserts);
+        store.apply_row_batch(row_upserts, metadata_upserts, row_removals.into_iter().chain(index_removals))?;
+
+        let table = self.tables.get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        table.next_row_id = catalog.next_row_id;
+        match operation {
+            Pdb6DmlOperation::Insert { .. } => table.persisted_row_count = table.persisted_row_count.saturating_add(1),
+            Pdb6DmlOperation::Delete { .. } => table.persisted_row_count = table.persisted_row_count.saturating_sub(affected_rows),
+            Pdb6DmlOperation::Update { .. } => {}
+        }
+        self.wal_sequence = generation;
+        self.revision = self.revision.wrapping_add(1);
+        self.ember_indexes_valid = false;
+
+        Ok(QueryResult {
+            columns: Vec::new(), rows: Vec::new(), affected_rows,
+            message: match statement.get(..6) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("INSERT") => "1 row inserted".into(),
+                Some(prefix) if prefix.eq_ignore_ascii_case("UPDATE") => format!("{affected_rows} row(s) updated"),
+                _ => format!("{affected_rows} row(s) deleted"),
+            },
+        })
     }
 
     /// Execute SQL with typed positional parameters. Placeholders inside quoted
@@ -831,6 +1173,13 @@ impl Database {
         let bound = bind_parameters(sql, parameters)?;
         self.execute(&bound)
     }
+
+#[derive(Debug)]
+enum Pdb6DmlOperation {
+    Insert { columns: Option<Vec<String>>, supplied: Vec<Value> },
+    Update { column: String, value: Value, predicate: Option<String> },
+    Delete { predicate: Option<String> },
+}
 
     fn execute_inner(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         let result = if starts_with_kw(statement, "CREATE TABLE") {
