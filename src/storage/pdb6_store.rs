@@ -695,7 +695,7 @@ mod tests {
     }
 
     fn cleanup(path: &Path) {
-        for suffix in [".pdb6.lock", ".pdb6.pages", ".pdb6.wal"] {
+        for suffix in [".pdb6.lock", ".pdb6.pages", ".pdb6.wal", ".pdb6.snapshots", ".pdb6.snapshots.tmp"] {
             let _ = fs::remove_file(sidecar(path, suffix));
         }
     }
@@ -858,6 +858,54 @@ mod tests {
             let reclaimed = store.vacuum_unreachable_tree_pages().unwrap();
             assert!(reclaimed >= u64::from(descriptor.page_count));
             assert_eq!(store.get_row_payload(77, 9001).unwrap(), None);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn named_snapshots_survive_reopen_and_pin_tree_and_overflow_pages_until_vacuum() {
+        let path = temp_path();
+        let payload = vec![0x4d; 100_000];
+        let old_root_pages;
+        let overflow_descriptor;
+        {
+            let mut store = Pdb6Store::open(&path, 32).unwrap();
+            store.apply_row_batch(
+                vec![(91, 7001, payload.clone())],
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+                Vec::<Vec<u8>>::new(),
+            ).unwrap();
+            old_root_pages = page_tree::reachable_page_ids(&mut store.pages).unwrap();
+            overflow_descriptor = RowPayloadDescriptor::decode(
+                &store.get(&crate::storage::pdb6::row_key(91, 7001).unwrap()).unwrap().unwrap()
+            ).unwrap();
+            store.create_snapshot("before-delete").unwrap();
+            assert!(store.create_snapshot("before-delete").is_err());
+            assert_eq!(store.list_snapshots().unwrap(), vec!["before-delete"]);
+            store.apply_batch(
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+                vec![crate::storage::pdb6::row_key(91, 7001).unwrap()],
+            ).unwrap();
+            assert_eq!(store.get_row_payload(91, 7001).unwrap(), None);
+            assert!(store.vacuum_unreachable_tree_pages().unwrap() > 0);
+            for page_id in &old_root_pages { assert!(store.pages.read_page(*page_id).is_ok()); }
+            for index in 0..overflow_descriptor.page_count {
+                assert!(store.pages.read_page(overflow_descriptor.first_page_id + u64::from(index)).is_ok());
+            }
+        }
+        {
+            let mut reopened = Pdb6Store::open(&path, 32).unwrap();
+            assert_eq!(reopened.list_snapshots().unwrap(), vec!["before-delete"]);
+            for page_id in &old_root_pages { assert!(reopened.pages.read_page(*page_id).is_ok()); }
+            assert!(reopened.delete_snapshot("before-delete").unwrap());
+            assert!(!reopened.delete_snapshot("before-delete").unwrap());
+            assert!(reopened.vacuum_unreachable_tree_pages().unwrap() > 0);
+            for page_id in &old_root_pages { assert!(reopened.pages.read_page(*page_id).is_err()); }
+            for index in 0..overflow_descriptor.page_count {
+                assert!(reopened.pages.read_page(overflow_descriptor.first_page_id + u64::from(index)).is_err());
+            }
+            assert!(reopened.list_snapshots().unwrap().is_empty());
+            assert!(reopened.create_snapshot("invalid/name").is_err());
         }
         cleanup(&path);
     }
