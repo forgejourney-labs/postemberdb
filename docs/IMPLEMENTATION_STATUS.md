@@ -133,7 +133,9 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 - [x] KSL bridge independently validates loopback destinations and refuses remote database hosts.
 - [x] Bounded client count, SQL line size, UTF-8 input, and socket timeouts.
 - [x] CLI recovery check and WAL checkpoint commands.
-- [ ] TLS, authentication, role-based authorization, and audit log.
+- [x] Argon2id user authentication, persisted permission bitsets, enabled/disabled users, password rotation, and durable checksummed audit events for login outcomes and user administration; user mutations and their audit records share one atomic page-tree batch.
+- [ ] Named roles and role membership, actor-attributed administrative authorization, audit retention/export policy, and audit tamper-evidence beyond per-record checksums.
+- [ ] Mutual TLS and per-user rate/connection quotas.
 - [ ] Encryption at rest and managed key rotation.
 - [ ] Verified full/incremental backup and restore.
 - [ ] Fuzzing, corruption tests, and fault-injection release suite.
@@ -257,7 +259,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Standalone JDBC Maven module with Connection, Statement, PreparedStatement, ResultSet, metadata basics, TLS and JSONL/1 transport.
 - [ ] Server-side prepared-statement protocol, streaming ResultSets, JDBC batch/generated keys/savepoints, and complete JDBC metadata remain pending.
 - [x] Durable password rotation with independent Argon2 salt/hash persistence.
-- [ ] Mutual TLS, per-user rate/connection quotas, audit logging, and schema/table-scoped grants remain pending.
+- [x] Durable authentication audit events are stored in the auth sidecar with monotonic sequence IDs, checksums, bounded page reads, and no password material.
+- [ ] Named roles, actor-attributed administrative audit identity, audit retention/export, mutual TLS, per-user rate/connection quotas, and schema/table-scoped grants remain pending.
 
 ## Vacuum and snapshots
 
