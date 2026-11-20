@@ -336,7 +336,7 @@ mod tests {
             "/path/that/does/not/exist/ca.pem",
             "admin",
             "a valid test password",
-        ).unwrap_err();
+        ).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -348,7 +348,7 @@ mod tests {
             "/path/that/does/not/exist/ca.pem",
             "admin\nAUTH root anything",
             "valid password",
-        ).unwrap_err();
+        ).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         let error = RemoteClient::connect(
@@ -357,7 +357,7 @@ mod tests {
             "/path/that/does/not/exist/ca.pem",
             "admin",
             &"p".repeat(1025),
-        ).unwrap_err();
+        ).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
