@@ -1025,9 +1025,6 @@ impl Database {
                         for (column, value) in table_schema.columns.iter().zip(&values) {
                             validate_value(column, value)?;
                         }
-                        for (column, value) in table_schema.columns.iter().zip(&values) {
-                            validate_value(column, value)?;
-                        }
                         if matches_sql_predicates(&values, &predicates) {
                             matched_count = matched_count.checked_add(1)
                                 .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
@@ -1139,12 +1136,15 @@ impl Database {
         }
 
         if affected_rows == 0 || (row_upserts.is_empty() && row_removals.is_empty()) {
+            let message = if starts_with_kw(statement, "UPDATE") {
+                format!("{affected_rows} row(s) updated")
+            } else if starts_with_kw(statement, "DELETE FROM") {
+                format!("{affected_rows} row(s) deleted")
+            } else {
+                "0 row(s) affected".into()
+            };
             return Ok(QueryResult {
-                columns: Vec::new(), rows: Vec::new(), affected_rows: 0,
-                message: match statement.get(..6) {
-                    Some(prefix) if prefix.eq_ignore_ascii_case("UPDATE") => "0 row(s) updated".into(),
-                    _ => "0 row(s) deleted".into(),
-                },
+                columns: Vec::new(), rows: Vec::new(), affected_rows, message,
             });
         }
 
