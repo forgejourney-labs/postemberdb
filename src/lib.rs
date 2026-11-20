@@ -2306,6 +2306,16 @@ mod tests {
             assert!(!db.tables["players"].rows_loaded,
                 "PDB6 insert_many must not hydrate the table cache");
             assert_eq!(db.catalog().tables[0].row_count, 2_000);
+            assert!(db.insert_many("players", vec![
+                vec![Value::Text("player-0000".into()), Value::Integer(9_999)],
+                vec![Value::Text("player-3000".into()), Value::Integer(3_000)],
+            ]).is_err(), "bulk insert must reject a key already present on disk");
+            assert!(db.insert_many("players", vec![
+                vec![Value::Text("player-3001".into()), Value::Integer(3_001)],
+                vec![Value::Text("player-3001".into()), Value::Integer(3_002)],
+            ]).is_err(), "bulk insert must reject duplicate unique keys within one batch");
+            assert_eq!(db.catalog().tables[0].row_count, 2_000);
+            assert!(!db.tables["players"].rows_loaded);
         }
 
         {
@@ -2319,6 +2329,24 @@ mod tests {
             assert_eq!(updated.affected_rows, 1);
             assert!(!db.tables["players"].rows_loaded,
                 "bounded UPDATE must not hydrate the full table");
+
+            let unchanged = db.execute(
+                "UPDATE players SET coins = 777 WHERE uuid = 'player-1000'"
+            ).unwrap();
+            assert_eq!(unchanged.affected_rows, 1,
+                "same-value UPDATE must preserve matched-row semantics");
+            assert!(!db.tables["players"].rows_loaded);
+
+            let key_changed = db.execute(
+                "UPDATE players SET uuid = 'player-2000' WHERE uuid = 'player-1000'"
+            ).unwrap();
+            assert_eq!(key_changed.affected_rows, 1);
+            assert_eq!(
+                db.execute("SELECT coins FROM players WHERE uuid = 'player-2000'").unwrap().rows[0].values[0],
+                Value::Integer(777)
+            );
+            db.execute("UPDATE players SET uuid = 'player-1000' WHERE uuid = 'player-2000'").unwrap();
+            assert!(!db.tables["players"].rows_loaded);
 
             let duplicate = db.execute(
                 "UPDATE players SET uuid = 'player-0002' WHERE uuid = 'player-1001'"
