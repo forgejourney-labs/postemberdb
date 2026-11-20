@@ -634,6 +634,13 @@ pub struct Database {
     ember_journal_supported: bool,
 }
 
+#[derive(Debug)]
+enum Pdb6DmlOperation {
+    Insert { columns: Option<Vec<String>>, supplied: Vec<Value> },
+    Update { column: String, value: Value, predicate: Option<String> },
+    Delete { predicate: Option<String> },
+}
+
 impl Default for Database {
     fn default() -> Self {
         Self {
@@ -940,7 +947,7 @@ impl Database {
         let mut index_removals = Vec::<Vec<u8>>::new();
         let affected_rows;
 
-        match operation {
+        match &operation {
             Pdb6DmlOperation::Insert { columns, supplied } => {
                 let values = if let Some(names) = columns {
                     if names.len() != supplied.len() {
@@ -950,13 +957,13 @@ impl Database {
                     }
                     let mut row = vec![Value::Null; table_schema.columns.len()];
                     let mut assigned = std::collections::BTreeSet::new();
-                    for (name, value) in names.iter().zip(supplied.into_iter()) {
+                    for (name, value) in names.iter().zip(supplied.iter()) {
                         let index = table_schema.columns.iter().position(|column| column.name == *name)
                             .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
                         if !assigned.insert(index) {
                             return Err(DbError::Constraint(format!("column listed more than once: {name}")));
                         }
-                        row[index] = value;
+                        row[index] = value.clone();
                     }
                     row
                 } else {
@@ -965,7 +972,7 @@ impl Database {
                             "expected {} values, received {}", table_schema.columns.len(), supplied.len()
                         )));
                     }
-                    supplied
+                    supplied.clone()
                 };
                 for (column, value) in table_schema.columns.iter().zip(&values) {
                     validate_value(column, value)?;
@@ -999,13 +1006,14 @@ impl Database {
                 affected_rows = 1;
             }
             Pdb6DmlOperation::Update { column, value, predicate } => {
-                let target_index = table_schema.columns.iter().position(|item| item.name == column)
+                let target_index = table_schema.columns.iter().position(|item| item.name == *column)
                     .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
-                validate_value(&table_schema.columns[target_index], &value)?;
+                validate_value(&table_schema.columns[target_index], value)?;
                 let predicates = predicate.as_deref()
                     .map(|text| parse_where_predicates(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
                 let mut changed = Vec::<Row>::new();
+                let mut matched_count = 0usize;
                 let mut after = None;
                 loop {
                     let ids = store.scan_row_ids(table_id, after, SCAN_BATCH)?;
@@ -1017,14 +1025,21 @@ impl Database {
                         for (column, value) in table_schema.columns.iter().zip(&values) {
                             validate_value(column, value)?;
                         }
-                        if matches_sql_predicates(&values, &predicates) && values[target_index] != value {
+                        for (column, value) in table_schema.columns.iter().zip(&values) {
+                            validate_value(column, value)?;
+                        }
+                        if matches_sql_predicates(&values, &predicates) {
+                            matched_count = matched_count.checked_add(1)
+                                .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
+                        }
+                        if matches_sql_predicates(&values, &predicates) && values[target_index] != *value {
                             if changed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
                                 )));
                             }
                             let mut new_values = values.clone();
-                            new_values[target_index] = value.clone();
+                            new_values[target_index] = (*value).clone();
                             changed.push(Row { row_id: *row_id, values: new_values });
                             // Keep old values in a side map for index maintenance.
                             // The key is stable row ID, independent of page placement.
@@ -1081,7 +1096,7 @@ impl Database {
                         index_upserts.push((new_key, Vec::new()));
                     }
                 }
-                affected_rows = changed.len();
+                affected_rows = matched_count;
             }
             Pdb6DmlOperation::Delete { predicate } => {
                 let predicates = predicate.as_deref()
@@ -1123,7 +1138,7 @@ impl Database {
             }
         }
 
-        if affected_rows == 0 {
+        if affected_rows == 0 || (row_upserts.is_empty() && row_removals.is_empty()) {
             return Ok(QueryResult {
                 columns: Vec::new(), rows: Vec::new(), affected_rows: 0,
                 message: match statement.get(..6) {
@@ -1148,7 +1163,7 @@ impl Database {
         let table = self.tables.get_mut(&table_name)
             .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
         table.next_row_id = catalog.next_row_id;
-        match operation {
+        match &operation {
             Pdb6DmlOperation::Insert { .. } => table.persisted_row_count = table.persisted_row_count.saturating_add(1),
             Pdb6DmlOperation::Delete { .. } => table.persisted_row_count = table.persisted_row_count.saturating_sub(affected_rows),
             Pdb6DmlOperation::Update { .. } => {}
@@ -1173,13 +1188,6 @@ impl Database {
         let bound = bind_parameters(sql, parameters)?;
         self.execute(&bound)
     }
-
-#[derive(Debug)]
-enum Pdb6DmlOperation {
-    Insert { columns: Option<Vec<String>>, supplied: Vec<Value> },
-    Update { column: String, value: Value, predicate: Option<String> },
-    Delete { predicate: Option<String> },
-}
 
     fn execute_inner(&mut self, statement: &str) -> Result<QueryResult, DbError> {
         let result = if starts_with_kw(statement, "CREATE TABLE") {
