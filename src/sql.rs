@@ -1,6 +1,6 @@
 //! SQL token helpers and the currently supported SQL subset parser.
 
-use super::{Column, DataType, DbError, IndexKey, Table, Value};
+use super::{Column, ComparisonOperator, DataType, DbError, IndexKey, SqlPredicate, Table, Value};
 
 pub(super) fn take_parenthesized(input: &str) -> Result<(&str, &str), DbError> {
     let input = input.trim_start();
@@ -163,6 +163,54 @@ pub(super) fn parse_order_by(columns: &[Column], clause: &str) -> Result<Vec<(us
         let index = columns.iter().position(|column| column.name == name)
             .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
         Ok((index, descending))
+    }).collect()
+}
+
+pub(super) fn parse_where_predicates(
+    columns: &[Column],
+    predicate: &str,
+) -> Result<Vec<SqlPredicate>, DbError> {
+    let conditions = split_and_conditions(predicate);
+    if conditions.is_empty() || conditions.iter().any(|condition| condition.is_empty()) {
+        return Err(DbError::Parse("empty WHERE predicate".into()));
+    }
+    conditions.into_iter().map(|condition| {
+        let trimmed = condition.trim();
+        let (left, operator, value) = if let Some(position) = find_unquoted_keyword(trimmed, " IS NOT NULL") {
+            (&trimmed[..position], ComparisonOperator::IsNotNull, None)
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NULL") {
+            (&trimmed[..position], ComparisonOperator::IsNull, None)
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " LIKE ") {
+            (&trimmed[..position], ComparisonOperator::Like, Some(parse_value(trimmed[position + 6..].trim())?))
+        } else {
+            let operators = [
+                ("<=", ComparisonOperator::LessOrEqual),
+                (">=", ComparisonOperator::GreaterOrEqual),
+                ("<>", ComparisonOperator::NotEqual),
+                ("!=", ComparisonOperator::NotEqual),
+                ("=", ComparisonOperator::Equal),
+                ("<", ComparisonOperator::Less),
+                (">", ComparisonOperator::Greater),
+            ];
+            let found = operators.iter().find_map(|(token, operator)| {
+                find_unquoted_keyword(trimmed, token).map(|position| (position, *operator, token.len()))
+            }).ok_or_else(|| DbError::Parse(format!("unsupported WHERE predicate: {trimmed}")))?;
+            let (position, operator, width) = found;
+            (&trimmed[..position], operator, Some(parse_value(trimmed[position + width..].trim())?))
+        };
+        let column_name = normalize_ident(left);
+        let column_index = columns.iter().position(|column| column.name == column_name)
+            .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
+        if let Some(value) = &value {
+            validate_value(&columns[column_index], value)?;
+        }
+        if operator == ComparisonOperator::Like && columns[column_index].data_type != DataType::Text {
+            return Err(DbError::TypeMismatch {
+                column: column_name,
+                expected: DataType::Text,
+            });
+        }
+        Ok(SqlPredicate { column_index, operator, value })
     }).collect()
 }
 

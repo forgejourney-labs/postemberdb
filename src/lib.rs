@@ -27,8 +27,8 @@ pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, E
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, find_unquoted_keyword, normalize_ident,
-    parse_equality_predicates, parse_order_by, parse_value, split_csv, starts_with_kw,
-    take_parenthesized, value_to_sql, validate_value,
+    parse_equality_predicates, parse_order_by, parse_value, parse_where_predicates,
+    split_csv, starts_with_kw, take_parenthesized, value_to_sql, validate_value,
 };
 
 /// Runtime statistics for the bounded fixed-page buffer pool.
@@ -155,6 +155,85 @@ impl fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Like,
+    IsNull,
+    IsNotNull,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SqlPredicate {
+    pub column_index: usize,
+    pub operator: ComparisonOperator,
+    pub value: Option<Value>,
+}
+
+fn sql_like_matches(value: &str, pattern: &str) -> bool {
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        match token {
+            '%' => {
+                current[0] = previous[0];
+                for index in 1..=value.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            '_' => {
+                for index in 1..=value.len() {
+                    current[index] = previous[index - 1];
+                }
+            }
+            literal => {
+                for index in 1..=value.len() {
+                    current[index] = previous[index - 1] && value[index - 1] == literal;
+                }
+            }
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
+fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool {
+    predicates.iter().all(|predicate| {
+        let Some(value) = values.get(predicate.column_index) else { return false; };
+        match predicate.operator {
+            ComparisonOperator::IsNull => matches!(value, Value::Null),
+            ComparisonOperator::IsNotNull => !matches!(value, Value::Null),
+            _ if matches!(value, Value::Null) => false,
+            ComparisonOperator::Like => match (value, predicate.value.as_ref()) {
+                (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
+                _ => false,
+            },
+            operator => {
+                let Some(expected) = predicate.value.as_ref() else { return false; };
+                if matches!(expected, Value::Null) { return false; }
+                let ordering = compare_sql_values(value, expected);
+                match operator {
+                    ComparisonOperator::Equal => ordering == std::cmp::Ordering::Equal,
+                    ComparisonOperator::NotEqual => ordering != std::cmp::Ordering::Equal,
+                    ComparisonOperator::Less => ordering == std::cmp::Ordering::Less,
+                    ComparisonOperator::LessOrEqual => ordering != std::cmp::Ordering::Greater,
+                    ComparisonOperator::Greater => ordering == std::cmp::Ordering::Greater,
+                    ComparisonOperator::GreaterOrEqual => ordering != std::cmp::Ordering::Less,
+                    ComparisonOperator::Like | ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
+                }
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexAtom {
@@ -1180,8 +1259,19 @@ impl Database {
             validate_value(&table.columns[target_index], &new_value)?;
 
             let matching = if let Some(predicate) = predicate {
-                let predicates = parse_equality_predicates(&table.columns, predicate)?;
-                table.matching_rows_for_predicates(&predicates)
+                let predicates = parse_where_predicates(&table.columns, predicate)?;
+                if predicates.iter().all(|item| item.operator == ComparisonOperator::Equal) {
+                    let equality = predicates.iter().map(|item| {
+                        Ok((item.column_index, item.value.clone()
+                            .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
+                    }).collect::<Result<Vec<_>, DbError>>()?;
+                    table.matching_rows_for_predicates(&equality)
+                } else {
+                    table.rows.iter().enumerate()
+                        .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                        .map(|(position, _)| position)
+                        .collect()
+                }
             } else {
                 (0..table.rows.len()).collect()
             };
@@ -1219,8 +1309,20 @@ impl Database {
         let (removed, deltas) = {
             let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             let matches = if let Some(predicate) = predicate {
-                let predicates = parse_equality_predicates(&table.columns, predicate)?;
-                table.matching_rows_for_predicates(&predicates).into_iter().collect::<std::collections::BTreeSet<_>>()
+                let predicates = parse_where_predicates(&table.columns, predicate)?;
+                let positions = if predicates.iter().all(|item| item.operator == ComparisonOperator::Equal) {
+                    let equality = predicates.iter().map(|item| {
+                        Ok((item.column_index, item.value.clone()
+                            .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
+                    }).collect::<Result<Vec<_>, DbError>>()?;
+                    table.matching_rows_for_predicates(&equality)
+                } else {
+                    table.rows.iter().enumerate()
+                        .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                        .map(|(position, _)| position)
+                        .collect()
+                };
+                positions.into_iter().collect::<std::collections::BTreeSet<_>>()
             } else {
                 (0..table.rows.len()).collect::<std::collections::BTreeSet<_>>()
             };
@@ -1256,7 +1358,7 @@ impl Database {
         let projection_upper = projection.to_ascii_uppercase();
         let is_count = projection_upper.starts_with("COUNT(*)");
         let predicates = predicate
-            .map(|value| parse_equality_predicates(&table.columns, value))
+            .map(|value| parse_where_predicates(&table.columns, value))
             .transpose()?
             .unwrap_or_default();
         let order = order_by.map(|value| parse_order_by(&table.columns, value))
@@ -1290,7 +1392,7 @@ impl Database {
         let mut matched = 0usize;
         if limit != Some(0) || is_count {
             storage::scan_pdb6_table_rows(path, table_name, 512, |row| {
-                if !predicates.iter().all(|(column, value)| row.values[*column] == *value) {
+                if !matches_sql_predicates(&row.values, &predicates) {
                     return Ok(true);
                 }
                 matched = matched.checked_add(1)
@@ -1368,35 +1470,48 @@ impl Database {
         }
         let selection_limit = if is_count || !order.is_empty() { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
-            let predicates = parse_equality_predicates(&table.columns, predicate)?;
-            let columns = predicates.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-            let persistent_index = if self.ember_indexes_valid {
-                self.storage_path.as_deref().and_then(|path| {
-                    table.indexes.iter().find(|(_, index)| index.column_indices == columns)
-                        .map(|(name, _)| (path, name.as_str()))
-                })
-            } else {
-                None
-            };
-            if let Some((path, index_name)) = persistent_index {
-                let values = predicates.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
-                let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
-                if let Some(row_ids) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
-                    if row_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-                        return Err(DbError::Storage("persistent SQL index contains non-increasing stable row identifiers".into()));
-                    }
-                    let mut positions = Vec::with_capacity(row_ids.len());
-                    for row_id in row_ids.into_iter().take(selection_limit.unwrap_or(usize::MAX)) {
-                        let position = table.row_positions.get(&row_id).copied()
-                            .ok_or_else(|| DbError::Storage("persistent SQL index references an unknown stable row identifier".into()))?;
-                        positions.push(position);
-                    }
-                    positions
+            let predicates = parse_where_predicates(&table.columns, predicate)?;
+            let equality = predicates.iter().all(|item| item.operator == ComparisonOperator::Equal);
+            if equality {
+                let equality_values = predicates.iter().map(|item| {
+                    Ok((item.column_index, item.value.clone()
+                        .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
+                }).collect::<Result<Vec<_>, DbError>>()?;
+                let columns = equality_values.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+                let persistent_index = if self.ember_indexes_valid {
+                    self.storage_path.as_deref().and_then(|path| {
+                        table.indexes.iter().find(|(_, index)| index.column_indices == columns)
+                            .map(|(name, _)| (path, name.as_str()))
+                    })
                 } else {
-                    table.matching_rows_for_predicates_limited(&predicates, selection_limit)
+                    None
+                };
+                if let Some((path, index_name)) = persistent_index {
+                    let values = equality_values.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+                    let key = IndexKey::from_columns(&values, &(0..values.len()).collect::<Vec<_>>());
+                    if let Some(row_ids) = storage::lookup_ember_index(path, &table_name, index_name, &key, selection_limit)? {
+                        if row_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+                            return Err(DbError::Storage("persistent SQL index contains non-increasing stable row identifiers".into()));
+                        }
+                        let mut positions = Vec::with_capacity(row_ids.len());
+                        for row_id in row_ids.into_iter().take(selection_limit.unwrap_or(usize::MAX)) {
+                            let position = table.row_positions.get(&row_id).copied()
+                                .ok_or_else(|| DbError::Storage("persistent SQL index references an unknown stable row identifier".into()))?;
+                            positions.push(position);
+                        }
+                        positions
+                    } else {
+                        table.matching_rows_for_predicates_limited(&equality_values, selection_limit)
+                    }
+                } else {
+                    table.matching_rows_for_predicates_limited(&equality_values, selection_limit)
                 }
             } else {
-                table.matching_rows_for_predicates_limited(&predicates, selection_limit)
+                table.rows.iter().enumerate()
+                    .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                    .take(selection_limit.unwrap_or(usize::MAX))
+                    .map(|(position, _)| position)
+                    .collect()
             }
         } else {
             (0..table.rows.len().min(selection_limit.unwrap_or(usize::MAX))).collect()
@@ -1819,6 +1934,31 @@ mod tests {
         assert_eq!(db.execute("SELECT * FROM counters").unwrap().rows.len(), 0);
     }
 
+
+    #[test]
+    fn where_supports_comparisons_null_checks_and_like_for_select_update_delete() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE predicate_rows (name TEXT, score INTEGER, note TEXT)").unwrap();
+        db.execute("INSERT INTO predicate_rows VALUES ('Ada', 30, NULL)").unwrap();
+        db.execute("INSERT INTO predicate_rows VALUES ('Bob', 20, 'active')").unwrap();
+        db.execute("INSERT INTO predicate_rows VALUES ('Alice', 10, 'idle')").unwrap();
+
+        let selected = db.execute("SELECT name FROM predicate_rows WHERE score >= 20 AND name LIKE 'A%'").unwrap();
+        assert_eq!(selected.rows.len(), 1);
+        assert_eq!(selected.rows[0].values[0], Value::Text("Ada".into()));
+
+        let nulls = db.execute("SELECT name FROM predicate_rows WHERE note IS NULL").unwrap();
+        assert_eq!(nulls.rows[0].values[0], Value::Text("Ada".into()));
+
+        let not_equal = db.execute("SELECT name FROM predicate_rows WHERE score <> 20 ORDER BY score DESC").unwrap();
+        assert_eq!(not_equal.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Text("Ada".into()), Value::Text("Alice".into())]);
+
+        db.execute("UPDATE predicate_rows SET score = 40 WHERE score > 25").unwrap();
+        assert_eq!(db.execute("SELECT score FROM predicate_rows WHERE name = 'Ada'").unwrap().rows[0].values[0], Value::Integer(40));
+        db.execute("DELETE FROM predicate_rows WHERE note IS NOT NULL AND score <= 20").unwrap();
+        assert_eq!(db.execute("SELECT COUNT(*) FROM predicate_rows").unwrap().rows[0].values[0], Value::Integer(2));
+    }
 
     #[test]
     fn select_supports_order_by_ascending_descending_and_multiple_keys() {
