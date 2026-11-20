@@ -174,6 +174,8 @@ pub(crate) struct SqlPredicate {
     pub column_index: usize,
     pub operator: ComparisonOperator,
     pub value: Option<Value>,
+    /// OR-group number; predicates inside one group are ANDed.
+    pub group: usize,
 }
 
 fn sql_like_matches(value: &str, pattern: &str) -> bool {
@@ -217,9 +219,11 @@ fn estimate_row_values_heap_bytes(values: &[Value]) -> usize {
 }
 
 fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool {
-    predicates.iter().all(|predicate| {
+    if predicates.is_empty() { return true; }
+    let mut groups = BTreeMap::<usize, bool>::new();
+    for predicate in predicates {
         let Some(value) = values.get(predicate.column_index) else { return false; };
-        match predicate.operator {
+        let matched = match predicate.operator {
             ComparisonOperator::IsNull => matches!(value, Value::Null),
             ComparisonOperator::IsNotNull => !matches!(value, Value::Null),
             _ if matches!(value, Value::Null) => false,
@@ -241,8 +245,11 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                     ComparisonOperator::Like | ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
                 }
             }
-        }
-    })
+        };
+        let group_matches = groups.entry(predicate.group).or_insert(true);
+        *group_matches &= matched;
+    }
+    groups.values().any(|matched| *matched)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1809,7 +1816,8 @@ impl Database {
             let matching = if let Some(predicate) = predicate {
                 let predicates = parse_where_predicates(&table.columns, predicate)?;
                 if predicates.iter().all(|item| {
-                    item.operator == ComparisonOperator::Equal
+                    item.group == predicates[0].group
+                        && item.operator == ComparisonOperator::Equal
                         && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
                 }) {
                     let equality = predicates.iter().map(|item| {
@@ -1862,7 +1870,8 @@ impl Database {
             let matches = if let Some(predicate) = predicate {
                 let predicates = parse_where_predicates(&table.columns, predicate)?;
                 let positions = if predicates.iter().all(|item| {
-                    item.operator == ComparisonOperator::Equal
+                    item.group == predicates[0].group
+                        && item.operator == ComparisonOperator::Equal
                         && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
                 }) {
                     let equality = predicates.iter().map(|item| {
@@ -2026,7 +2035,8 @@ impl Database {
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
             let predicates = parse_where_predicates(&table.columns, predicate)?;
             let equality = predicates.iter().all(|item| {
-                item.operator == ComparisonOperator::Equal
+                item.group == predicates[0].group
+                        && item.operator == ComparisonOperator::Equal
                     && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
             });
             if equality {
