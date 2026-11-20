@@ -1,8 +1,8 @@
 //! Durable transaction-decision journal for cross-domain transactions.
 //!
-//! This module records coordinator decisions only. It deliberately does not
-//! claim atomicity for SQL/KV/Registry/EF7 until each participant implements
-//! durable prepare, idempotent commit/rollback, and recovery integration.
+//! Durable cross-domain transaction decisions and participant orchestration.
+//! Each participant must durably prepare before COMMIT; application is retried
+//! idempotently until every participant has a synced APPLIED acknowledgement.
 
 use crate::DbError;
 use fs2::FileExt;
@@ -177,6 +177,48 @@ impl TransactionCoordinator {
         self.append(2, participant_id, txid, count)?;
         self.transactions.get_mut(&txid).unwrap().prepared.insert(participant_id);
         Ok(())
+    }
+
+    /// Completes a prepared cross-domain transaction in one guarded operation.
+    ///
+    /// The method first verifies that every supplied participant has a durable
+    /// prepare file, then syncs PREPARED records, the COMMIT decision, and each
+    /// APPLIED acknowledgement. If application fails after COMMIT, the transaction
+    /// remains recoverable through `apply_committed` and this method may be retried.
+    /// Participants must already have staged their mutations using this txid.
+    pub fn commit_prepared_participants(
+        &mut self,
+        txid: u64,
+        participants: &mut [&mut dyn CoordinatorParticipant],
+    ) -> Result<(), DbError> {
+        let tx = self.transactions.get(&txid)
+            .ok_or_else(|| DbError::Storage("unknown coordinator transaction".into()))?;
+        if tx.state == TransactionState::Committed {
+            return self.apply_committed(txid, participants);
+        }
+        if tx.state != TransactionState::Preparing {
+            return Err(DbError::Constraint("only a preparing transaction can be committed".into()));
+        }
+        if participants.len() != usize::from(tx.participant_count) {
+            return Err(DbError::Constraint("supplied participant count does not match coordinator BEGIN".into()));
+        }
+        let mut supplied = BTreeSet::new();
+        for participant in participants.iter() {
+            let id = participant.participant_id();
+            if !supplied.insert(id) {
+                return Err(DbError::Constraint("duplicate coordinator participant ID".into()));
+            }
+            if !participant.has_prepared(txid)? {
+                return Err(DbError::Storage(format!("participant {id} has no durable prepare for transaction {txid}")));
+            }
+        }
+        let prepared = self.transactions.get(&txid).unwrap().prepared.clone();
+        for participant in participants.iter() {
+            let id = participant.participant_id();
+            if !prepared.contains(&id) { self.mark_prepared(txid, id)?; }
+        }
+        self.commit(txid)?;
+        self.apply_committed(txid, participants)
     }
 
     /// COMMIT is durable only after every participant has a PREPARED record.
