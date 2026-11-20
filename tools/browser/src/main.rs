@@ -235,12 +235,9 @@ impl BrowserApp {
                 self.status = format!("Opened {}", self.database_path.trim());
             }
             Err(error) => {
-                self.database = None;
-                self.catalog = CatalogSnapshot::default();
-                self.selected_table = None;
-                self.browsing_table = false;
-                self.result = None;
-                self.status = format!("Open failed: {error}");
+                // Keep the currently active local or remote session intact when
+                // opening a different file fails. A failed open is not a disconnect.
+                self.status = format!("Open failed; current connection was kept: {error}");
             }
         }
     }
