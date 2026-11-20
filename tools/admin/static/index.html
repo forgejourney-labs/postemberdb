@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostemberDB Admin</title>
+<style>
+:root{font-family:Tahoma,Arial,sans-serif;color:#252525;background:#e9edf1;font-size:13px}*{box-sizing:border-box}body{margin:0}
+header{height:48px;display:flex;align-items:center;gap:18px;padding:0 18px;color:#fff;background:#34495e;border-bottom:1px solid #243746}header strong{font-size:16px}header span{color:#d8e2ea}
+.layout{display:grid;grid-template-columns:230px 1fr;min-height:calc(100vh - 48px)}aside{background:#f5f6f7;border-right:1px solid #c9d0d7;padding:14px 12px}
+.tree-title{font-weight:bold;padding:8px 7px;border-bottom:1px solid #d5dbe0;margin-bottom:8px}.tree-item{padding:8px 9px;border:1px solid transparent;color:#34495e}.tree-item.active{background:#dce7f0;border-color:#bdcbd8;font-weight:bold}
+main{min-width:0;padding:18px}.breadcrumbs{color:#647586;margin-bottom:14px}.panel{background:#fff;border:1px solid #cbd2d9;margin-bottom:15px;box-shadow:0 1px 1px #0000000b}
+.panel h2{font-size:14px;margin:0;padding:10px 13px;background:#f2f4f6;border-bottom:1px solid #d4d9de}.panel-body{padding:13px}
+textarea{display:block;width:100%;min-height:150px;resize:vertical;padding:10px;border:1px solid #aeb8c2;background:#fbfcfd;color:#202830;font:13px Consolas,monospace}
+button{margin-top:9px;padding:7px 14px;border:1px solid #315d7b;background:#477b9f;color:white;cursor:pointer}button:hover{background:#386989}
+#status{color:#536575;padding:7px 0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;border:1px solid #d5dbe0;padding:7px 9px}th{background:#e9eef2}tbody tr:nth-child(even){background:#f7f9fa}.muted{color:#71808d}
+@media(max-width:720px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7}}
+</style>
+</head>
+<body>
+<header><strong>PostemberDB Admin</strong><span>Database management</span><span>Local mode</span></header>
+<div class="layout">
+<aside>
+<div class="tree-title">Database navigator</div>
+<div class="tree-item active">▣ Current database</div>
+<div class="tree-item muted">▸ Tables — catalog API pending</div>
+<div class="tree-item muted">▸ Indexes — catalog API pending</div>
+<div class="tree-item muted">▸ Users &amp; roles — admin API pending</div>
+<div class="tree-item muted">▸ Server status — metrics API pending</div>
+</aside>
+<main>
+<div class="breadcrumbs">Home » SQL console</div>
+<section class="panel"><h2>SQL query</h2><div class="panel-body">
+<textarea id="sql" spellcheck="false">SELECT * FROM your_table LIMIT 100;</textarea>
+<button id="run">Execute</button><div id="status" role="status">Ready. This panel is bound to a local database file.</div>
+</div></section>
+<section class="panel"><h2>Query results</h2><div class="panel-body table-wrap" id="results"><span class="muted">Execute a query to display its result.</span></div></section>
+</main></div>
+<script>
+const statusNode=document.getElementById('status'),resultsNode=document.getElementById('results');
+document.getElementById('run').addEventListener('click',async()=>{
+ statusNode.textContent='Executing…';resultsNode.replaceChildren();
+ try{
+  const response=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:document.getElementById('sql').value})});
+  if(!response.ok)throw new Error(await response.text());
+  const result=await response.json();
+  statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected';
+  if(!result.columns.length){resultsNode.textContent=result.message;return;}
+  const table=document.createElement('table'),head=document.createElement('thead'),headerRow=document.createElement('tr'),body=document.createElement('tbody');
+  for(const column of result.columns){const cell=document.createElement('th');cell.textContent=column;headerRow.append(cell);}head.append(headerRow);
+  for(const row of result.rows){const rowNode=document.createElement('tr');for(const value of row){const cell=document.createElement('td');cell.textContent=value;rowNode.append(cell);}body.append(rowNode);}
+  table.append(head,body);resultsNode.append(table);
+ }catch(error){statusNode.textContent='Query failed: '+error.message;}
+});
+</script>
+</body></html>
