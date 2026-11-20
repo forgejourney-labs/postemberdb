@@ -21,7 +21,7 @@ From the repository root:
 
     cargo run --manifest-path tools/browser/Cargo.toml
 
-Enter a database path and select Open. Click a table in Explorer to browse its rows.
+Enter a database path and select Open for local access. For remote access, enter the server address, certificate DNS name, trusted CA bundle path, username, and password, then select **Connect securely**. Click a table in Explorer to browse its rows.
 
 CSV and JSON exports are saved in the current working directory.
 
@@ -34,7 +34,7 @@ CSV and JSON exports are saved in the current working directory.
 
 ## Current limitations
 
-- Remote connections are not available. They will use a stable authenticated TLS client protocol, not the development JSONL/1 transport.
+- Remote TLS connections are available through Binary/1. Supply a trusted PEM CA bundle and a TLS server name; certificate validation is mandatory and there is no insecure mode.
 - No automatic migration, vacuum, or destructive maintenance actions.
 - The file path is entered manually; a native file picker is a later UI improvement.
 - Sorting/filtering and full-table streaming exports are later improvements.

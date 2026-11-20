@@ -620,8 +620,8 @@ impl eframe::App for BrowserApp {
                     else { "○ Disconnected" });
                 ui.separator();
                 ui.heading("Explorer");
-                if self.database.is_none() {
-                    ui.weak("Open a .pbd or legacy .db file to inspect it.");
+                if !self.is_connected() {
+                    ui.weak("Open a .pbd or legacy .db file, or connect to a remote TLS server.");
                 } else if self.catalog.tables.is_empty() {
                     ui.weak("No SQL tables in this database.");
                 } else {
