@@ -486,28 +486,38 @@ where
     Ok(())
 }
 
-/// Loads row payloads only when a write/session needs a mutable table image.
+/// Hydrates one table only when a write needs a mutable row image.
+pub(super) fn hydrate_pdb6_table(
+    path: &Path,
+    table_name: &str,
+    table: &mut Table,
+) -> Result<(), DbError> {
+    if table.rows_loaded { return Ok(()); }
+    let mut rows = Vec::with_capacity(table.persisted_row_count);
+    scan_pdb6_table_rows(path, table_name, 512, |row| {
+        rows.push(row);
+        Ok(true)
+    })?;
+    if rows.len() != table.persisted_row_count {
+        return Err(DbError::Storage(format!(
+            "PDB6 table {table_name} row count changed during hydration: expected {}, found {}",
+            table.persisted_row_count, rows.len()
+        )));
+    }
+    table.rows = rows;
+    table.rebuild_row_positions();
+    table.rebuild_indexes();
+    table.rows_loaded = true;
+    Ok(())
+}
+
+/// Hydrates all tables for explicit maintenance operations that need a complete view.
 pub(super) fn hydrate_pdb6_rows(
     path: &Path,
     tables: &mut BTreeMap<String, Table>,
 ) -> Result<(), DbError> {
     for (table_name, table) in tables.iter_mut() {
-        if table.rows_loaded { continue; }
-        let mut rows = Vec::with_capacity(table.persisted_row_count);
-        scan_pdb6_table_rows(path, table_name, 512, |row| {
-            rows.push(row);
-            Ok(true)
-        })?;
-        if rows.len() != table.persisted_row_count {
-            return Err(DbError::Storage(format!(
-                "PDB6 table {table_name} row count changed during hydration: expected {}, found {}",
-                table.persisted_row_count, rows.len()
-            )));
-        }
-        table.rows = rows;
-        table.rebuild_row_positions();
-        table.rebuild_indexes();
-        table.rows_loaded = true;
+        hydrate_pdb6_table(path, table_name, table)?;
     }
     Ok(())
 }
