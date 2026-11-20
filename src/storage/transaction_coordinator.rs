@@ -786,6 +786,47 @@ mod tests {
     }
 
     #[test]
+    fn recovery_finishes_finalization_after_crash_between_applied_and_cleanup() {
+        let coordinator_path = path();
+        let kv_path = coordinator_path.with_extension("kv");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            tx = coordinator.begin(1).unwrap();
+            kv.prepare_batch(tx, &[], &[(b"finalize/key".to_vec(), b"durable".to_vec())]).unwrap();
+            coordinator.mark_prepared(tx, 1).unwrap();
+            coordinator.commit(tx).unwrap();
+
+            // Simulate a crash after participant application and APPLIED sync,
+            // but before its prepared marker is removed.
+            kv.commit_prepared(tx).unwrap();
+            coordinator.mark_applied(tx, 1).unwrap();
+            assert!(kv.pending_prepared_transactions().contains(&tx));
+        }
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            let pending = coordinator.committed_pending_apply();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].applied_participants, vec![1]);
+            assert!(pending[0].finalized_participants.is_empty());
+
+            let mut participants: [&mut dyn CoordinatorParticipant; 1] = [&mut kv];
+            coordinator.recover_pending(&mut participants).unwrap();
+            assert_eq!(kv.get(b"finalize/key").unwrap(), Some(b"durable".to_vec()));
+            assert!(kv.pending_prepared_transactions().is_empty());
+            assert!(coordinator.committed_pending_apply().is_empty());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"] {
+            let mut candidate = kv_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
     fn coordinator_applies_prepared_ef7_chunk_after_reopen() {
         let coordinator_path = path();
         let ef7_path = coordinator_path.with_extension("ef7");
