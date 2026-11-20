@@ -464,7 +464,7 @@ fn describe_table(name: &str, table: &Table) -> TableInfo {
 
     TableInfo {
         name: name.to_owned(),
-        row_count: table.rows.len(),
+        row_count: if table.rows_loaded { table.rows.len() } else { table.persisted_row_count },
         columns: table.columns.clone(),
         indexes,
     }
