@@ -356,6 +356,37 @@ impl Pdb6Store {
             .collect()
     }
 
+    /// Reclaims unreachable B+ tree node pages from the current published root.
+    /// P6R1 overflow pages and unknown page kinds are deliberately retained:
+    /// their ownership must be established by a descriptor-aware vacuum first.
+    /// The exclusive PDB6 file lock prevents another process publishing a root
+    /// during this pass. This is not a retained-snapshot API.
+    pub(crate) fn vacuum_unreachable_tree_pages(&mut self) -> Result<u64, DbError> {
+        let reachable = page_tree::reachable_page_ids(&mut self.pages)?;
+        let mut dead = Vec::new();
+        for (start, count) in self.pages.allocated_extents() {
+            let end = start.checked_add(count).ok_or_else(|| DbError::Storage("allocated extent end overflow during vacuum".into()))?;
+            for page_id in start..end {
+                if reachable.contains(&page_id) { continue; }
+                let payload = self.pages.read_page(page_id)?;
+                if payload.starts_with(b"EBL1") || payload.starts_with(b"EBI1") { dead.push(page_id); }
+            }
+        }
+        if dead.is_empty() { return Ok(0); }
+        dead.sort_unstable();
+        let reclaimed = dead.len() as u64;
+        let mut range_start = dead[0];
+        let mut previous = dead[0];
+        for page_id in dead.into_iter().skip(1) {
+            if page_id == previous + 1 { previous = page_id; continue; }
+            self.pages.release_extent(range_start, previous - range_start + 1)?;
+            range_start = page_id;
+            previous = page_id;
+        }
+        self.pages.release_extent(range_start, previous - range_start + 1)?;
+        Ok(reclaimed)
+    }
+
     fn write_row_payload(
         &mut self,
         table_id: u64,
@@ -625,6 +656,22 @@ mod tests {
             assert_eq!(reopened.get_row_payload(12, 42).unwrap(), None);
             assert_eq!(reopened.get(&index_key).unwrap(), None);
             assert_eq!(reopened.scan_row_ids(12, None, 10).unwrap(), vec![41]);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn vacuum_reclaims_only_unreachable_tree_nodes_and_preserves_row_overflow_pages() {
+        let path = temp_path();
+        let payload = vec![0x5a; 80_000];
+        {
+            let mut store = Pdb6Store::open(&path, 32).unwrap();
+            store.apply_row_batch(vec![(5, 9, payload.clone())], Vec::<(Vec<u8>, Vec<u8>)>::new(), Vec::<Vec<u8>>::new()).unwrap();
+            store.apply_batch((0..100u64).map(|id| (vec![0x40, (id >> 8) as u8, id as u8], vec![id as u8])).collect(), Vec::<Vec<u8>>::new()).unwrap();
+            store.apply_batch(vec![(vec![0x40, 0, 1], b"replaced".to_vec())], Vec::<Vec<u8>>::new()).unwrap();
+            let reclaimed = store.vacuum_unreachable_tree_pages().unwrap();
+            assert!(reclaimed > 0);
+            assert_eq!(store.get_row_payload(5, 9).unwrap(), Some(payload));
         }
         cleanup(&path);
     }

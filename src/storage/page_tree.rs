@@ -624,6 +624,30 @@ fn scan_node_limited(
     Ok(())
 }
 
+/// Returns every page reachable from the currently published root.
+/// Duplicate references and cycles are rejected; callers must hold exclusive
+/// ownership of the page file while using this set for reclamation.
+pub(crate) fn reachable_page_ids(store: &mut ExtentFile) -> Result<HashSet<u64>, DbError> {
+    let Some(root) = store.root_page_id() else { return Ok(HashSet::new()); };
+    let bound = store.stats().allocated_pages;
+    let mut visited = HashSet::new();
+    collect_reachable(store, root, &mut visited, bound)?;
+    Ok(visited)
+}
+
+fn collect_reachable(store: &mut ExtentFile, page_id: u64, visited: &mut HashSet<u64>, allocation_bound: u64) -> Result<(), DbError> {
+    if !visited.insert(page_id) {
+        return Err(DbError::Storage("B+ tree contains a cycle or multiply-referenced page".into()));
+    }
+    if visited.len() as u64 > allocation_bound {
+        return Err(DbError::Storage("B+ tree reachability exceeds allocated page count".into()));
+    }
+    if let DecodedNode::Internal(children) = decode_node(&store.read_page(page_id)?)? {
+        for (_, child_id) in children { collect_reachable(store, child_id, visited, allocation_bound)?; }
+    }
+    Ok(())
+}
+
 /// Validates the complete reachable tree, including child ranges and separator
 /// equality. It also rejects cycles and pages referenced by multiple parents.
 pub(crate) fn validate_tree(store: &mut ExtentFile) -> Result<(), DbError> {
