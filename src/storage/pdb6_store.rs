@@ -667,7 +667,7 @@ mod tests {
         {
             let mut store = Pdb6Store::open(&path, 32).unwrap();
             store.apply_row_batch(vec![(5, 9, payload.clone())], Vec::<(Vec<u8>, Vec<u8>)>::new(), Vec::<Vec<u8>>::new()).unwrap();
-            store.apply_batch((0..100u64).map(|id| (table_key(id + 1).unwrap(), vec![id as u8])).collect(), Vec::<Vec<u8>>::new()).unwrap();
+            store.apply_batch((0..100u64).map(|id| (table_key(id + 1).unwrap(), vec![id as u8])).collect::<Vec<_>>(), Vec::<Vec<u8>>::new()).unwrap();
             store.apply_batch(vec![(table_key(2).unwrap(), b"replaced".to_vec())], Vec::<Vec<u8>>::new()).unwrap();
             let reclaimed = store.vacuum_unreachable_tree_pages().unwrap();
             assert!(reclaimed > 0);
