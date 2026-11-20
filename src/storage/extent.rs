@@ -350,6 +350,19 @@ impl ExtentFile {
         Ok(())
     }
 
+    /// Lists allocated logical page ranges without expanding free extents.
+    /// Callers must prove page-level unreachability before releasing pages.
+    pub(crate) fn allocated_extents(&self) -> Vec<(u64, u64)> {
+        let mut allocated = Vec::new();
+        let mut cursor = 0u64;
+        for (&free_start, &free_len) in &self.metadata.free_extents {
+            if cursor < free_start { allocated.push((cursor, free_start - cursor)); }
+            cursor = free_start.saturating_add(free_len);
+        }
+        if cursor < self.metadata.next_page_id { allocated.push((cursor, self.metadata.next_page_id - cursor)); }
+        allocated
+    }
+
     pub(crate) fn root_page_id(&self) -> Option<u64> {
         self.metadata.root_page_id
     }
