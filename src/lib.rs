@@ -1799,6 +1799,78 @@ mod tests {
     }
 
     #[test]
+    fn pdb6_writes_hydrate_only_the_tables_they_modify() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-pdb6-table-hydration-{}-{}.pbd",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::create_pdb6(&path).unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT, coins INTEGER)").unwrap();
+            db.execute("CREATE TABLE regions (region_id INTEGER, payload TEXT)").unwrap();
+            db.execute("INSERT INTO players VALUES ('player-a', 10)").unwrap();
+            db.execute("INSERT INTO regions VALUES (1, 'region-payload')").unwrap();
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert!(!db.tables["players"].rows_loaded);
+            assert!(!db.tables["regions"].rows_loaded);
+
+            db.transaction(|transaction| {
+                transaction.execute("UPDATE players SET coins = 20 WHERE uuid = 'player-a'")?;
+                assert!(transaction.database.tables["players"].rows_loaded);
+                assert!(!transaction.database.tables["regions"].rows_loaded);
+                assert!(transaction.staged.tables["players"].rows_loaded);
+                assert!(!transaction.staged.tables["regions"].rows_loaded);
+                Ok(())
+            }).unwrap();
+
+            assert!(!db.tables["players"].rows_loaded, "committed row caches must be evicted");
+            assert!(!db.tables["regions"].rows_loaded, "unmodified tables must stay cold");
+
+            let mut session = db.begin_session();
+            session.execute("UPDATE players SET coins = 30 WHERE uuid = 'player-a'").unwrap();
+            assert!(session.staged.tables["players"].rows_loaded);
+            assert!(!session.staged.tables["regions"].rows_loaded);
+            db.commit_session(session).unwrap();
+
+            assert!(!db.tables["players"].rows_loaded);
+            assert!(!db.tables["regions"].rows_loaded);
+            assert_eq!(
+                db.execute("SELECT coins FROM players WHERE uuid = 'player-a'").unwrap().rows[0].values[0],
+                Value::Integer(30)
+            );
+            assert_eq!(
+                db.execute("SELECT payload FROM regions WHERE region_id = 1").unwrap().rows[0].values[0],
+                Value::Text("region-payload".into())
+            );
+            assert!(!db.tables["players"].rows_loaded);
+            assert!(!db.tables["regions"].rows_loaded);
+        }
+
+        for suffix in [
+            "", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal",
+            ".pdb6.pages.wal", ".pdb6.pages.lock",
+        ] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
+
+    #[test]
+    fn pdb6_write_target_parser_handles_dml_and_index_statements() {
+        assert_eq!(pdb6_write_table_target("INSERT INTO players VALUES (1)"), Some("players".into()));
+        assert_eq!(pdb6_write_table_target("UPDATE `Players` SET coins = 1"), Some("players".into()));
+        assert_eq!(pdb6_write_table_target("DELETE FROM regions WHERE region_id = 1"), Some("regions".into()));
+        assert_eq!(pdb6_write_table_target("CREATE INDEX idx_uuid ON players (uuid)"), Some("players".into()));
+        assert_eq!(pdb6_write_table_target("CREATE TABLE players (uuid TEXT)"), None);
+        assert_eq!(pdb6_write_table_target("CREATE INDEX idx_uuid players (uuid)"), None);
+    }
+
+    #[test]
     fn pdb6_manifest_becomes_live_sql_authority_after_reopen() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-pdb6-live-{}-{}.pbd",
