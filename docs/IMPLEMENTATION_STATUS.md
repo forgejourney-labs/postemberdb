@@ -134,7 +134,8 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 - [x] Bounded client count, SQL line size, UTF-8 input, and socket timeouts.
 - [x] CLI recovery check and WAL checkpoint commands.
 - [x] Argon2id user authentication, persisted permission bitsets, enabled/disabled users, password rotation, named roles with durable membership and permission inheritance, and checksummed audit events for login outcomes and user/role administration; user/role mutations and their audit records share one atomic page-tree batch.
-- [ ] Named roles and role membership, actor-attributed administrative authorization, audit retention/export policy, and audit tamper-evidence beyond per-record checksums.
+- [x] `AuthStore::as_admin` requires an authenticated `Principal` with `Admin` and attributes all administrative audit events emitted by its closure to that principal; nested actor contexts are rejected.
+- [ ] Audit retention/export policy, audit tamper-evidence beyond per-record checksums, and per-database/schema/table grants.
 - [ ] Mutual TLS and per-user rate/connection quotas.
 - [ ] Encryption at rest and managed key rotation.
 - [ ] Verified full/incremental backup and restore.
@@ -262,7 +263,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [ ] Server-side prepared-statement protocol, streaming ResultSets, JDBC batch/generated keys/savepoints, and complete JDBC metadata remain pending.
 - [x] Durable password rotation with independent Argon2 salt/hash persistence.
 - [x] Durable authentication audit events are stored in the auth sidecar with monotonic sequence IDs, checksums, bounded page reads, and no password material.
-- [ ] Actor-attributed administrative audit identity, audit retention/export, mutual TLS, per-user rate/connection quotas, and schema/table-scoped grants remain pending.
+- [x] Actor-attributed administrative audit identity through `AuthStore::as_admin`; legacy direct local administration remains explicitly attributed as `local-api`.
+- [ ] Audit retention/export, mutual TLS, per-user rate/connection quotas, and schema/table-scoped grants remain pending.
 
 ## Vacuum and snapshots
 
