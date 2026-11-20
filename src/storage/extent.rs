@@ -585,6 +585,9 @@ fn is_allocated(metadata: &AllocatorMetadata, page_id: u64) -> bool {
 }
 
 fn validate_metadata(metadata: &AllocatorMetadata) -> Result<(), DbError> {
+    if metadata.generation == 0 {
+        return Err(DbError::Storage("extent metadata generation must be non-zero".into()));
+    }
     if metadata.root_page_id.is_some_and(|root| root >= metadata.next_page_id || !is_allocated(metadata, root)) {
         return Err(DbError::Storage("metadata root points to an unallocated page".into()));
     }
@@ -982,6 +985,77 @@ mod tests {
         assert_eq!(reopened.allocate_extent(1).unwrap(), 0);
         drop(reopened);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn allocator_churn_preserves_exact_ownership_across_reopens() {
+        use std::collections::BTreeSet;
+
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        let mut allocated = BTreeSet::<u64>::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+
+        for step in 0..400usize {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let should_allocate = allocated.is_empty() || seed & 3 != 0;
+
+            if should_allocate {
+                let count = ((seed >> 8) % 4) + 1;
+                let start = store.allocate_extent(count).unwrap();
+                for page_id in start..start + count {
+                    assert!(allocated.insert(page_id), "allocator returned already-owned page {page_id}");
+                }
+            } else {
+                let candidates = allocated.iter().copied().collect::<Vec<_>>();
+                let chosen = (seed as usize) % candidates.len();
+                let start = candidates[chosen];
+                let mut count = 1u64;
+                while count < 3 && allocated.contains(&(start + count)) {
+                    count += 1;
+                }
+                store.release_extent(start, count).unwrap();
+                for page_id in start..start + count {
+                    assert!(allocated.remove(&page_id));
+                }
+            }
+
+            let stats = store.stats();
+            assert_eq!(stats.allocated_pages as usize, allocated.len());
+            let from_extents = store.allocated_extents()
+                .into_iter()
+                .flat_map(|(start, count)| start..start + count)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(from_extents, allocated);
+
+            if step % 37 == 36 {
+                drop(store);
+                store = ExtentFile::open(&path).unwrap();
+                assert_eq!(store.stats().allocated_pages as usize, allocated.len());
+                let reopened_extents = store.allocated_extents()
+                    .into_iter()
+                    .flat_map(|(start, count)| start..start + count)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(reopened_extents, allocated);
+            }
+        }
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn metadata_rejects_generation_zero_even_with_valid_checksum() {
+        let mut page = [0u8; PAGE_SIZE];
+        page[0..4].copy_from_slice(b"EAM3");
+        page[4..8].copy_from_slice(&3u32.to_le_bytes());
+        page[8..16].copy_from_slice(&0u64.to_le_bytes());
+        page[16..24].copy_from_slice(&0u64.to_le_bytes());
+        page[24..28].copy_from_slice(&0u32.to_le_bytes());
+        let checksum = super::super::checksum(&page[..44]);
+        page[36..44].copy_from_slice(&checksum.to_le_bytes());
+
+        assert!(decode_metadata(&page).unwrap_err().to_string().contains("generation"));
     }
 
     #[test]
