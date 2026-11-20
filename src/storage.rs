@@ -1052,6 +1052,27 @@ impl Database {
         store.vacuum_unreachable_tree_pages()
     }
 
+    /// Creates a durable named snapshot of the current PDB6 root.
+    pub fn create_pdb6_snapshot(&mut self, name: &str) -> Result<(), DbError> {
+        if !self.pdb6_mode { return Err(DbError::Storage("PDB6 snapshots require a PDB6 database".into())); }
+        let path = self.storage_path.as_deref().ok_or_else(|| DbError::Storage("PDB6 snapshots require a persistent database".into()))?;
+        Pdb6Store::open(path, 128)?.create_snapshot(name)
+    }
+
+    /// Deletes a durable named snapshot. A later vacuum can reclaim pages no longer referenced.
+    pub fn delete_pdb6_snapshot(&mut self, name: &str) -> Result<bool, DbError> {
+        if !self.pdb6_mode { return Err(DbError::Storage("PDB6 snapshots require a PDB6 database".into())); }
+        let path = self.storage_path.as_deref().ok_or_else(|| DbError::Storage("PDB6 snapshots require a persistent database".into()))?;
+        Pdb6Store::open(path, 128)?.delete_snapshot(name)
+    }
+
+    /// Lists durable named PDB6 snapshots in lexical order.
+    pub fn list_pdb6_snapshots(&mut self) -> Result<Vec<String>, DbError> {
+        if !self.pdb6_mode { return Err(DbError::Storage("PDB6 snapshots require a PDB6 database".into())); }
+        let path = self.storage_path.as_deref().ok_or_else(|| DbError::Storage("PDB6 snapshots require a persistent database".into()))?;
+        Pdb6Store::open(path, 128)?.list_snapshots()
+    }
+
     pub fn migrate_to_pdb6(&mut self) -> Result<(), DbError> {
         let database_path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 migration requires a persistent database opened with Database::open".into()))?;
