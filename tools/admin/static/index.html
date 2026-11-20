@@ -13,11 +13,14 @@ main{min-width:0;padding:18px}.breadcrumbs{color:#647586;margin-bottom:14px}.pan
 .panel h2{font-size:14px;margin:0;padding:10px 13px;background:#f2f4f6;border-bottom:1px solid #d4d9de}.panel-body{padding:13px}
 .summary{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr));gap:10px}.summary-item{border:1px solid #d5dbe0;background:#fafbfc;padding:11px}.summary-item strong{display:block;font-size:19px;color:#34495e;margin-bottom:3px}
 textarea{display:block;width:100%;min-height:145px;resize:vertical;padding:10px;border:1px solid #aeb8c2;background:#fbfcfd;color:#202830;font:13px Consolas,monospace}
-button.action{margin-top:9px;padding:7px 14px;border:1px solid #315d7b;background:#477b9f;color:white;cursor:pointer}button.action:hover{background:#386989}
-button.secondary{padding:5px 10px;border:1px solid #aeb8c2;background:#f7f8f9;color:#34495e;cursor:pointer}
+button.action{padding:7px 12px;border:1px solid #315d7b;background:#477b9f;color:white;cursor:pointer}button.action:hover{background:#386989}
+button.secondary{padding:6px 10px;border:1px solid #aeb8c2;background:#f7f8f9;color:#34495e;cursor:pointer}
+button.danger{padding:5px 9px;border:1px solid #b56d6d;background:#fff7f7;color:#8b3333;cursor:pointer}
 #status{color:#536575;padding:7px 0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;border:1px solid #d5dbe0;padding:7px 9px}th{background:#e9eef2}tbody tr:nth-child(even){background:#f7f9fa}
 .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.detail-grid h3{font-size:13px;margin:3px 0 8px}.detail-list{margin:0;padding:0;list-style:none}.detail-list li{padding:6px 8px;border-bottom:1px solid #edf0f2}
-@media(max-width:760px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7;max-height:270px}.summary{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr}}
+.toolbar{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}.field-grid{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:10px}.field{display:flex;flex-direction:column;gap:4px}.field label{font-weight:bold;color:#465767}.field input,.field select{padding:7px;border:1px solid #aeb8c2;background:#fff;font:inherit;min-width:0}.null-control{display:flex;gap:6px;align-items:center;color:#647586;font-weight:normal!important}
+.pager{display:flex;align-items:center;gap:9px;margin:9px 0;color:#536575}.inline-editor{border:1px solid #ccd4db;background:#fafbfc;padding:12px;margin-top:12px}.inline-editor h3{margin-top:0}
+@media(max-width:760px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7;max-height:270px}.summary{grid-template-columns:1fr}.detail-grid,.field-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -52,7 +55,21 @@ button.secondary{padding:5px 10px;border:1px solid #aeb8c2;background:#f7f8f9;co
         <div><h3>Columns</h3><ul class="detail-list" id="column-list"></ul></div>
         <div><h3>Indexes</h3><ul class="detail-list" id="index-list"></ul></div>
       </div>
-      <button class="action" id="browse-rows">Browse rows</button>
+      <div class="toolbar"><button class="action" id="browse-rows">Browse rows</button><button class="secondary" id="insert-row">Insert row</button></div>
+      <div id="insert-editor" class="inline-editor" hidden></div>
+    </div>
+  </section>
+  <section class="panel" id="rows-panel" hidden>
+    <h2 id="rows-heading">Table rows</h2>
+    <div class="panel-body">
+      <div class="toolbar">
+        <button class="secondary" id="export-csv">Export current page CSV</button>
+        <button class="secondary" id="export-json">Export current page JSON</button>
+        <span class="muted" id="rows-summary"></span>
+      </div>
+      <div class="table-wrap" id="rows-grid"></div>
+      <div class="pager"><button class="secondary" id="prev-page">‹ Previous</button><span id="page-label">Page 1</span><button class="secondary" id="next-page">Next ›</button></div>
+      <div id="row-editor" class="inline-editor" hidden></div>
     </div>
   </section>
   <section class="panel"><h2>SQL query</h2><div class="panel-body">
@@ -65,117 +82,210 @@ button.secondary{padding:5px 10px;border:1px solid #aeb8c2;background:#f7f8f9;co
 const statusNode=document.getElementById('status');
 const resultsNode=document.getElementById('results');
 const sqlNode=document.getElementById('sql');
-let catalog={tables:[]};
-let selectedTable=null;
-
+const PAGE_SIZE=50;
+let catalog={tables:[]},selectedTable=null,currentRows=null;
 function textNode(tag,text,className){
- const node=document.createElement(tag);
- node.textContent=text;
- if(className)node.className=className;
- return node;
+ const node=document.createElement(tag);node.textContent=text;if(className)node.className=className;return node;
 }
-
+async function requestJson(url,options){
+ const response=await fetch(url,options);
+ if(!response.ok)throw new Error(await response.text());
+ return response.json();
+}
 function showOverview(){
- selectedTable=null;
+ selectedTable=null;currentRows=null;
  document.getElementById('overview-panel').hidden=false;
  document.getElementById('table-panel').hidden=true;
+ document.getElementById('rows-panel').hidden=true;
  document.getElementById('overview-link').classList.add('active');
  document.getElementById('breadcrumbs').textContent='Home » Overview';
  document.querySelectorAll('#table-list .tree-item').forEach(node=>node.classList.remove('active'));
 }
-
 function renderTable(table){
- selectedTable=table;
+ selectedTable=table;currentRows=null;
  document.getElementById('overview-panel').hidden=true;
  document.getElementById('table-panel').hidden=false;
+ document.getElementById('rows-panel').hidden=true;
+ document.getElementById('insert-editor').hidden=true;
+ document.getElementById('row-editor').hidden=true;
  document.getElementById('overview-link').classList.remove('active');
  document.getElementById('table-heading').textContent='Table: '+table.name+' · '+table.row_count+' row(s)';
  document.getElementById('breadcrumbs').textContent='Home » Tables » '+table.name;
- const columns=document.getElementById('column-list');
- const indexes=document.getElementById('index-list');
+ const columns=document.getElementById('column-list'),indexes=document.getElementById('index-list');
  columns.replaceChildren();indexes.replaceChildren();
- for(const column of table.columns){
-  const nullable=column.nullable?'NULL allowed':'NOT NULL';
-  columns.append(textNode('li',column.name+'  ·  '+column.data_type+'  ·  '+nullable));
- }
+ for(const column of table.columns)columns.append(textNode('li',column.name+' · '+column.data_type+' · '+(column.nullable?'NULL allowed':'NOT NULL')));
  if(!table.indexes.length)indexes.append(textNode('li','No indexes','muted'));
- for(const index of table.indexes){
-  indexes.append(textNode('li',index.name+'  ·  '+(index.unique?'UNIQUE':'INDEX')+'  ·  '+index.columns.join(', ')));
- }
- document.querySelectorAll('#table-list .tree-item').forEach(node=>{
-  node.classList.toggle('active',node.dataset.table===table.name);
- });
+ for(const index of table.indexes)indexes.append(textNode('li',index.name+' · '+(index.unique?'UNIQUE':'INDEX')+' · '+index.columns.join(', ')));
+ document.querySelectorAll('#table-list .tree-item').forEach(node=>node.classList.toggle('active',node.dataset.table===table.name));
 }
-
 async function loadCatalog(){
- const response=await fetch('/api/catalog');
- if(!response.ok)throw new Error(await response.text());
- catalog=await response.json();
- const tableList=document.getElementById('table-list');
- tableList.replaceChildren();
+ catalog=await requestJson('/api/catalog');
+ const list=document.getElementById('table-list');list.replaceChildren();
  document.getElementById('table-count').textContent='('+catalog.tables.length+')';
  document.getElementById('summary-tables').textContent=String(catalog.tables.length);
- document.getElementById('summary-rows').textContent=String(catalog.tables.reduce((sum,table)=>sum+table.row_count,0));
- document.getElementById('summary-indexes').textContent=String(catalog.tables.reduce((sum,table)=>sum+table.indexes.length,0));
- if(!catalog.tables.length)tableList.append(textNode('div','No tables found','muted'));
+ document.getElementById('summary-rows').textContent=String(catalog.tables.reduce((sum,t)=>sum+t.row_count,0));
+ document.getElementById('summary-indexes').textContent=String(catalog.tables.reduce((sum,t)=>sum+t.indexes.length,0));
+ if(!catalog.tables.length)list.append(textNode('div','No tables found','muted'));
  for(const table of catalog.tables){
-  const button=textNode('button','▦ '+table.name+'  ('+table.row_count+')','tree-item');
-  button.type='button';button.dataset.table=table.name;
-  button.addEventListener('click',()=>renderTable(table));
-  tableList.append(button);
+  const button=textNode('button','▦ '+table.name+' ('+table.row_count+')','tree-item');
+  button.type='button';button.dataset.table=table.name;button.addEventListener('click',()=>renderTable(table));list.append(button);
  }
  if(selectedTable){
-  const refreshed=catalog.tables.find(table=>table.name===selectedTable.name);
-  if(refreshed)renderTable(refreshed);else showOverview();
+  const fresh=catalog.tables.find(t=>t.name===selectedTable.name);
+  if(fresh)renderTable(fresh);else showOverview();
  }else showOverview();
 }
-
 function renderResult(result){
  resultsNode.replaceChildren();
  if(!result.columns.length){resultsNode.textContent=result.message;return;}
- const table=document.createElement('table');
- const head=document.createElement('thead');
- const headerRow=document.createElement('tr');
- const body=document.createElement('tbody');
- for(const column of result.columns)headerRow.append(textNode('th',column));
- head.append(headerRow);
- for(const row of result.rows){
-  const rowNode=document.createElement('tr');
-  for(const value of row)rowNode.append(textNode('td',value));
-  body.append(rowNode);
- }
+ const table=document.createElement('table'),head=document.createElement('thead'),header=document.createElement('tr'),body=document.createElement('tbody');
+ result.columns.forEach(column=>header.append(textNode('th',column)));head.append(header);
+ result.rows.forEach(row=>{const tr=document.createElement('tr');row.forEach(value=>tr.append(textNode('td',value)));body.append(tr);});
  table.append(head,body);resultsNode.append(table);
 }
-
+function rowKey(table,row){
+ const unique=table.indexes.find(index=>index.unique);if(!unique)return null;
+ return unique.columns.map(name=>row.values[table.columns.findIndex(column=>column.name===name)]);
+}
+function parseInteger(raw){
+ if(raw.trim()==='')throw new Error('An integer value is required');
+ const value=Number(raw);if(!Number.isSafeInteger(value))throw new Error('Value must be a safe integer');return value;
+}
+function buildField(column,value){
+ const wrapper=document.createElement('div');wrapper.className='field';
+ wrapper.append(textNode('label',column.name+' · '+column.data_type));
+ let control;
+ if(column.data_type==='Boolean'){
+  control=document.createElement('select');
+  [['true','TRUE'],['false','FALSE']].forEach(([v,label])=>{const option=document.createElement('option');option.value=v;option.textContent=label;control.append(option);});
+ }else{
+  control=document.createElement('input');control.type=column.data_type==='Integer'?'number':'text';control.step='1';
+ }
+ control.value=value===null?(column.data_type==='Boolean'?'true':''):String(value);
+ let nullBox=null;
+ if(column.nullable){
+  const label=document.createElement('label');label.className='null-control';
+  nullBox=document.createElement('input');nullBox.type='checkbox';nullBox.checked=value===null;
+  nullBox.addEventListener('change',()=>control.disabled=nullBox.checked);control.disabled=nullBox.checked;
+  label.append(nullBox,document.createTextNode(' NULL'));wrapper.append(control,label);
+ }else wrapper.append(control);
+ return {wrapper,read:()=>nullBox&&nullBox.checked?null:column.data_type==='Integer'?parseInteger(control.value):column.data_type==='Boolean'?control.value==='true':control.value};
+}
+function showInsertForm(){
+ const editor=document.getElementById('insert-editor');editor.replaceChildren();editor.hidden=false;
+ editor.append(textNode('h3','Insert a new row'));
+ const grid=document.createElement('div');grid.className='field-grid';const fields=[];
+ selectedTable.columns.forEach(column=>{const field=buildField(column,null);fields.push(field);grid.append(field.wrapper);});
+ editor.append(grid);
+ const actions=document.createElement('div');actions.className='toolbar';
+ const save=textNode('button','Insert row','action');save.type='button';
+ save.addEventListener('click',async()=>{
+  try{
+   const values=fields.map(field=>field.read());
+   await requestJson('/api/tables/'+encodeURIComponent(selectedTable.name)+'/rows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({values})});
+   editor.hidden=true;statusNode.textContent='Row inserted';await loadCatalog();await loadRows(0);
+  }catch(error){statusNode.textContent='Insert failed: '+error.message;}
+ });
+ const cancel=textNode('button','Cancel','secondary');cancel.type='button';cancel.addEventListener('click',()=>editor.hidden=true);
+ actions.append(save,cancel);editor.append(actions);
+}
+function showRowEditor(row){
+ const editor=document.getElementById('row-editor');editor.replaceChildren();editor.hidden=false;
+ const key=rowKey(selectedTable,row);
+ if(!key){editor.append(textNode('p','This table has no UNIQUE index. Row editing is disabled.','muted'));return;}
+ editor.append(textNode('h3','Edit row #'+row.row_id));
+ editor.append(textNode('p','Save each field separately. Values are checked against the column type.','muted'));
+ const grid=document.createElement('div');grid.className='field-grid';
+ selectedTable.columns.forEach((column,index)=>{
+  const field=buildField(column,row.values[index]);grid.append(field.wrapper);
+  const save=textNode('button','Save '+column.name,'secondary');save.type='button';
+  save.addEventListener('click',async()=>{
+   try{
+    await requestJson('/api/tables/'+encodeURIComponent(selectedTable.name)+'/rows',{
+     method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,column:column.name,value:field.read()})
+    });
+    statusNode.textContent='Updated '+column.name;await loadCatalog();await loadRows(currentRows?currentRows.offset:0);
+   }catch(error){statusNode.textContent='Update failed: '+error.message;}
+  });
+  field.wrapper.append(save);
+ });
+ editor.append(grid);
+ const close=textNode('button','Close','secondary');close.type='button';close.addEventListener('click',()=>editor.hidden=true);editor.append(close);
+}
+function renderRows(response){
+ currentRows=response;document.getElementById('rows-panel').hidden=false;
+ document.getElementById('rows-heading').textContent='Rows: '+response.table;
+ document.getElementById('rows-summary').textContent=response.total_rows+' total · showing '+response.rows.length;
+ const grid=document.getElementById('rows-grid');grid.replaceChildren();
+ const table=document.createElement('table'),head=document.createElement('thead'),header=document.createElement('tr'),body=document.createElement('tbody');
+ response.columns.forEach(column=>header.append(textNode('th',column)));
+ if(response.editable)header.append(textNode('th','Actions'));
+ head.append(header);
+ const info=catalog.tables.find(item=>item.name===response.table);
+ response.rows.forEach(row=>{
+  const tr=document.createElement('tr');row.values.forEach(value=>tr.append(textNode('td',value===null?'NULL':String(value))));
+  if(response.editable){
+   const actions=document.createElement('td');
+   const edit=textNode('button','Edit','secondary');edit.type='button';edit.addEventListener('click',()=>showRowEditor(row));
+   const remove=textNode('button','Delete','danger');remove.type='button';
+   remove.addEventListener('click',async()=>{
+    if(!window.confirm('Delete row #'+row.row_id+'?'))return;
+    try{
+     await requestJson('/api/tables/'+encodeURIComponent(response.table)+'/rows',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rowKey(info,row)})});
+     statusNode.textContent='Row deleted';await loadCatalog();await loadRows(response.offset);
+    }catch(error){statusNode.textContent='Delete failed: '+error.message;}
+   });
+   actions.append(edit,document.createTextNode(' '),remove);tr.append(actions);
+  }
+  body.append(tr);
+ });
+ table.append(head,body);grid.append(table);
+ document.getElementById('page-label').textContent='Rows '+(response.total_rows===0?0:response.offset+1)+'–'+(response.offset+response.rows.length)+' of '+response.total_rows;
+ document.getElementById('prev-page').disabled=response.offset===0;
+ document.getElementById('next-page').disabled=response.offset+response.rows.length>=response.total_rows;
+ document.getElementById('row-editor').hidden=true;
+ if(!response.editable)statusNode.textContent='Read-only row actions: add a UNIQUE index or PRIMARY KEY to enable edits/deletes.';
+}
+async function loadRows(offset){
+ if(!selectedTable)return;
+ const name=selectedTable.name;
+ const response=await requestJson('/api/tables/'+encodeURIComponent(name)+'/rows?offset='+offset+'&limit='+PAGE_SIZE);
+ renderRows(response);
+}
+function downloadFile(name,type,content){
+ const blob=new Blob([content],{type}),url=URL.createObjectURL(blob);
+ const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url);
+}
+function exportRows(format){
+ if(!currentRows)return;
+ const page=Math.floor(currentRows.offset/PAGE_SIZE)+1;
+ if(format==='json'){
+  const objects=currentRows.rows.map(row=>{const object={};currentRows.columns.forEach((column,index)=>object[column]=row.values[index]);return object;});
+  downloadFile(currentRows.table+'.page-'+page+'.json','application/json',JSON.stringify(objects,null,2));
+ }else{
+  const quote=value=>'"'+String(value===null?'':value).replace(/"/g,'""')+'"';
+  const lines=[currentRows.columns.map(quote).join(',')];
+  currentRows.rows.forEach(row=>lines.push(row.values.map(quote).join(',')));
+  downloadFile(currentRows.table+'.page-'+page+'.csv','text/csv;charset=utf-8','\uFEFF'+lines.join('\r\n'));
+ }
+}
 async function runSQL(){
- statusNode.textContent='Executing…';
- resultsNode.replaceChildren();
+ statusNode.textContent='Executing…';resultsNode.replaceChildren();
  try{
-  const response=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sqlNode.value})});
-  if(!response.ok)throw new Error(await response.text());
-  const result=await response.json();
-  statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected';
-  renderResult(result);
-  await loadCatalog();
+  const result=await requestJson('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sqlNode.value})});
+  statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected;
+  renderResult(result);await loadCatalog();if(selectedTable)await loadRows(currentRows?currentRows.offset:0);
  }catch(error){statusNode.textContent='Query failed: '+error.message;}
 }
-
 document.getElementById('run').addEventListener('click',runSQL);
-document.getElementById('refresh-catalog').addEventListener('click',async()=>{
- try{await loadCatalog();statusNode.textContent='Catalog refreshed';}
- catch(error){statusNode.textContent='Catalog refresh failed: '+error.message;}
-});
+document.getElementById('refresh-catalog').addEventListener('click',async()=>{try{await loadCatalog();statusNode.textContent='Catalog refreshed';}catch(error){statusNode.textContent='Catalog refresh failed: '+error.message;}});
 document.getElementById('overview-link').addEventListener('click',showOverview);
-document.getElementById('browse-rows').addEventListener('click',()=>{
- if(!selectedTable)return;
- if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(selectedTable.name)){
-  statusNode.textContent='This table name cannot be inserted into the simple SQL browser automatically.';
-  return;
- }
- sqlNode.value='SELECT * FROM '+selectedTable.name+' LIMIT 100;';
- runSQL();
-});
-loadCatalog().then(()=>{statusNode.textContent='Ready · local embedded database';})
- .catch(error=>{statusNode.textContent='Catalog load failed: '+error.message;});
+document.getElementById('browse-rows').addEventListener('click',()=>loadRows(0).catch(error=>{statusNode.textContent='Could not load rows: '+error.message;}));
+document.getElementById('insert-row').addEventListener('click',showInsertForm);
+document.getElementById('prev-page').addEventListener('click',()=>{if(currentRows)loadRows(Math.max(0,currentRows.offset-PAGE_SIZE)).catch(error=>{statusNode.textContent=error.message;});});
+document.getElementById('next-page').addEventListener('click',()=>{if(currentRows)loadRows(currentRows.offset+PAGE_SIZE).catch(error=>{statusNode.textContent=error.message;});});
+document.getElementById('export-csv').addEventListener('click',()=>exportRows('csv'));
+document.getElementById('export-json').addEventListener('click',()=>exportRows('json'));
+loadCatalog().then(()=>{statusNode.textContent='Ready · local embedded database';}).catch(error=>{statusNode.textContent='Catalog load failed: '+error.message;});
 </script>
 </body></html>
