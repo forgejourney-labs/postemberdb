@@ -955,7 +955,7 @@ fn format_result(result: QueryResult) -> String {
 mod tests {
     use super::{append_sidecar_suffix, open_recovered_stores, read_bounded_line, validate_bind_address};
     use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
-    use postemberdb::{CoordinatorParticipant, Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, QueryResult, Registry, TransactionCoordinator, Value};
+    use postemberdb::{Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, QueryResult, Registry, TransactionCoordinator, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -1010,7 +1010,6 @@ mod tests {
             assert!(coordinator.committed_pending_apply().is_empty());
             assert!(coordinator.in_doubt().is_empty());
         }
-        let _ = tx;
         std::fs::remove_dir_all(directory).unwrap();
     }
 
