@@ -3468,6 +3468,21 @@ mod tests {
             quoted.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
             vec![Value::Integer(3), Value::Integer(5)]
         );
+
+        let updated = db.execute(
+            "UPDATE logical_filters SET state = 'changed' WHERE id = 1 OR id = 3"
+        ).unwrap();
+        assert_eq!(updated.affected_rows, 2);
+        let changed = db.execute(
+            "SELECT id FROM logical_filters WHERE state = 'changed' OR id = 5 ORDER BY id"
+        ).unwrap();
+        assert_eq!(changed.rows.len(), 3);
+
+        let deleted = db.execute(
+            "DELETE FROM logical_filters WHERE id = 2 OR id = 4"
+        ).unwrap();
+        assert_eq!(deleted.affected_rows, 2);
+        assert_eq!(db.execute("SELECT * FROM logical_filters").unwrap().rows.len(), 3);
     }
 
 
