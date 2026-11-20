@@ -524,6 +524,42 @@ fn handle_binary_client<S: Read + Write>(
             None => return Ok(()),
         };
         let request_id = frame.request_id;
+        let current_principal = if auth_required {
+            let Some(original) = principal.as_ref() else {
+                binary_error(request_id, "authentication required")
+                    .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+                continue;
+            };
+            let Some(store) = auth.as_ref() else {
+                binary_error(request_id, "authentication service unavailable")
+                    .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+                continue;
+            };
+            let refreshed = match store.lock() {
+                Ok(mut store) => store.current_principal(&original.username),
+                Err(_) => {
+                    binary_error(request_id, "authentication service lock poisoned")
+                        .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+                    continue;
+                }
+            };
+            match refreshed {
+                Ok(Some(principal)) => Some(principal),
+                Ok(None) => {
+                    binary_error(request_id, "authenticated account is disabled or no longer exists")
+                        .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+                    continue;
+                }
+                Err(error) => {
+                    binary_error(request_id, &error.to_string())
+                        .write_to(reader.get_mut(), DEFAULT_MAX_PAYLOAD)?;
+                    continue;
+                }
+            }
+        } else {
+            principal.clone()
+        };
+        let principal = current_principal.as_ref();
         let response = match frame.kind {
             FrameKind::Ping => Frame::new(FrameKind::Pong, request_id, frame.payload),
             FrameKind::Catalog => {

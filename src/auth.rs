@@ -392,6 +392,31 @@ impl AuthStore {
         Ok(Some(Principal { username: username.to_ascii_lowercase(), permissions: effective_permissions }))
     }
 
+    /// Resolves an authenticated username against current durable account state.
+    /// Long-lived connections call this before each request so revocation and
+    /// account disablement take effect without requiring the client to reconnect.
+    pub fn current_principal(&mut self, username: &str) -> Result<Option<Principal>, DbError> {
+        let key = user_key(username)?;
+        let Some(bytes) = self.users.get(&key)? else {
+            return Ok(None);
+        };
+        let record = UserRecord::decode(&bytes)?;
+        if !record.enabled {
+            return Ok(None);
+        }
+        let mut effective_permissions = record.permissions;
+        for role in self.list_user_roles(username)? {
+            let Some(bytes) = self.users.get(&role_key(&role)?)? else {
+                return Err(DbError::Storage(format!("assigned authentication role '{role}' is missing")));
+            };
+            effective_permissions = effective_permissions.union(RoleRecord::decode(&bytes)?.permissions);
+        }
+        Ok(Some(Principal {
+            username: username.to_ascii_lowercase(),
+            permissions: effective_permissions,
+        }))
+    }
+
     /// Replace a user's password hash without exposing or returning password material.
     /// The new credential is independently salted and persisted before this method returns.
     pub fn change_password(&mut self, username: &str, new_password: &str) -> Result<(), DbError> {
@@ -690,6 +715,35 @@ mod tests {
             }).flatten().copied().collect::<Vec<_>>();
             assert!(!encoded.windows(b"correct horse battery staple".len())
                 .any(|window| window == b"correct horse battery staple"));
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn current_principal_refreshes_direct_role_and_enabled_permissions() {
+        let path = path();
+        {
+            let mut store = AuthStore::open(&path).unwrap();
+            store.create_user("operator", "operator secure password", Permissions::ADMIN).unwrap();
+            assert!(store.current_principal("operator").unwrap().unwrap().allows(Permission::Admin));
+
+            store.set_permissions("operator", Permissions::READ_ONLY).unwrap();
+            let refreshed = store.current_principal("operator").unwrap().unwrap();
+            assert!(refreshed.allows(Permission::SqlRead));
+            assert!(!refreshed.allows(Permission::Admin));
+
+            store.create_role("temporary-admin", Permissions::ADMIN).unwrap();
+            store.assign_role("operator", "temporary-admin").unwrap();
+            assert!(store.current_principal("operator").unwrap().unwrap().allows(Permission::Admin));
+
+            store.revoke_role("operator", "temporary-admin").unwrap();
+            assert!(!store.current_principal("operator").unwrap().unwrap().allows(Permission::Admin));
+
+            store.set_enabled("operator", false).unwrap();
+            assert!(store.current_principal("operator").unwrap().is_none());
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal"] {
             let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
