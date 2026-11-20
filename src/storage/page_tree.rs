@@ -87,14 +87,7 @@ pub(crate) fn insert_many(
         });
     }
     let root = root.expect("non-empty mutation batch always creates a root");
-    let frame = encode_wal(root, &staged)?;
-    write_wal(wal_path, &frame)?;
-    for (page_id, payload) in &staged {
-        store.write_page(*page_id, payload)?;
-    }
-    store.publish_root(Some(root))?;
-    validate_tree(store)?;
-    truncate_wal(wal_path)?;
+    commit_staged_tree(store, wal_path, Some(root), &staged)?;
     Ok(())
 }
 
@@ -134,14 +127,7 @@ pub(crate) fn remove_many(
     }
     if removed == 0 { return Ok(0); }
 
-    let frame = encode_wal(root.unwrap_or(EMPTY_ROOT), &staged)?;
-    write_wal(wal_path, &frame)?;
-    for (page_id, payload) in &staged {
-        store.write_page(*page_id, payload)?;
-    }
-    store.publish_root(root)?;
-    validate_tree(store)?;
-    truncate_wal(wal_path)?;
+    commit_staged_tree(store, wal_path, root, &staged)?;
     Ok(removed)
 }
 
@@ -497,15 +483,7 @@ pub(crate) fn replace_all(
     }
 
     let root_page_id = level[0].page_id;
-    let wal = encode_wal(root_page_id, &pages)?;
-    write_wal(wal_path, &wal)?;
-
-    for (page_id, payload) in &pages {
-        store.write_page(*page_id, payload)?;
-    }
-    store.publish_root((root_page_id != EMPTY_ROOT).then_some(root_page_id))?;
-    validate_tree(store)?;
-    truncate_wal(wal_path)?;
+    commit_staged_tree(store, wal_path, (root_page_id != EMPTY_ROOT).then_some(root_page_id), &pages)?;
     Ok(())
 }
 
@@ -937,6 +915,58 @@ fn truncate_wal(path: &Path) -> Result<(), DbError> {
     file.sync_all().map_err(storage_error)
 }
 
+const FAIL_AFTER_WAL_SYNC: u8 = 1;
+const FAIL_AFTER_FIRST_PAGE_SYNC: u8 = 2;
+const FAIL_AFTER_ALL_PAGE_SYNCS: u8 = 3;
+const FAIL_AFTER_ROOT_PUBLICATION: u8 = 4;
+
+#[cfg(test)]
+thread_local! {
+    static COMMIT_FAILPOINT: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_failpoint(point: u8) -> Result<(), DbError> {
+    COMMIT_FAILPOINT.with(|active| {
+        if active.get() == Some(point) {
+            active.set(None);
+            Err(DbError::Storage(format!("simulated crash at B+ tree commit boundary {point}")))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn maybe_failpoint(_point: u8) -> Result<(), DbError> { Ok(()) }
+
+/// Commits immutable page images through a single redo record and root switch.
+/// Every injected failure leaves enough durable WAL state for recovery.
+fn commit_staged_tree(
+    store: &mut ExtentFile,
+    wal_path: &Path,
+    root: Option<u64>,
+    pages: &[(u64, Vec<u8>)],
+) -> Result<(), DbError> {
+    let frame = encode_wal(root.unwrap_or(EMPTY_ROOT), pages)?;
+    write_wal(wal_path, &frame)?;
+    maybe_failpoint(FAIL_AFTER_WAL_SYNC)?;
+
+    for (index, (page_id, payload)) in pages.iter().enumerate() {
+        store.write_page(*page_id, payload)?;
+        if index == 0 {
+            maybe_failpoint(FAIL_AFTER_FIRST_PAGE_SYNC)?;
+        }
+    }
+    maybe_failpoint(FAIL_AFTER_ALL_PAGE_SYNCS)?;
+
+    store.publish_root(root)?;
+    maybe_failpoint(FAIL_AFTER_ROOT_PUBLICATION)?;
+    validate_tree(store)?;
+    truncate_wal(wal_path)?;
+    Ok(())
+}
+
 fn storage_error(error: std::io::Error) -> DbError { DbError::Storage(error.to_string()) }
 
 fn put_u16(out: &mut Vec<u8>, value: usize) -> Result<(), DbError> {
@@ -1002,6 +1032,48 @@ mod tests {
         drop(reopened);
         fs::remove_file(path).unwrap();
         fs::remove_file(wal).ok();
+    }
+
+    #[test]
+    fn redo_recovery_completes_commits_interrupted_at_every_durable_boundary() {
+        let failpoints = [
+            FAIL_AFTER_WAL_SYNC,
+            FAIL_AFTER_FIRST_PAGE_SYNC,
+            FAIL_AFTER_ALL_PAGE_SYNCS,
+            FAIL_AFTER_ROOT_PUBLICATION,
+        ];
+
+        for (case_index, failpoint) in failpoints.into_iter().enumerate() {
+            let (path, wal) = paths(&format!("fault-recovery-{case_index}"));
+            let entries = (0u64..700)
+                .map(|n| (format!("key-{n:04}").into_bytes(), n.to_le_bytes().to_vec()))
+                .collect::<Vec<_>>();
+
+            {
+                let mut store = ExtentFile::open(&path).unwrap();
+                replace_all(&mut store, &wal, &entries).unwrap();
+                COMMIT_FAILPOINT.with(|active| active.set(Some(failpoint)));
+                let result = insert_or_replace(&mut store, &wal, b"key-0350", b"committed-after-recovery");
+                assert!(result.is_err(), "failpoint {failpoint} must interrupt the commit");
+                assert_eq!(COMMIT_FAILPOINT.with(|active| active.get()), None,
+                    "failpoint {failpoint} must be consumed exactly once");
+            }
+
+            {
+                let mut reopened = ExtentFile::open(&path).unwrap();
+                recover(&mut reopened, &wal).unwrap();
+                assert_eq!(get(&mut reopened, b"key-0350").unwrap(),
+                    Some(b"committed-after-recovery".to_vec()),
+                    "recovery must finish the redo transaction at failpoint {failpoint}");
+                assert_eq!(get(&mut reopened, b"key-0699").unwrap(),
+                    Some(699u64.to_le_bytes().to_vec()),
+                    "unmodified pages must remain readable after recovery");
+                assert!(!wal.exists() || fs::metadata(&wal).unwrap().len() == 0);
+            }
+
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(&wal).ok();
+        }
     }
 
     #[test]
