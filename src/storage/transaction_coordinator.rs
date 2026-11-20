@@ -339,6 +339,22 @@ impl TransactionCoordinator {
         Ok(())
     }
 
+    /// Retries every durable COMMIT and ABORT decision using the supplied
+    /// participant handles. Transactions still in PREPARING are intentionally
+    /// left in doubt: recovery must not guess COMMIT or ABORT without a decision.
+    pub fn recover_pending(
+        &mut self,
+        participants: &mut [&mut dyn CoordinatorParticipant],
+    ) -> Result<(), DbError> {
+        let committed = self.committed_pending_apply().into_iter()
+            .map(|transaction| transaction.transaction_id).collect::<Vec<_>>();
+        for txid in committed { self.apply_committed(txid, participants)?; }
+        let aborted = self.aborted_pending_rollback().into_iter()
+            .map(|transaction| transaction.transaction_id).collect::<Vec<_>>();
+        for txid in aborted { self.rollback_prepared_participants(txid, participants)?; }
+        Ok(())
+    }
+
     pub fn in_doubt(&self) -> Vec<RecoveredTransaction> {
         self.transactions.iter().filter_map(|(id, tx)| (tx.state == TransactionState::Preparing).then(|| RecoveredTransaction {
             transaction_id: *id, participant_count: tx.participant_count,
@@ -632,6 +648,69 @@ mod tests {
             for suffix in suffixes {
                 let mut candidate = base.as_os_str().to_os_string();
                 candidate.push(suffix);
+                let _ = fs::remove_file(PathBuf::from(candidate));
+            }
+        }
+        cleanup(&coordinator_path);
+    }
+
+    #[test]
+    fn recovery_finishes_a_cross_domain_commit_after_partial_application() {
+        let coordinator_path = path();
+        let database_path = coordinator_path.with_extension("recover.pbd");
+        let kv_path = coordinator_path.with_extension("recover.kv");
+        let registry_path = coordinator_path.with_extension("recover.registry");
+        let ef7_path = coordinator_path.with_extension("recover.ef7");
+        let tx;
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut database = crate::Database::open(&database_path).unwrap();
+            database.migrate_to_pdb6().unwrap();
+            database.execute("CREATE TABLE players (uuid TEXT, name TEXT)").unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            let mut registry = crate::Registry::open(&registry_path).unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            let mut ef7 = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
+            ef7.create_namespace(1, None, crate::storage::emberforge7::EmberForge7NamespaceKind::World, "world").unwrap();
+            tx = coordinator.begin(4).unwrap();
+            database.prepare_sql(tx, &[String::from("INSERT INTO players (uuid, name) VALUES ('recovery-player', 'Morgan')")]).unwrap();
+            kv.prepare_batch(tx, &[], &[(b"recovery/key".to_vec(), b"kv".to_vec())]).unwrap();
+            registry.prepare_set_value(tx, "SYSTEM", "Recovery", crate::RegistryValue::String("done".into())).unwrap();
+            ef7.prepare_put_chunk(tx, 1, 7, -9, b"recovered-chunk").unwrap();
+            for id in [0, 1, 2, 3] { coordinator.mark_prepared(tx, id).unwrap(); }
+            coordinator.commit(tx).unwrap();
+            // Crash window: SQL has applied, but the coordinator has no APPLIED
+            // acknowledgement and the other three participants remain prepared.
+            database.commit_prepared(tx).unwrap();
+        }
+        {
+            let mut coordinator = TransactionCoordinator::open(&coordinator_path).unwrap();
+            let mut database = crate::Database::open(&database_path).unwrap();
+            let mut kv = crate::KeyValueStore::open(&kv_path).unwrap();
+            let mut registry = crate::Registry::open(&registry_path).unwrap();
+            let mut ef7 = crate::storage::emberforge7::EmberForge7Store::open(&ef7_path, 32).unwrap();
+            let mut participants: [&mut dyn CoordinatorParticipant; 4] = [
+                &mut database, &mut kv, &mut registry, &mut ef7,
+            ];
+            coordinator.recover_pending(&mut participants).unwrap();
+            assert!(coordinator.committed_pending_apply().is_empty());
+            assert_eq!(database.execute("SELECT * FROM players").unwrap().rows.len(), 1);
+            assert_eq!(kv.get(b"recovery/key").unwrap(), Some(b"kv".to_vec()));
+            assert_eq!(registry.get_value("SYSTEM", "Recovery").unwrap(), Some(crate::RegistryValue::String("done".into())));
+            assert_eq!(ef7.get_chunk(1, 7, -9).unwrap(), Some(b"recovered-chunk".to_vec()));
+            assert!(database.pending_prepared_transactions().unwrap().is_empty());
+            assert!(kv.pending_prepared_transactions().is_empty());
+            assert!(registry.pending_prepared_transactions().is_empty());
+            assert!(ef7.pending_prepared_transactions().is_empty());
+        }
+        for (base, suffixes) in [
+            (&database_path, vec!["", ".lock", ".wal", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal", ".pdb6.wal.prepared.1"]),
+            (&kv_path, vec![".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"]),
+            (&registry_path, vec![".lock", ".pages", ".pages.wal", ".pages.wal.prepared.1"]),
+            (&ef7_path, vec![".ef7.lock", ".ef7.pages", ".ef7.wal", ".ef7.wal.prepared.1"]),
+        ] {
+            for suffix in suffixes {
+                let mut candidate = base.as_os_str().to_os_string(); candidate.push(suffix);
                 let _ = fs::remove_file(PathBuf::from(candidate));
             }
         }
