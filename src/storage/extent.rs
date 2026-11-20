@@ -27,6 +27,36 @@ const METADATA_MAGIC: &[u8; 4] = b"EAM3";
 const DATA_PAGE_MAGIC: &[u8; 4] = b"EPG1";
 const FORMAT_VERSION: u32 = 3;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataFailpoint {
+    AfterPrimarySync,
+    AfterMirrorSync,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static METADATA_FAILPOINT: std::cell::Cell<Option<MetadataFailpoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_metadata_failpoint(failpoint: Option<MetadataFailpoint>) {
+    METADATA_FAILPOINT.with(|slot| slot.set(failpoint));
+}
+
+#[cfg(test)]
+fn take_metadata_failpoint(expected: MetadataFailpoint) -> bool {
+    METADATA_FAILPOINT.with(|slot| {
+        if slot.get() == Some(expected) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AllocatorMetadata {
     generation: u64,
@@ -415,6 +445,18 @@ impl ExtentFile {
         // The first durable copy is now the committed generation, even if
         // mirroring the second copy subsequently fails.
         self.metadata = next.clone();
+
+        // A failed return after the first durable copy has an uncertain outcome:
+        // the generation is committed even though the caller did not receive
+        // success. Poison this handle and require reopen/reconciliation.
+        #[cfg(test)]
+        if take_metadata_failpoint(MetadataFailpoint::AfterPrimarySync) {
+            self.poisoned = true;
+            return Err(DbError::Storage(
+                "injected failure after primary allocator metadata sync".into(),
+            ));
+        }
+
         if let Err(error) = write_at(&mut self.file, second_slot * PAGE_SIZE as u64, &encoded) {
             self.poisoned = true;
             return Err(error);
@@ -423,6 +465,15 @@ impl ExtentFile {
             self.poisoned = true;
             return Err(storage_error(error));
         }
+
+        #[cfg(test)]
+        if take_metadata_failpoint(MetadataFailpoint::AfterMirrorSync) {
+            self.poisoned = true;
+            return Err(DbError::Storage(
+                "injected failure after mirrored allocator metadata sync".into(),
+            ));
+        }
+
         self.metadata = next;
         Ok(())
     }
@@ -814,6 +865,46 @@ mod tests {
         let next_page = reopened.allocate_page(b"after-recovery").unwrap();
         assert_eq!(next_page, 1);
         assert_eq!(reopened.read_page(next_page).unwrap(), b"after-recovery");
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn allocator_reservation_survives_failure_after_primary_metadata_sync() {
+        use super::{set_metadata_failpoint, MetadataFailpoint};
+
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        set_metadata_failpoint(Some(MetadataFailpoint::AfterPrimarySync));
+        let error = store.allocate_extent(3).unwrap_err();
+        assert!(error.to_string().contains("primary allocator metadata sync"));
+        assert!(store.allocate_extent(1).is_err());
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.stats().next_page_id, 3);
+        assert_eq!(reopened.stats().allocated_pages, 3);
+        // The failed reservation is intentionally leaked, never reissued.
+        assert_eq!(reopened.allocate_extent(1).unwrap(), 3);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mirrored_metadata_failure_reopens_with_the_committed_generation() {
+        use super::{set_metadata_failpoint, MetadataFailpoint};
+
+        let path = temp_path();
+        let mut store = ExtentFile::open(&path).unwrap();
+        set_metadata_failpoint(Some(MetadataFailpoint::AfterMirrorSync));
+        let error = store.allocate_extent(2).unwrap_err();
+        assert!(error.to_string().contains("mirrored allocator metadata sync"));
+        drop(store);
+
+        let mut reopened = ExtentFile::open(&path).unwrap();
+        assert_eq!(reopened.stats().next_page_id, 2);
+        assert_eq!(reopened.stats().allocated_pages, 2);
+        assert_eq!(reopened.allocate_extent(1).unwrap(), 2);
         drop(reopened);
         fs::remove_file(path).unwrap();
     }
