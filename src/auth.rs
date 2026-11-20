@@ -388,7 +388,35 @@ impl AuthStore {
     pub fn delete_user(&mut self, username: &str) -> Result<bool, DbError> {
         let key = user_key(username)?;
         if self.users.get(&key)?.is_none() { return Ok(false); }
-        self.commit_audited_mutation(&[key], &[], "local-api", "user.delete", username, true)?;
+        let mut membership_prefix = MEMBERSHIP_PREFIX.to_vec();
+        membership_prefix.extend_from_slice(&normalized_identifier(username)?);
+        membership_prefix.push(b'/');
+        let memberships = self.users.scan_prefix(&membership_prefix, None)?;
+        if memberships.len() > 4_999 {
+            return Err(DbError::Constraint("user has too many role memberships to delete atomically".into()));
+        }
+        let mut removals = vec![key];
+        removals.extend(memberships.into_iter().map(|(key, _)| key));
+        self.commit_audited_mutation(&removals, &[], "local-api", "user.delete", username, true)?;
+        Ok(true)
+    }
+
+    /// Deletes a role and all its user memberships in one atomic page-tree batch.
+    pub fn delete_role(&mut self, name: &str) -> Result<bool, DbError> {
+        let key = role_key(name)?;
+        if self.users.get(&key)?.is_none() { return Ok(false); }
+        let role_suffix = [vec![b'/'], normalized_identifier(name)?].concat();
+        let memberships = self.users.scan_prefix(MEMBERSHIP_PREFIX, None)?
+            .into_iter()
+            .filter(|(membership, _)| membership.ends_with(&role_suffix))
+            .map(|(membership, _)| membership)
+            .collect::<Vec<_>>();
+        if memberships.len() > 4_999 {
+            return Err(DbError::Constraint("role has too many members to delete atomically".into()));
+        }
+        let mut removals = vec![key];
+        removals.extend(memberships);
+        self.commit_audited_mutation(&removals, &[], "local-api", "role.delete", name, true)?;
         Ok(true)
     }
 
@@ -591,6 +619,30 @@ mod tests {
             }).flatten().copied().collect::<Vec<_>>();
             assert!(!encoded.windows(b"correct horse battery staple".len())
                 .any(|window| window == b"correct horse battery staple"));
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn deleting_users_and_roles_cleans_memberships_without_regranting_stale_access() {
+        let path = path();
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            auth.create_user("membership-user", "correct horse battery staple", Permissions::NONE).unwrap();
+            auth.create_role("moderators", Permissions::ADMIN).unwrap();
+            auth.assign_role("membership-user", "moderators").unwrap();
+            assert!(auth.delete_user("membership-user").unwrap());
+            auth.create_user("membership-user", "another secure password", Permissions::NONE).unwrap();
+            let principal = auth.authenticate("membership-user", "another secure password").unwrap().unwrap();
+            assert!(!principal.allows(Permission::Admin));
+            auth.assign_role("membership-user", "moderators").unwrap();
+            assert!(auth.delete_role("moderators").unwrap());
+            let principal = auth.authenticate("membership-user", "another secure password").unwrap().unwrap();
+            assert!(!principal.allows(Permission::Admin));
+            assert!(auth.list_user_roles("membership-user").unwrap().is_empty());
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal"] {
             let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
