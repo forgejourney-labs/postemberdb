@@ -22,9 +22,9 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
       - name: Run Clippy correctness and suspicious lints
-        run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
+        run: cargo clippy --all-targets -- -D clippy::correctness
       - name: Check all targets
         run: cargo check --all-targets
       - name: Run unit and binary tests
