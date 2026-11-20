@@ -12,7 +12,7 @@ A separate Rust web application with a phpMyAdmin-inspired administration layout
 - Allows inserting rows and editing/deleting individual rows when the table has a UNIQUE index or PRIMARY KEY.
 - Exports the current visible page as CSV or JSON.
 - Provides remote server status, user list/create/enable/disable/delete/password reset, role create/permission updates/assignment/revocation/deletion, and audit-event browsing.
-- Provides a live table-name filter in the database navigator and displays the active local/remote connection mode in the header.
+- Provides a live table-name filter in the database navigator, a current-page row filter, and displays the active local/remote connection mode in the header.
 - User password reset is available in the user action list and validates the minimum password length before sending the request.
 - All remote administrative actions are checked by the database server for the Admin permission; mutations are attributed to the authenticated principal in the durable audit log.
 - Server-side RBAC changes are rejected if they would leave no enabled administrator.

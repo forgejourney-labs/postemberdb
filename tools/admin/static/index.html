@@ -293,7 +293,7 @@ async function loadRows(offset){
 }
 function downloadFile(name,type,content){
  const blob=new Blob([content],{type}),url=URL.createObjectURL(blob);
- const link=document.createElement('a');link.href=url;link.download=name;link.click();URL.revokeObjectURL(url);
+ const link=document.createElement('a');link.href=url;link.download=name;document.body.append(link);link.click();link.remove();window.setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function exportRows(format){
  if(!currentRows)return;
