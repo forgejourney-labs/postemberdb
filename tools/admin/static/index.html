@@ -7,50 +7,175 @@
 <style>
 :root{font-family:Tahoma,Arial,sans-serif;color:#252525;background:#e9edf1;font-size:13px}*{box-sizing:border-box}body{margin:0}
 header{height:48px;display:flex;align-items:center;gap:18px;padding:0 18px;color:#fff;background:#34495e;border-bottom:1px solid #243746}header strong{font-size:16px}header span{color:#d8e2ea}
-.layout{display:grid;grid-template-columns:230px 1fr;min-height:calc(100vh - 48px)}aside{background:#f5f6f7;border-right:1px solid #c9d0d7;padding:14px 12px}
-.tree-title{font-weight:bold;padding:8px 7px;border-bottom:1px solid #d5dbe0;margin-bottom:8px}.tree-item{padding:8px 9px;border:1px solid transparent;color:#34495e}.tree-item.active{background:#dce7f0;border-color:#bdcbd8;font-weight:bold}
+.layout{display:grid;grid-template-columns:245px minmax(0,1fr);min-height:calc(100vh - 48px)}aside{background:#f5f6f7;border-right:1px solid #c9d0d7;padding:13px 11px;overflow:auto}
+.tree-title{font-weight:bold;padding:8px 7px;border-bottom:1px solid #d5dbe0;margin:8px 0}.tree-item{display:block;width:100%;text-align:left;padding:7px 9px;border:1px solid transparent;background:transparent;color:#34495e;cursor:pointer;font:inherit}.tree-item:hover{background:#e9eef2}.tree-item.active{background:#dce7f0;border-color:#bdcbd8;font-weight:bold}.muted{color:#71808d}
 main{min-width:0;padding:18px}.breadcrumbs{color:#647586;margin-bottom:14px}.panel{background:#fff;border:1px solid #cbd2d9;margin-bottom:15px;box-shadow:0 1px 1px #0000000b}
 .panel h2{font-size:14px;margin:0;padding:10px 13px;background:#f2f4f6;border-bottom:1px solid #d4d9de}.panel-body{padding:13px}
-textarea{display:block;width:100%;min-height:150px;resize:vertical;padding:10px;border:1px solid #aeb8c2;background:#fbfcfd;color:#202830;font:13px Consolas,monospace}
-button{margin-top:9px;padding:7px 14px;border:1px solid #315d7b;background:#477b9f;color:white;cursor:pointer}button:hover{background:#386989}
-#status{color:#536575;padding:7px 0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;border:1px solid #d5dbe0;padding:7px 9px}th{background:#e9eef2}tbody tr:nth-child(even){background:#f7f9fa}.muted{color:#71808d}
-@media(max-width:720px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7}}
+.summary{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr));gap:10px}.summary-item{border:1px solid #d5dbe0;background:#fafbfc;padding:11px}.summary-item strong{display:block;font-size:19px;color:#34495e;margin-bottom:3px}
+textarea{display:block;width:100%;min-height:145px;resize:vertical;padding:10px;border:1px solid #aeb8c2;background:#fbfcfd;color:#202830;font:13px Consolas,monospace}
+button.action{margin-top:9px;padding:7px 14px;border:1px solid #315d7b;background:#477b9f;color:white;cursor:pointer}button.action:hover{background:#386989}
+button.secondary{padding:5px 10px;border:1px solid #aeb8c2;background:#f7f8f9;color:#34495e;cursor:pointer}
+#status{color:#536575;padding:7px 0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;border:1px solid #d5dbe0;padding:7px 9px}th{background:#e9eef2}tbody tr:nth-child(even){background:#f7f9fa}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.detail-grid h3{font-size:13px;margin:3px 0 8px}.detail-list{margin:0;padding:0;list-style:none}.detail-list li{padding:6px 8px;border-bottom:1px solid #edf0f2}
+@media(max-width:760px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #c9d0d7;max-height:270px}.summary{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <header><strong>PostemberDB Admin</strong><span>Database management</span><span>Local mode</span></header>
 <div class="layout">
 <aside>
-<div class="tree-title">Database navigator</div>
-<div class="tree-item active">▣ Current database</div>
-<div class="tree-item muted">▸ Tables — catalog API pending</div>
-<div class="tree-item muted">▸ Indexes — catalog API pending</div>
-<div class="tree-item muted">▸ Users &amp; roles — admin API pending</div>
-<div class="tree-item muted">▸ Server status — metrics API pending</div>
+  <div class="tree-title">Database navigator</div>
+  <button class="tree-item active" id="overview-link">▣ Current database</button>
+  <div class="tree-title">Tables <span id="table-count" class="muted">(loading)</span></div>
+  <div id="table-list"><div class="muted" style="padding:8px">Loading catalog…</div></div>
+  <button class="secondary" id="refresh-catalog">Refresh catalog</button>
+  <div class="tree-title">Server</div>
+  <div class="tree-item muted">Local embedded mode</div>
 </aside>
 <main>
-<div class="breadcrumbs">Home » SQL console</div>
-<section class="panel"><h2>SQL query</h2><div class="panel-body">
-<textarea id="sql" spellcheck="false">SELECT * FROM your_table LIMIT 100;</textarea>
-<button id="run">Execute</button><div id="status" role="status">Ready. This panel is bound to a local database file.</div>
-</div></section>
-<section class="panel"><h2>Query results</h2><div class="panel-body table-wrap" id="results"><span class="muted">Execute a query to display its result.</span></div></section>
+  <div class="breadcrumbs" id="breadcrumbs">Home » Overview</div>
+  <section class="panel" id="overview-panel">
+    <h2>Database overview</h2>
+    <div class="panel-body">
+      <div class="summary">
+        <div class="summary-item"><strong id="summary-tables">—</strong><span>SQL tables</span></div>
+        <div class="summary-item"><strong id="summary-rows">—</strong><span>Rows in tables</span></div>
+        <div class="summary-item"><strong id="summary-indexes">—</strong><span>Indexes</span></div>
+      </div>
+      <p class="muted">Select a table in the left navigator to inspect its structure or browse its rows.</p>
+    </div>
+  </section>
+  <section class="panel" id="table-panel" hidden>
+    <h2 id="table-heading">Table</h2>
+    <div class="panel-body">
+      <div class="detail-grid">
+        <div><h3>Columns</h3><ul class="detail-list" id="column-list"></ul></div>
+        <div><h3>Indexes</h3><ul class="detail-list" id="index-list"></ul></div>
+      </div>
+      <button class="action" id="browse-rows">Browse rows</button>
+    </div>
+  </section>
+  <section class="panel"><h2>SQL query</h2><div class="panel-body">
+    <textarea id="sql" spellcheck="false">SELECT * FROM your_table LIMIT 100;</textarea>
+    <button class="action" id="run">Execute</button><div id="status" role="status">Connecting to the local database…</div>
+  </div></section>
+  <section class="panel"><h2>Query results</h2><div class="panel-body table-wrap" id="results"><span class="muted">Execute a query to display its result.</span></div></section>
 </main></div>
 <script>
-const statusNode=document.getElementById('status'),resultsNode=document.getElementById('results');
-document.getElementById('run').addEventListener('click',async()=>{
- statusNode.textContent='Executing…';resultsNode.replaceChildren();
+const statusNode=document.getElementById('status');
+const resultsNode=document.getElementById('results');
+const sqlNode=document.getElementById('sql');
+let catalog={tables:[]};
+let selectedTable=null;
+
+function textNode(tag,text,className){
+ const node=document.createElement(tag);
+ node.textContent=text;
+ if(className)node.className=className;
+ return node;
+}
+
+function showOverview(){
+ selectedTable=null;
+ document.getElementById('overview-panel').hidden=false;
+ document.getElementById('table-panel').hidden=true;
+ document.getElementById('overview-link').classList.add('active');
+ document.getElementById('breadcrumbs').textContent='Home » Overview';
+ document.querySelectorAll('#table-list .tree-item').forEach(node=>node.classList.remove('active'));
+}
+
+function renderTable(table){
+ selectedTable=table;
+ document.getElementById('overview-panel').hidden=true;
+ document.getElementById('table-panel').hidden=false;
+ document.getElementById('overview-link').classList.remove('active');
+ document.getElementById('table-heading').textContent='Table: '+table.name+' · '+table.row_count+' row(s)';
+ document.getElementById('breadcrumbs').textContent='Home » Tables » '+table.name;
+ const columns=document.getElementById('column-list');
+ const indexes=document.getElementById('index-list');
+ columns.replaceChildren();indexes.replaceChildren();
+ for(const column of table.columns){
+  const nullable=column.nullable?'NULL allowed':'NOT NULL';
+  columns.append(textNode('li',column.name+'  ·  '+column.data_type+'  ·  '+nullable));
+ }
+ if(!table.indexes.length)indexes.append(textNode('li','No indexes','muted'));
+ for(const index of table.indexes){
+  indexes.append(textNode('li',index.name+'  ·  '+(index.unique?'UNIQUE':'INDEX')+'  ·  '+index.columns.join(', ')));
+ }
+ document.querySelectorAll('#table-list .tree-item').forEach(node=>{
+  node.classList.toggle('active',node.dataset.table===table.name);
+ });
+}
+
+async function loadCatalog(){
+ const response=await fetch('/api/catalog');
+ if(!response.ok)throw new Error(await response.text());
+ catalog=await response.json();
+ const tableList=document.getElementById('table-list');
+ tableList.replaceChildren();
+ document.getElementById('table-count').textContent='('+catalog.tables.length+')';
+ document.getElementById('summary-tables').textContent=String(catalog.tables.length);
+ document.getElementById('summary-rows').textContent=String(catalog.tables.reduce((sum,table)=>sum+table.row_count,0));
+ document.getElementById('summary-indexes').textContent=String(catalog.tables.reduce((sum,table)=>sum+table.indexes.length,0));
+ if(!catalog.tables.length)tableList.append(textNode('div','No tables found','muted'));
+ for(const table of catalog.tables){
+  const button=textNode('button','▦ '+table.name+'  ('+table.row_count+')','tree-item');
+  button.type='button';button.dataset.table=table.name;
+  button.addEventListener('click',()=>renderTable(table));
+  tableList.append(button);
+ }
+ if(selectedTable){
+  const refreshed=catalog.tables.find(table=>table.name===selectedTable.name);
+  if(refreshed)renderTable(refreshed);else showOverview();
+ }else showOverview();
+}
+
+function renderResult(result){
+ resultsNode.replaceChildren();
+ if(!result.columns.length){resultsNode.textContent=result.message;return;}
+ const table=document.createElement('table');
+ const head=document.createElement('thead');
+ const headerRow=document.createElement('tr');
+ const body=document.createElement('tbody');
+ for(const column of result.columns)headerRow.append(textNode('th',column));
+ head.append(headerRow);
+ for(const row of result.rows){
+  const rowNode=document.createElement('tr');
+  for(const value of row)rowNode.append(textNode('td',value));
+  body.append(rowNode);
+ }
+ table.append(head,body);resultsNode.append(table);
+}
+
+async function runSQL(){
+ statusNode.textContent='Executing…';
+ resultsNode.replaceChildren();
  try{
-  const response=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:document.getElementById('sql').value})});
+  const response=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sqlNode.value})});
   if(!response.ok)throw new Error(await response.text());
   const result=await response.json();
   statusNode.textContent=result.message+' · '+result.rows.length+' row(s) · '+result.affected_rows+' affected';
-  if(!result.columns.length){resultsNode.textContent=result.message;return;}
-  const table=document.createElement('table'),head=document.createElement('thead'),headerRow=document.createElement('tr'),body=document.createElement('tbody');
-  for(const column of result.columns){const cell=document.createElement('th');cell.textContent=column;headerRow.append(cell);}head.append(headerRow);
-  for(const row of result.rows){const rowNode=document.createElement('tr');for(const value of row){const cell=document.createElement('td');cell.textContent=value;rowNode.append(cell);}body.append(rowNode);}
-  table.append(head,body);resultsNode.append(table);
+  renderResult(result);
+  await loadCatalog();
  }catch(error){statusNode.textContent='Query failed: '+error.message;}
+}
+
+document.getElementById('run').addEventListener('click',runSQL);
+document.getElementById('refresh-catalog').addEventListener('click',async()=>{
+ try{await loadCatalog();statusNode.textContent='Catalog refreshed';}
+ catch(error){statusNode.textContent='Catalog refresh failed: '+error.message;}
 });
+document.getElementById('overview-link').addEventListener('click',showOverview);
+document.getElementById('browse-rows').addEventListener('click',()=>{
+ if(!selectedTable)return;
+ if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(selectedTable.name)){
+  statusNode.textContent='This table name cannot be inserted into the simple SQL browser automatically.';
+  return;
+ }
+ sqlNode.value='SELECT * FROM '+selectedTable.name+' LIMIT 100;';
+ runSQL();
+});
+loadCatalog().then(()=>{statusNode.textContent='Ready · local embedded database';})
+ .catch(error=>{statusNode.textContent='Catalog load failed: '+error.message;});
 </script>
 </body></html>

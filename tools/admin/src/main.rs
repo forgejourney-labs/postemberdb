@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use postemberdb::{Database, QueryResult};
+use postemberdb::{CatalogSnapshot, Database, QueryResult};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::{Arc, Mutex}};
 
@@ -25,6 +25,33 @@ struct QueryResponse {
     message: String,
 }
 
+#[derive(Serialize)]
+struct CatalogResponse {
+    tables: Vec<TableResponse>,
+}
+
+#[derive(Serialize)]
+struct TableResponse {
+    name: String,
+    row_count: usize,
+    columns: Vec<ColumnResponse>,
+    indexes: Vec<IndexResponse>,
+}
+
+#[derive(Serialize)]
+struct ColumnResponse {
+    name: String,
+    data_type: String,
+    nullable: bool,
+}
+
+#[derive(Serialize)]
+struct IndexResponse {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
 impl From<QueryResult> for QueryResponse {
     fn from(result: QueryResult) -> Self {
         Self {
@@ -38,10 +65,39 @@ impl From<QueryResult> for QueryResponse {
     }
 }
 
+impl From<CatalogSnapshot> for CatalogResponse {
+    fn from(catalog: CatalogSnapshot) -> Self {
+        Self {
+            tables: catalog.tables.into_iter().map(|table| TableResponse {
+                name: table.name,
+                row_count: table.row_count,
+                columns: table.columns.into_iter().map(|column| ColumnResponse {
+                    name: column.name,
+                    data_type: format!("{:?}", column.data_type),
+                    nullable: column.nullable,
+                }).collect(),
+                indexes: table.indexes.into_iter().map(|index| IndexResponse {
+                    name: index.name,
+                    columns: index.columns,
+                    unique: index.unique,
+                }).collect(),
+            }).collect(),
+        }
+    }
+}
+
 async fn index() -> Html<&'static str> { Html(INDEX_HTML) }
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok", "mode": "local-embedded" }))
+}
+
+async fn get_catalog(State(state): State<AppState>) -> Response {
+    let database = match state.database.lock() {
+        Ok(database) => database,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "database lock is unavailable").into_response(),
+    };
+    Json(CatalogResponse::from(database.catalog())).into_response()
 }
 
 async fn execute_query(State(state): State<AppState>, Json(request): Json<QueryRequest>) -> Response {
@@ -75,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/health", get(health))
+        .route("/api/catalog", get(get_catalog))
         .route("/api/query", post(execute_query))
         .with_state(state);
 
