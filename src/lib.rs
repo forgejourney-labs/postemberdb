@@ -2175,8 +2175,7 @@ mod tests {
         ));
         {
             let mut db = Database::create_pdb6(&path).unwrap();
-            db.execute("CREATE TABLE players (uuid TEXT NOT NULL, coins INTEGER)").unwrap();
-            db.execute("CREATE UNIQUE INDEX players_uuid ON players (uuid)").unwrap();
+            db.execute("CREATE TABLE players (uuid TEXT PRIMARY KEY, coins INTEGER)").unwrap();
             let rows = (0..2_000).map(|index| vec![
                 Value::Text(format!("player-{index:04}")),
                 Value::Integer(index),
