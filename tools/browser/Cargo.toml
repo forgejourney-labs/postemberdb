@@ -1,0 +1,10 @@
+[package]
+name = "postemberdb-browser"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Classic native desktop browser for PostemberDB"
+
+[dependencies]
+postemberdb = { path = "../.." }
+eframe = "0.29"
