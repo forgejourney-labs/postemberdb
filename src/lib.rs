@@ -692,9 +692,6 @@ impl Database {
 
     /// Execute one SQL statement. Supported initially: CREATE TABLE, INSERT, SELECT *.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
-        if let Some(error) = &self.initialization_error {
-            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
-        }
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE")
             || starts_with_kw(statement, "CREATE INDEX")
@@ -1449,6 +1446,9 @@ pub struct DatabaseSession {
 
 impl DatabaseSession {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        if let Some(error) = &self.initialization_error {
+            return Err(DbError::Storage(format!("could not initialize disk-backed SQL session: {error}")));
+        }
         let statement = sql.trim().trim_end_matches(';').trim();
         let is_write = starts_with_kw(statement, "CREATE TABLE")
             || starts_with_kw(statement, "CREATE INDEX")
