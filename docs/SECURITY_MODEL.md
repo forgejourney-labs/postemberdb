@@ -53,7 +53,7 @@ Release gates include SQL-parser and protocol fuzzing, property tests for page/W
 - Provision accounts with `postemberdb user add <data-file> <username> <admin|read-only|read-write>`; passwords are prompted without terminal echo and stored as Argon2id PHC hashes in the `.auth` sidecar.
 - SQL read/write and EF7 read/write permissions are enforced for authenticated connections. Unknown SQL/EF7 command classes are denied by default.
 - TLS uses rustls and PEM certificate/private-key parsing. Clients must validate the server certificate; mutual TLS and certificate-to-user mapping are not yet implemented.
-- Remaining work includes per-user connection/query quotas, authentication rate limiting, audit logging, password rotation policies, and permission scoping by database/schema/table.
+- Authentication audit events are durable, checksummed, sequence-addressable, and exclude password/hash material. `AuthStore::as_admin` requires an authenticated Admin principal and records that actor for administrative mutations; direct legacy local API calls remain labeled `local-api`. Audit retention/export, tamper-evidence beyond per-record checksums, per-user connection/query quotas, authentication rate limiting, password rotation policy enforcement, and database/schema/table-scoped grants remain future work.
 
 
 ## JDBC driver
