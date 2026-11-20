@@ -14,7 +14,7 @@ pub(crate) mod page_tree;
 pub mod record_store;
 pub mod sql_rows;
 mod pages;
-mod pdb6;
+pub(crate) mod pdb6;
 pub(crate) mod pdb6_store;
 pub mod emberforge;
 pub mod emberforge7;
