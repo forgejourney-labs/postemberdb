@@ -170,11 +170,18 @@ pub(super) fn parse_where_predicates(
     columns: &[Column],
     predicate: &str,
 ) -> Result<Vec<SqlPredicate>, DbError> {
-    let conditions = split_and_conditions(predicate);
-    if conditions.is_empty() || conditions.iter().any(|condition| condition.is_empty()) {
+    // AND binds more tightly than OR; each OR branch is one conjunction.
+    let groups = split_or_conditions(predicate);
+    if groups.is_empty() || groups.iter().any(|group| group.is_empty()) {
         return Err(DbError::Parse("empty WHERE predicate".into()));
     }
-    conditions.into_iter().map(|condition| {
+    let mut parsed = Vec::new();
+    for (group, expression) in groups.iter().enumerate() {
+        let conditions = split_and_conditions(expression);
+        if conditions.is_empty() || conditions.iter().any(|condition| condition.is_empty()) {
+            return Err(DbError::Parse("empty WHERE predicate".into()));
+        }
+        for condition in conditions {
         let trimmed = condition.trim();
         let (left, operator, value) = if let Some(position) = find_unquoted_keyword(trimmed, " IS NOT NULL") {
             (&trimmed[..position], ComparisonOperator::IsNotNull, None)
@@ -215,21 +222,29 @@ pub(super) fn parse_where_predicates(
                 expected: DataType::Text,
             });
         }
-        Ok(SqlPredicate { column_index, operator, value })
-    }).collect()
+        parsed.push(SqlPredicate { column_index, operator, value, group });
+        }
+    }
+    Ok(parsed)
 }
 
-pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
+pub(super) fn split_or_conditions(input: &str) -> Vec<&str> {
+    split_top_level_keyword(input, " OR ")
+}
+
+fn split_top_level_keyword<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
     let mut result = Vec::new();
     let mut start = 0usize;
     let mut quote = None;
-    let chars = input.char_indices().collect::<Vec<_>>();
+    let mut depth = 0usize;
+    let bytes = input.as_bytes();
+    let needle = keyword.as_bytes();
     let mut cursor = 0usize;
-    while cursor < chars.len() {
-        let (position, ch) = chars[cursor];
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
         if let Some(active) = quote {
-            if ch == active {
-                if cursor + 1 < chars.len() && chars[cursor + 1].1 == active {
+            if byte == active {
+                if bytes.get(cursor + 1) == Some(&active) {
                     cursor += 2;
                     continue;
                 }
@@ -238,23 +253,29 @@ pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
             cursor += 1;
             continue;
         }
-        if ch == '\'' || ch == '"' {
-            quote = Some(ch);
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
             cursor += 1;
             continue;
         }
-        if input.as_bytes().get(position..position + 5)
-            .map(|bytes| bytes.eq_ignore_ascii_case(b" AND "))
-            .unwrap_or(false) {
-            result.push(input[start..position].trim());
-            start = position + 5;
-            while cursor < chars.len() && chars[cursor].0 < start { cursor += 1; }
+        if byte == b'(' { depth += 1; cursor += 1; continue; }
+        if byte == b')' { depth = depth.saturating_sub(1); cursor += 1; continue; }
+        if depth == 0 && cursor + needle.len() <= bytes.len()
+            && bytes[cursor..cursor + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            result.push(input[start..cursor].trim());
+            cursor += needle.len();
+            start = cursor;
             continue;
         }
         cursor += 1;
     }
     result.push(input[start..].trim());
     result
+}
+
+pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
+    split_top_level_keyword(input, " AND ")
 }
 
 pub(super) fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
