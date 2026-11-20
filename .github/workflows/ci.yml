@@ -30,3 +30,14 @@ jobs:
           java-version: '17'
       - name: Test JDBC driver
         run: mvn -B -f jdbc-driver/pom.xml test
+
+  operator-apps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check desktop Browser
+        run: cargo check --manifest-path tools/browser/Cargo.toml
+      - name: Check web Admin
+        run: cargo check --manifest-path tools/admin/Cargo.toml
