@@ -101,26 +101,23 @@ fn append_sidecar_suffix(path: &str, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<ServerConfig>>) -> io::Result<()> {
-    let tls_enabled = tls_config.is_some();
-    let socket_address = validate_bind_address(address, tls_enabled)?;
-
-    // Open every durable participant before accepting clients. A committed
-    // coordinator decision must be replayed across all domains before writes
-    // are allowed; PREPARING transactions remain in-doubt and fail closed.
-    let mut database_handle = Database::open(data_path)
+fn open_recovered_stores(
+    data_path: &str,
+) -> io::Result<(Database, KeyValueStore, Registry, EmberForge7Store, TransactionCoordinator)> {
+    let mut database = Database::open(data_path)
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut kv_store = KeyValueStore::open(append_sidecar_suffix(data_path, ".kv"))
+    let mut kv = KeyValueStore::open(append_sidecar_suffix(data_path, ".kv"))
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut registry_store = Registry::open(append_sidecar_suffix(data_path, ".registry"))
+    let mut registry = Registry::open(append_sidecar_suffix(data_path, ".registry"))
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut ef7_handle = EmberForge7Store::open(data_path, 256)
+    let mut ef7 = EmberForge7Store::open(data_path, 256)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let mut coordinator = TransactionCoordinator::open(append_sidecar_suffix(data_path, ".coordinator"))
         .map_err(|error| io::Error::other(error.to_string()))?;
+
     {
         let mut participants: [&mut dyn postemberdb::CoordinatorParticipant; 4] = [
-            &mut database_handle, &mut kv_store, &mut registry_store, &mut ef7_handle,
+            &mut database, &mut kv, &mut registry, &mut ef7,
         ];
         coordinator.recover_pending(&mut participants)
             .map_err(|error| io::Error::other(format!("coordinator recovery failed: {error}")))?;
@@ -133,7 +130,16 @@ fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<Serve
             "server startup blocked: coordinator transactions remain in-doubt (no durable COMMIT/ABORT decision): {ids:?}"
         )));
     }
+    Ok((database, kv, registry, ef7, coordinator))
+}
 
+fn run_server_inner(address: &str, data_path: &str, tls_config: Option<Arc<ServerConfig>>) -> io::Result<()> {
+    let tls_enabled = tls_config.is_some();
+    let socket_address = validate_bind_address(address, tls_enabled)?;
+
+    // Recover durable cross-domain decisions before accepting any clients.
+    let (database_handle, kv_store, registry_store, ef7_handle, coordinator) =
+        open_recovered_stores(data_path)?;
     let database = Arc::new(std::sync::Mutex::new(database_handle));
     let ef7_store = Arc::new(std::sync::Mutex::new(ef7_handle));
     // Keep all participant handles and the coordinator lock alive for the
@@ -947,13 +953,66 @@ fn format_result(result: QueryResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bounded_line, validate_bind_address};
+    use super::{append_sidecar_suffix, open_recovered_stores, read_bounded_line, validate_bind_address};
     use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
-    use postemberdb::{EmberForge7Store, QueryResult, Value};
+    use postemberdb::{CoordinatorParticipant, Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, QueryResult, Registry, TransactionCoordinator, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn server_startup_recovers_committed_sql_kv_registry_and_ef7_participants() {
+        let directory = std::env::temp_dir().join(format!(
+            "postemberdb-server-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let data_path = directory.join("server.pbd").to_string_lossy().into_owned();
+        let tx;
+        {
+            let mut database = Database::open(&data_path).unwrap();
+            database.migrate_to_pdb6().unwrap();
+            database.execute("CREATE TABLE startup_players (uuid TEXT, name TEXT)").unwrap();
+            let mut kv = KeyValueStore::open(append_sidecar_suffix(&data_path, ".kv")).unwrap();
+            let mut registry = Registry::open(append_sidecar_suffix(&data_path, ".registry")).unwrap();
+            registry.create_hive("SYSTEM").unwrap();
+            let mut ef7 = EmberForge7Store::open(&data_path, 16).unwrap();
+            ef7.create_namespace(1, None, EmberForge7NamespaceKind::World, "world").unwrap();
+            let mut coordinator = TransactionCoordinator::open(append_sidecar_suffix(&data_path, ".coordinator")).unwrap();
+
+            tx = coordinator.begin(4).unwrap();
+            database.prepare_sql(tx, &[String::from(
+                "INSERT INTO startup_players (uuid, name) VALUES ('startup-uuid', 'Casey')"
+            )]).unwrap();
+            kv.prepare_batch(tx, &[], &[(b"startup/key".to_vec(), b"kv-value".to_vec())]).unwrap();
+            registry.prepare_set_value(
+                tx, "SYSTEM", "StartupRecovery", postemberdb::RegistryValue::String("ok".into()),
+            ).unwrap();
+            ef7.prepare_put_chunk(tx, 1, 2, -3, b"startup-chunk").unwrap();
+            for id in [0, 1, 2, 3] { coordinator.mark_prepared(tx, id).unwrap(); }
+            coordinator.commit(tx).unwrap();
+        }
+
+        {
+            let (mut database, mut kv, mut registry, mut ef7, coordinator) =
+                open_recovered_stores(&data_path).unwrap();
+            assert_eq!(database.execute("SELECT * FROM startup_players").unwrap().rows.len(), 1);
+            assert_eq!(kv.get(b"startup/key").unwrap(), Some(b"kv-value".to_vec()));
+            assert_eq!(registry.get_value("SYSTEM", "StartupRecovery").unwrap(),
+                Some(postemberdb::RegistryValue::String("ok".into())));
+            assert_eq!(ef7.get_chunk(1, 2, -3).unwrap(), Some(b"startup-chunk".to_vec()));
+            assert!(database.pending_prepared_transactions().unwrap().is_empty());
+            assert!(kv.pending_prepared_transactions().is_empty());
+            assert!(registry.pending_prepared_transactions().is_empty());
+            assert!(ef7.pending_prepared_transactions().is_empty());
+            assert!(coordinator.committed_pending_apply().is_empty());
+            assert!(coordinator.in_doubt().is_empty());
+        }
+        let _ = tx;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn jsonl_response_encodes_text_and_preserves_types() {
