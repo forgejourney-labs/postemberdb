@@ -392,7 +392,7 @@ impl AuthStore {
         membership_prefix.extend_from_slice(&normalized_identifier(username)?);
         membership_prefix.push(b'/');
         let memberships = self.users.scan_prefix(&membership_prefix, None)?;
-        if memberships.len() > 4_999 {
+        if memberships.len() > 4_998 {
             return Err(DbError::Constraint("user has too many role memberships to delete atomically".into()));
         }
         let mut removals = vec![key];
