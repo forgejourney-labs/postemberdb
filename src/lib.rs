@@ -1752,6 +1752,9 @@ mod tests {
             let ordered = db.execute("SELECT uuid FROM players ORDER BY coins DESC").unwrap();
             assert_eq!(ordered.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
                 vec![Value::Text("player-b".into()), Value::Text("player-a".into())]);
+            let ranged = db.execute("SELECT uuid FROM players WHERE coins >= 20").unwrap();
+            assert_eq!(ranged.rows[0].values[0], Value::Text("player-b".into()));
+            assert!(!db.tables["players"].rows_loaded, "filtered SELECT must not hydrate the table cache");
             assert!(!db.tables["players"].rows_loaded, "ordered SELECT must not hydrate the table cache");
             db.execute("UPDATE players SET coins = 99 WHERE uuid = 'player-a'").unwrap();
             assert!(!db.tables["players"].rows_loaded, "committed DML must evict its temporary full-table staging cache");
