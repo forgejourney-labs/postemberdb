@@ -542,7 +542,7 @@ fn handle_binary_client<S: Read + Write>(
             }
             FrameKind::TablePage => {
                 let permission = principal.as_ref().map(|value| value.require(Permission::SqlRead))
-                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                    .unwrap_or_else(|| if auth_required { Err(postemberdb::DbError::Constraint("authentication required".into())) } else { Ok(()) });
                 if let Err(error) = permission {
                     binary_error(request_id, &error.to_string())
                 } else {
@@ -578,7 +578,7 @@ fn handle_binary_client<S: Read + Write>(
             }
             FrameKind::BatchQuery => {
                 let permission = principal.as_ref().map(|value| value.require(Permission::SqlWrite))
-                    .unwrap_or_else(|| if auth_required { Err(crate::DbError::Constraint("authentication required".into())) } else { Ok(()) });
+                    .unwrap_or_else(|| if auth_required { Err(postemberdb::DbError::Constraint("authentication required".into())) } else { Ok(()) });
                 if let Err(error) = permission {
                     binary_error(request_id, &error.to_string())
                 } else {
@@ -763,17 +763,17 @@ fn handle_binary_admin_request(
         .ok_or_else(|| "administrative request requires an action".to_owned())?;
     let mut store = auth.lock().map_err(|_| "authentication store lock poisoned".to_owned())?;
     let result = store.as_admin(principal, |store| {
-        let text = |field: &str| -> Result<String, crate::DbError> {
+        let text = |field: &str| -> Result<String, postemberdb::DbError> {
             request.get(field).and_then(JsonValue::as_str).map(str::to_owned)
-                .ok_or_else(|| crate::DbError::Constraint(format!("administrative request requires text field '{field}'")))
+                .ok_or_else(|| postemberdb::DbError::Constraint(format!("administrative request requires text field '{field}'")))
         };
-        let number = |field: &str| -> Result<u64, crate::DbError> {
+        let number = |field: &str| -> Result<u64, postemberdb::DbError> {
             request.get(field).and_then(JsonValue::as_u64)
-                .ok_or_else(|| crate::DbError::Constraint(format!("administrative request requires integer field '{field}'")))
+                .ok_or_else(|| postemberdb::DbError::Constraint(format!("administrative request requires integer field '{field}'")))
         };
-        let permission_set = || -> Result<Permissions, crate::DbError> {
+        let permission_set = || -> Result<Permissions, postemberdb::DbError> {
             let bits = u32::try_from(number("permissions")?)
-                .map_err(|_| crate::DbError::Constraint("permissions bitset is out of range".into()))?;
+                .map_err(|_| postemberdb::DbError::Constraint("permissions bitset is out of range".into()))?;
             Permissions::from_bits(bits)
         };
         match action {
@@ -787,7 +787,7 @@ fn handle_binary_admin_request(
             "users.permissions" => {
                 let username = text("username")?;
                 if username.eq_ignore_ascii_case(&principal.username) {
-                    return Err(crate::DbError::Constraint("an administrator may not change their own direct permissions through this session".into()));
+                    return Err(postemberdb::DbError::Constraint("an administrator may not change their own direct permissions through this session".into()));
                 }
                 store.set_permissions(&username, permission_set()?)?;
                 Ok(json!({"updated": true, "username": username}))
@@ -795,9 +795,9 @@ fn handle_binary_admin_request(
             "users.enabled" => {
                 let username = text("username")?;
                 let enabled = request.get("enabled").and_then(JsonValue::as_bool)
-                    .ok_or_else(|| crate::DbError::Constraint("administrative request requires boolean field 'enabled'".into()))?;
+                    .ok_or_else(|| postemberdb::DbError::Constraint("administrative request requires boolean field 'enabled'".into()))?;
                 if username.eq_ignore_ascii_case(&principal.username) && !enabled {
-                    return Err(crate::DbError::Constraint("an administrator may not disable their own account through this session".into()));
+                    return Err(postemberdb::DbError::Constraint("an administrator may not disable their own account through this session".into()));
                 }
                 store.set_enabled(&username, enabled)?;
                 Ok(json!({"updated": true, "username": username, "enabled": enabled}))
@@ -805,7 +805,7 @@ fn handle_binary_admin_request(
             "users.delete" => {
                 let username = text("username")?;
                 if username.eq_ignore_ascii_case(&principal.username) {
-                    return Err(crate::DbError::Constraint("an administrator may not delete their own account through this session".into()));
+                    return Err(postemberdb::DbError::Constraint("an administrator may not delete their own account through this session".into()));
                 }
                 let deleted = store.delete_user(&username)?;
                 Ok(json!({"deleted": deleted, "username": username}))
@@ -842,13 +842,13 @@ fn handle_binary_admin_request(
                 let after = number("after_sequence").unwrap_or(0);
                 let limit = request.get("limit").and_then(JsonValue::as_u64).unwrap_or(100);
                 let limit = usize::try_from(limit)
-                    .map_err(|_| crate::DbError::Constraint("audit limit is out of range".into()))?;
+                    .map_err(|_| postemberdb::DbError::Constraint("audit limit is out of range".into()))?;
                 if limit > 500 {
-                    return Err(crate::DbError::Constraint("remote audit page is limited to 500 events".into()));
+                    return Err(postemberdb::DbError::Constraint("remote audit page is limited to 500 events".into()));
                 }
                 Ok(json!({"events": store.audit_events(after, limit)?}))
             }
-            _ => Err(crate::DbError::Unsupported(format!("unknown administrative action: {action}"))),
+            _ => Err(postemberdb::DbError::Unsupported(format!("unknown administrative action: {action}"))),
         }
     }).map_err(|error| error.to_string())?;
     serde_json::to_vec(&json!({"ok":true,"result":result}))
