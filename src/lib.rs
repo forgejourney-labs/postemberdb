@@ -769,11 +769,27 @@ impl Database {
         Registry::open(PathBuf::from(path))
     }
 
-    fn hydrate_pdb6_rows(&mut self) -> Result<(), DbError> {
+    fn hydrate_pdb6_table(&mut self, table_name: &str) -> Result<(), DbError> {
         if !self.pdb6_mode { return Ok(()); }
         let path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 database has no storage path".into()))?;
-        storage::hydrate_pdb6_rows(path, &mut self.tables)
+        if let Some(table) = self.tables.get_mut(table_name) {
+            storage::hydrate_pdb6_table(path, table_name, table)?;
+        }
+        Ok(())
+    }
+
+    /// Loads only pre-existing tables whose staged image was actually needed by a write.
+    fn hydrate_pdb6_changed_tables(&mut self, staged: &Database) -> Result<(), DbError> {
+        if !self.pdb6_mode { return Ok(()); }
+        let changed = staged.tables.iter().filter_map(|(name, staged_table)| {
+            let original_is_cold = self.tables.get(name).is_some_and(|table| !table.rows_loaded);
+            (staged_table.rows_loaded && original_is_cold).then(|| name.clone())
+        }).collect::<Vec<_>>();
+        for table_name in changed {
+            self.hydrate_pdb6_table(&table_name)?;
+        }
+        Ok(())
     }
 
     fn evict_pdb6_row_cache(&mut self) {
@@ -896,7 +912,6 @@ impl Database {
         if !self.pdb6_mode {
             return Err(DbError::Constraint("SQL coordinator participation requires PDB6".into()));
         }
-        self.hydrate_pdb6_rows()?;
         let path = self.storage_path.as_deref()
             .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
         let (already_committed, encoded) = {
@@ -912,6 +927,7 @@ impl Database {
         let statements = decode_coordinator_sql_statements(&encoded)?;
         let mut session = self.begin_session();
         for statement in statements { session.execute(&statement)?; }
+        self.hydrate_pdb6_changed_tables(&session.staged)?;
         let sequence = self.wal_sequence.checked_add(1)
             .ok_or_else(|| DbError::Storage("PDB6 SQL generation space exhausted".into()))?;
         self.wal_sequence = crate::storage::persist_pdb6_transition(
@@ -951,8 +967,8 @@ impl Database {
             return Err(DbError::TransactionConflict);
         }
         if session.statements.is_empty() { return Ok(()); }
-        self.hydrate_pdb6_rows()?;
         if self.pdb6_mode {
+            self.hydrate_pdb6_changed_tables(&session.staged)?;
             self.ensure_no_prepared_sql_transactions()?;
             let path = self.storage_path.as_deref()
                 .ok_or_else(|| DbError::Storage("PDB6 database has no persistent storage path".into()))?;
@@ -1635,7 +1651,9 @@ impl DatabaseSession {
             || starts_with_kw(statement, "UPDATE")
             || starts_with_kw(statement, "DELETE FROM");
         if is_write {
-            self.staged.hydrate_pdb6_rows()?;
+            if let Some(table_name) = pdb6_write_table_target(statement) {
+                self.staged.hydrate_pdb6_table(&table_name)?;
+            }
         }
         let result = self.staged.execute_inner(statement)?;
         if is_write { self.statements.push(statement.to_owned()); }
@@ -1667,8 +1685,10 @@ impl Transaction<'_> {
             || starts_with_kw(statement, "UPDATE")
             || starts_with_kw(statement, "DELETE FROM");
         if is_write && self.database.pdb6_mode {
-            self.database.hydrate_pdb6_rows()?;
-            self.staged.hydrate_pdb6_rows()?;
+            if let Some(table_name) = pdb6_write_table_target(statement) {
+                self.database.hydrate_pdb6_table(&table_name)?;
+                self.staged.hydrate_pdb6_table(&table_name)?;
+            }
         }
         let result = self.staged.execute_inner(statement)?;
         if is_write {
