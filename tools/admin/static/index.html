@@ -250,13 +250,15 @@ function renderRows(response){
  document.getElementById('rows-heading').textContent='Rows: '+response.table;
  document.getElementById('rows-summary').textContent=response.total_rows+' total · showing '+response.rows.length;
  const grid=document.getElementById('rows-grid');grid.replaceChildren();
+ const filter=document.createElement('input');filter.type='search';filter.placeholder='Filter this page…';filter.setAttribute('aria-label','Filter visible table rows');
+ filter.style.cssText='width:100%;max-width:340px;padding:7px;border:1px solid #aeb8c2;margin:0 0 9px';
  const table=document.createElement('table'),head=document.createElement('thead'),header=document.createElement('tr'),body=document.createElement('tbody');
  response.columns.forEach(column=>header.append(textNode('th',column)));
  if(response.editable)header.append(textNode('th','Actions'));
  head.append(header);
  const info=catalog.tables.find(item=>item.name===response.table);
  response.rows.forEach(row=>{
-  const tr=document.createElement('tr');row.values.forEach(value=>tr.append(textNode('td',value===null?'NULL':String(value))));
+  const tr=document.createElement('tr');tr.dataset.search=row.values.map(value=>value===null?'NULL':String(value)).join(' ').toLocaleLowerCase();row.values.forEach(value=>tr.append(textNode('td',value===null?'NULL':String(value))));
   if(response.editable){
    const actions=document.createElement('td');
    const edit=textNode('button','Edit','secondary');edit.type='button';edit.addEventListener('click',()=>showRowEditor(row));
@@ -272,7 +274,11 @@ function renderRows(response){
   }
   body.append(tr);
  });
- table.append(head,body);grid.append(table);
+ table.append(head,body);grid.append(filter,table);
+ filter.addEventListener('input',()=>{
+  const needle=filter.value.trim().toLocaleLowerCase();
+  body.querySelectorAll('tr').forEach(row=>{row.hidden=!row.dataset.search.includes(needle);});
+ });
  document.getElementById('page-label').textContent='Rows '+(response.total_rows===0?0:response.offset+1)+'–'+(response.offset+response.rows.length)+' of '+response.total_rows;
  document.getElementById('prev-page').disabled=response.offset===0;
  document.getElementById('next-page').disabled=response.offset+response.rows.length>=response.total_rows;
