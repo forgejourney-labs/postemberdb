@@ -15,9 +15,11 @@ mod kv;
 pub mod protocol;
 pub mod auth;
 pub mod version;
+pub mod client;
 
 pub use kv::{KeyValueStore, Registry, RegistryValue};
 pub use auth::{AuditEvent, AuthStore, Permission, Permissions, Principal, RoleInfo, UserInfo};
+pub use client::{RemoteClient, RemoteServerStatus, RemoteTablePage};
 pub use storage::record_store::RecordStore;
 pub use storage::sql_rows::SqlRowStore;
 pub use storage::transaction_coordinator::{CoordinatorParticipant, RecoveredTransaction, TransactionCoordinator, TransactionState};
