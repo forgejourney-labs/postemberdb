@@ -209,11 +209,13 @@ mod tests {
         fs::write(&path, duplicated).unwrap();
 
         let mut recovered = Database::new();
+        recovered.execute("CREATE TABLE duplicate_guard (value INTEGER)").unwrap();
+        recovered.wal_sequence = 1;
         recovered.wal_path = Some(path.clone());
         let error = recovered.replay_wal().unwrap_err();
         assert!(error.to_string().contains("not strictly increasing"));
-        assert!(!recovered.tables.contains_key("duplicate_guard"));
-        assert_eq!(recovered.wal_sequence, 0);
+        assert!(recovered.tables.contains_key("duplicate_guard"));
+        assert_eq!(recovered.wal_sequence, 1);
 
         fs::remove_file(path).unwrap();
     }
