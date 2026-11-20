@@ -17,7 +17,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Streaming WAL recovery with a bounded 64 MiB maximum transaction frame; the complete WAL is not loaded into memory.
 - [x] Stage the recovery pass once and publish only after all complete frames validate, avoiding a full database clone per frame.
 - [x] Focused WAL tests for cross-frame atomicity, checksum corruption, sequence gaps, and truncated payloads.
-- [ ] Savepoints, explicit SQL BEGIN/COMMIT/ROLLBACK, and transaction isolation levels.
+- [x] Explicit SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server.
+- [ ] Savepoints and transaction isolation levels.
 - [x] OS-level exclusive sidecar lock for the same database path.
 - [ ] Hard-link alias detection and broader multi-writer coordination.
 - [ ] Fault-injection tests for power loss at every write/sync/rename boundary.
