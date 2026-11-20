@@ -230,6 +230,7 @@ impl UserRecord {
 pub struct AuthStore {
     users: KeyValueStore,
     dummy_hash: String,
+    audit_actor: Option<String>,
 }
 
 impl AuthStore {
@@ -239,7 +240,7 @@ impl AuthStore {
             .hash_password(b"postemberdb-dummy-credential", &salt)
             .map_err(|_| DbError::Storage("could not initialize password verifier".into()))?
             .to_string();
-        Ok(Self { users: KeyValueStore::open(path)?, dummy_hash })
+        Ok(Self { users: KeyValueStore::open(path)?, dummy_hash, audit_actor: None })
     }
 
     fn commit_audited_mutation(
@@ -260,9 +261,14 @@ impl AuthStore {
             .ok_or_else(|| DbError::Storage("authentication audit sequence exhausted".into()))?;
         let timestamp_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)
             .unwrap_or_default().as_millis().min(u128::from(u64::MAX)) as u64;
+        let effective_actor = if actor == "local-api" {
+            self.audit_actor.as_deref().unwrap_or(actor).to_string()
+        } else {
+            actor.to_string()
+        };
         let event = AuditEvent {
             sequence, timestamp_unix_ms,
-            actor: actor.to_string(), action: action.to_string(),
+            actor: effective_actor, action: action.to_string(),
             subject: subject.to_string(), succeeded,
         };
         let mut batch = upserts.to_vec();
@@ -270,6 +276,25 @@ impl AuthStore {
         batch.push((audit_event_key(sequence), event.encode()?));
         self.users.apply_batch(removals, &batch)?;
         Ok(())
+    }
+
+    /// Runs trusted administrative AuthStore operations as an authenticated principal.
+    /// The principal must hold Admin; every audit event emitted by the closure records
+    /// that principal instead of the legacy local-api actor. The actor context is
+    /// cleared before this method returns, including when the operation returns an error.
+    pub fn as_admin<T>(
+        &mut self,
+        principal: &Principal,
+        operation: impl FnOnce(&mut Self) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        principal.require(Permission::Admin)?;
+        if self.audit_actor.is_some() {
+            return Err(DbError::Constraint("nested administrative audit contexts are not allowed".into()));
+        }
+        self.audit_actor = Some(principal.username.clone());
+        let result = operation(self);
+        self.audit_actor = None;
+        result
     }
 
     /// Reads a bounded sequence of durable audit events after a sequence number.
@@ -643,6 +668,35 @@ mod tests {
             let principal = auth.authenticate("membership-user", "another secure password").unwrap().unwrap();
             assert!(!principal.allows(Permission::Admin));
             assert!(auth.list_user_roles("membership-user").unwrap().is_empty());
+        }
+        for suffix in ["", ".lock", ".pages", ".pages.wal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn admin_operations_require_admin_and_record_authenticated_actor() {
+        let path = path();
+        {
+            let mut auth = AuthStore::open(&path).unwrap();
+            let reader = Principal { username: "reader".into(), permissions: Permissions::READ_ONLY };
+            assert!(auth.as_admin(&reader, |store| {
+                store.create_user("blocked", "correct horse battery staple", Permissions::NONE)
+            }).is_err());
+            let admin = Principal { username: "root-operator".into(), permissions: Permissions::ADMIN };
+            auth.as_admin(&admin, |store| {
+                store.create_user("managed-user", "correct horse battery staple", Permissions::READ_ONLY)?;
+                store.set_permissions("managed-user", Permissions::READ_WRITE)?;
+                Ok(())
+            }).unwrap();
+            let events = auth.audit_events(0, 20).unwrap();
+            let admin_events = events.iter().filter(|event| event.subject == "managed-user").collect::<Vec<_>>();
+            assert_eq!(admin_events.len(), 2);
+            assert!(admin_events.iter().all(|event| event.actor == "root-operator"));
+            assert!(auth.create_user("local-user", "another secure password", Permissions::NONE).is_ok());
+            let events = auth.audit_events(0, 20).unwrap();
+            assert_eq!(events.last().unwrap().actor, "local-api");
         }
         for suffix in ["", ".lock", ".pages", ".pages.wal"] {
             let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
