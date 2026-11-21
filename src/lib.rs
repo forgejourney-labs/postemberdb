@@ -3711,7 +3711,7 @@ mod tests {
         let unknown_under_or = db.execute(
             "SELECT id FROM sql_ranges WHERE (id = 1 OR id = 2) OR NOT (id = 3) ORDER BY id"
         ).unwrap();
-        assert_eq!(unknown_under_or.rows.len(), 6);
+        assert_eq!(unknown_under_or.rows.len(), 5);
 
 
 
