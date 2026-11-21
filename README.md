@@ -28,7 +28,7 @@ EF7 is an independent storage engine at this stage. The optional KSL addon expos
 The project is at an early development stage. The first prototype provides:
 
 - an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`; `.pbd` is the recommended extension, while existing `.db` paths remain accepted for legacy files;
-- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` comparisons, `LIKE` / `NOT LIKE`, `IS NULL` / `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, top-level `AND` / `OR` with SQL precedence, bounded `LIMIT`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
+- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` comparisons, `LIKE` / `NOT LIKE`, `IS NULL` / `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, nested parenthesized boolean expressions, unary `NOT`, and SQL three-valued `AND` / `OR` / `NOT` semantics, bounded `LIMIT`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
 - a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
