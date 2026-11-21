@@ -38,7 +38,8 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Native B+ tree node splitting, point lookup, inclusive in-memory range scan, and structural validation; SQL equality indexes now use this tree.
 - [x] SELECT ORDER BY ASC/DESC with multiple sort keys; disk-backed PDB6 scans sort matching result rows.
 - [x] WHERE predicates support equality/inequality and ordered comparisons, `IS NULL`, `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, case-sensitive `LIKE` / `NOT LIKE` with `%` / `_` wildcards, `IN` / `NOT IN`, and inclusive `BETWEEN` / `NOT BETWEEN`; top-level `AND` / `OR` use SQL precedence (`AND` before `OR`). SQL comparisons to NULL do not match rows; `IN` / `NOT IN` account for NULL list members.
-- [ ] Parenthesized boolean expressions, unary `NOT`, and full SQL three-valued boolean semantics remain unfinished. `IN` / `NOT IN` and `BETWEEN` / `NOT BETWEEN` are supported.
+- [x] Recursive `WHERE` expression trees with nested parentheses, unary `NOT`, and SQL three-valued `AND` / `OR` / `NOT` evaluation (`TRUE`, `FALSE`, `UNKNOWN`); the same evaluator is used by SELECT, UPDATE, DELETE, and disk-backed PDB6 scans.
+- [ ] Full SQL expression grammar, scalar expressions, CASE, casts, collations, and query-planner normalization remain unfinished.
 - [ ] User-defined general composite indexes, indexed range scans, and a cost-aware index planner.
 - [ ] Cost-aware query planner and EXPLAIN output.
 
