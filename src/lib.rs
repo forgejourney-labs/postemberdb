@@ -3585,6 +3585,15 @@ mod tests {
             vec![Value::Integer(2), Value::Integer(5)]
         );
 
+        let nested_update = db.execute(
+            "UPDATE logical_filters SET state = 'nested' WHERE (id = 1 OR id = 2) AND NOT (state = 'cold')"
+        ).unwrap();
+        assert_eq!(nested_update.affected_rows, 1);
+        assert_eq!(
+            db.execute("SELECT id FROM logical_filters WHERE state = 'nested'").unwrap().rows[0].values[0],
+            Value::Integer(2)
+        );
+
         let updated = db.execute(
             "UPDATE logical_filters SET state = 'changed' WHERE id = 1 OR id = 3"
         ).unwrap();
@@ -3599,6 +3608,12 @@ mod tests {
         ).unwrap();
         assert_eq!(deleted.affected_rows, 2);
         assert_eq!(db.execute("SELECT * FROM logical_filters").unwrap().rows.len(), 3);
+
+        let nested_delete = db.execute(
+            "DELETE FROM logical_filters WHERE NOT (id = 1 OR id = 3)"
+        ).unwrap();
+        assert_eq!(nested_delete.affected_rows, 1);
+        assert_eq!(db.execute("SELECT * FROM logical_filters").unwrap().rows.len(), 2);
     }
 
 
