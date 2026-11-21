@@ -1,6 +1,6 @@
 //! SQL token helpers and the currently supported SQL subset parser.
 
-use super::{Column, ComparisonOperator, DataType, DbError, IndexKey, SqlPredicate, Table, Value};
+use super::{Column, ComparisonOperator, DataType, DbError, IndexKey, SqlExpression, SqlPredicate, Table, Value};
 
 pub(super) fn take_parenthesized(input: &str) -> Result<(&str, &str), DbError> {
     let input = input.trim_start();
@@ -176,6 +176,55 @@ fn parse_parenthesized_values(input: &str) -> Result<Vec<Value>, DbError> {
         return Err(DbError::Parse("IN requires at least one value".into()));
     }
     split_csv(inner).into_iter().map(parse_value).collect()
+}
+
+pub(super) fn parse_where_expression(
+    columns: &[Column],
+    input: &str,
+) -> Result<SqlExpression, DbError> {
+    fn parse(columns: &[Column], source: &str) -> Result<SqlExpression, DbError> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err(DbError::Parse("empty WHERE predicate".into()));
+        }
+
+        if source.starts_with('(') {
+            let (inner, remainder) = take_parenthesized(source)?;
+            if remainder.is_empty() {
+                return parse(columns, inner);
+            }
+        }
+
+        let disjunction = split_or_conditions(source);
+        if disjunction.len() > 1 {
+            return Ok(SqlExpression::Or(
+                disjunction.iter().map(|part| parse(columns, part)).collect::<Result<Vec<_>, _>>()?
+            ));
+        }
+
+        let conjunction = split_and_conditions(source);
+        if conjunction.len() > 1 {
+            return Ok(SqlExpression::And(
+                conjunction.iter().map(|part| parse(columns, part)).collect::<Result<Vec<_>, _>>()?
+            ));
+        }
+
+        let upper = source.to_ascii_uppercase();
+        if upper.starts_with("NOT ") {
+            return Ok(SqlExpression::Not(Box::new(parse(columns, source[4..].trim())?)));
+        }
+        if upper.starts_with("NOT(") {
+            return Ok(SqlExpression::Not(Box::new(parse(columns, source[3..].trim())?)));
+        }
+
+        let predicates = parse_where_predicates(columns, source)?;
+        if predicates.len() != 1 {
+            return Err(DbError::Parse("invalid nested WHERE expression".into()));
+        }
+        Ok(SqlExpression::Predicate(predicates.into_iter().next().unwrap()))
+    }
+
+    parse(columns, input)
 }
 
 pub(super) fn parse_where_predicates(
