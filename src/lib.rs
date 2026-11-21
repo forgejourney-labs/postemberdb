@@ -3551,6 +3551,20 @@ mod tests {
             vec![Value::Integer(1), Value::Integer(5), Value::Integer(6)]
         );
 
+        let between_and = db.execute(
+            "SELECT id FROM sql_ranges WHERE id BETWEEN 2 AND 5 AND label = 'item-3'"
+        ).unwrap();
+        assert_eq!(between_and.rows.len(), 1);
+        assert_eq!(between_and.rows[0].values[0], Value::Integer(3));
+
+        let between_or = db.execute(
+            "SELECT id FROM sql_ranges WHERE id = 1 OR id BETWEEN 3 AND 4 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            between_or.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(3), Value::Integer(4)]
+        );
+
         let in_with_null = db.execute(
             "SELECT id FROM sql_ranges WHERE id IN (3, NULL)"
         ).unwrap();
