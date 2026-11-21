@@ -3780,6 +3780,44 @@ mod tests {
     }
 
     #[test]
+    fn update_set_scalar_expressions_are_row_local_and_preserve_unique_constraints() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE balances (id INTEGER PRIMARY KEY, coins INTEGER, bonus INTEGER)").unwrap();
+        db.execute("INSERT INTO balances VALUES (1, 10, 3)").unwrap();
+        db.execute("INSERT INTO balances VALUES (2, 20, 7)").unwrap();
+        db.execute("INSERT INTO balances VALUES (3, NULL, 5)").unwrap();
+
+        let updated = db.execute(
+            "UPDATE balances SET coins = coins + bonus WHERE id <= 2"
+        ).unwrap();
+        assert_eq!(updated.affected_rows, 2);
+
+        let rows = db.execute("SELECT id, coins FROM balances ORDER BY id").unwrap();
+        assert_eq!(rows.rows[0].values[1], Value::Integer(13));
+        assert_eq!(rows.rows[1].values[1], Value::Integer(27));
+        assert_eq!(rows.rows[2].values[1], Value::Null);
+
+        let null_update = db.execute(
+            "UPDATE balances SET coins = coins + 1 WHERE id = 3"
+        ).unwrap();
+        assert_eq!(null_update.affected_rows, 1);
+        assert_eq!(
+            db.execute("SELECT coins FROM balances WHERE id = 3").unwrap().rows[0].values[0],
+            Value::Null
+        );
+
+        assert!(
+            db.execute("UPDATE balances SET id = id + 1 WHERE id = 1").is_err(),
+            "an expression update must not collide with a row outside its matched set"
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM balances ORDER BY id").unwrap().rows
+                .iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+    }
+
+    #[test]
     fn where_or_groups_follow_sql_and_before_or_precedence() {
         let mut db = Database::new();
         db.execute("CREATE TABLE logical_filters (id INTEGER, state TEXT)").unwrap();
