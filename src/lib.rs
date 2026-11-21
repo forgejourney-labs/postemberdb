@@ -27,7 +27,7 @@ pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, E
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, find_unquoted_keyword, normalize_ident,
-    parse_order_by, parse_value, parse_where_predicates,
+    parse_order_by, parse_value, parse_where_expression,
     split_csv, starts_with_kw, take_parenthesized, value_to_sql, validate_value,
 };
 
@@ -183,6 +183,10 @@ pub(crate) enum SqlExpression {
     And(Vec<SqlExpression>),
     Or(Vec<SqlExpression>),
     Not(Box<SqlExpression>),
+}
+
+impl Default for SqlExpression {
+    fn default() -> Self { Self::True }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1119,7 +1123,7 @@ impl Database {
                     .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
                 validate_value(&table_schema.columns[target_index], value)?;
                 let predicates = predicate.as_deref()
-                    .map(|text| parse_where_predicates(&table_schema.columns, text))
+                    .map(|text| parse_where_expression(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
                 let mut changed = Vec::<(Row, Vec<Value>)>::new();
                 let mut staged_row_bytes = 0usize;
@@ -1135,7 +1139,7 @@ impl Database {
                         for (column, value) in table_schema.columns.iter().zip(&values) {
                             validate_value(column, value)?;
                         }
-                        let matches = matches_sql_predicates(&values, &predicates);
+                        let matches = matches_sql_expression(&values, &predicates);
                         if matches {
                             matched_count = matched_count.checked_add(1)
                                 .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
@@ -1222,7 +1226,7 @@ impl Database {
             }
             Pdb6DmlOperation::Delete { predicate } => {
                 let predicates = predicate.as_deref()
-                    .map(|text| parse_where_predicates(&table_schema.columns, text))
+                    .map(|text| parse_where_expression(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
                 let mut removed = Vec::<Row>::new();
                 let mut staged_row_bytes = 0usize;
@@ -1234,7 +1238,7 @@ impl Database {
                         let payload = store.get_row_payload(table_id, *row_id)?
                             .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for row {row_id}")))?;
                         let values = storage::sql_rows::SqlRowStore::decode_values(&payload, table_schema.columns.len())?;
-                        if matches_sql_predicates(&values, &predicates) {
+                        if matches_sql_expression(&values, &predicates) {
                             if removed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded DELETE matches more than {MAX_CHANGED_ROWS} rows; split it into smaller statements"
@@ -1887,7 +1891,7 @@ impl Database {
             validate_value(&table.columns[target_index], &new_value)?;
 
             let matching = if let Some(predicate) = predicate {
-                let predicates = parse_where_predicates(&table.columns, predicate)?;
+                let predicates = parse_where_expression(&table.columns, predicate)?;
                 if predicates.iter().all(|item| {
                     item.group == predicates[0].group
                         && item.operator == ComparisonOperator::Equal
@@ -1900,7 +1904,7 @@ impl Database {
                     table.matching_rows_for_predicates(&equality)
                 } else {
                     table.rows.iter().enumerate()
-                        .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                        .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
                         .map(|(position, _)| position)
                         .collect()
                 }
@@ -1941,7 +1945,7 @@ impl Database {
         let (removed, deltas) = {
             let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             let matches = if let Some(predicate) = predicate {
-                let predicates = parse_where_predicates(&table.columns, predicate)?;
+                let predicates = parse_where_expression(&table.columns, predicate)?;
                 let positions = if predicates.iter().all(|item| {
                     item.group == predicates[0].group
                         && item.operator == ComparisonOperator::Equal
@@ -1954,7 +1958,7 @@ impl Database {
                     table.matching_rows_for_predicates(&equality)
                 } else {
                     table.rows.iter().enumerate()
-                        .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                        .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
                         .map(|(position, _)| position)
                         .collect()
                 };
@@ -1994,7 +1998,7 @@ impl Database {
         let projection_upper = projection.to_ascii_uppercase();
         let is_count = projection_upper.starts_with("COUNT(*)");
         let predicates = predicate
-            .map(|value| parse_where_predicates(&table.columns, value))
+            .map(|value| parse_where_expression(&table.columns, value))
             .transpose()?
             .unwrap_or_default();
         let order = order_by.map(|value| parse_order_by(&table.columns, value))
@@ -2028,7 +2032,7 @@ impl Database {
         let mut matched = 0usize;
         if limit != Some(0) || is_count {
             storage::scan_pdb6_table_rows(path, table_name, 512, |row| {
-                if !matches_sql_predicates(&row.values, &predicates) {
+                if !matches_sql_expression(&row.values, &predicates) {
                     return Ok(true);
                 }
                 matched = matched.checked_add(1)
@@ -2106,7 +2110,7 @@ impl Database {
         }
         let selection_limit = if is_count || !order.is_empty() { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
-            let predicates = parse_where_predicates(&table.columns, predicate)?;
+            let predicates = parse_where_expression(&table.columns, predicate)?;
             let equality = predicates.iter().all(|item| {
                 item.group == predicates[0].group
                         && item.operator == ComparisonOperator::Equal
@@ -2148,7 +2152,7 @@ impl Database {
                 }
             } else {
                 table.rows.iter().enumerate()
-                    .filter(|(_, row)| matches_sql_predicates(&row.values, &predicates))
+                    .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
                     .take(selection_limit.unwrap_or(usize::MAX))
                     .map(|(position, _)| position)
                     .collect()
