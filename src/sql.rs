@@ -4,7 +4,7 @@ use super::{Column, ComparisonOperator, DataType, DbError, IndexKey, SqlExpressi
 
 #[path = "sql/scalar.rs"]
 mod scalar;
-use self::scalar::parse_scalar_comparison;
+use self::scalar::{parse_scalar_comparison, parse_scalar_value_expression};
 
 pub(super) fn take_parenthesized(input: &str) -> Result<(&str, &str), DbError> {
     let input = input.trim_start();
