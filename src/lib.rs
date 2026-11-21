@@ -3670,6 +3670,15 @@ mod tests {
         assert_eq!(between_and.rows.len(), 1);
         assert_eq!(between_and.rows[0].values[0], Value::Integer(3));
 
+        let between_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE id BETWEEN NULL AND 4"
+        ).unwrap();
+        assert!(between_null.rows.is_empty());
+        let not_between_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE NOT (id BETWEEN NULL AND 4)"
+        ).unwrap();
+        assert!(not_between_null.rows.is_empty());
+
         let between_or = db.execute(
             "SELECT id FROM sql_ranges WHERE id = 1 OR id BETWEEN 3 AND 4 ORDER BY id"
         ).unwrap();
