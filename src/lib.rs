@@ -1291,7 +1291,7 @@ impl Database {
                         for (column, value) in table_schema.columns.iter().zip(&values) {
                             validate_value(column, value)?;
                         }
-                        let matches = matches_sql_expression(&values, &predicates);
+                        let matches = matches_sql_expression(&values, &predicates)?;
                         if matches {
                             matched_count = matched_count.checked_add(1)
                                 .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
@@ -1390,7 +1390,7 @@ impl Database {
                         let payload = store.get_row_payload(table_id, *row_id)?
                             .ok_or_else(|| DbError::Storage(format!("PDB6 row descriptor missing for row {row_id}")))?;
                         let values = storage::sql_rows::SqlRowStore::decode_values(&payload, table_schema.columns.len())?;
-                        if matches_sql_expression(&values, &predicates) {
+                        if matches_sql_expression(&values, &predicates)? {
                             if removed.len() == MAX_CHANGED_ROWS {
                                 return Err(DbError::Constraint(format!(
                                     "PDB6 bounded DELETE matches more than {MAX_CHANGED_ROWS} rows; split it into smaller statements"
@@ -2047,10 +2047,13 @@ impl Database {
                 if let Some(equality) = sql_expression_equality_terms(&expression) {
                     table.matching_rows_for_predicates(&equality)
                 } else {
-                    table.rows.iter().enumerate()
-                        .filter(|(_, row)| matches_sql_expression(&row.values, &expression))
-                        .map(|(position, _)| position)
-                        .collect()
+                    let mut positions = Vec::new();
+                    for (position, row) in table.rows.iter().enumerate() {
+                        if matches_sql_expression(&row.values, &expression)? {
+                            positions.push(position);
+                        }
+                    }
+                    positions
                 }
             } else {
                 (0..table.rows.len()).collect()
@@ -2093,10 +2096,13 @@ impl Database {
                 let positions = if let Some(equality) = sql_expression_equality_terms(&expression) {
                     table.matching_rows_for_predicates(&equality)
                 } else {
-                    table.rows.iter().enumerate()
-                        .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
-                        .map(|(position, _)| position)
-                        .collect()
+                    let mut positions = Vec::new();
+                    for (position, row) in table.rows.iter().enumerate() {
+                        if matches_sql_expression(&row.values, &expression)? {
+                            positions.push(position);
+                        }
+                    }
+                    positions
                 };
                 positions.into_iter().collect::<std::collections::BTreeSet<_>>()
             } else {
@@ -2168,7 +2174,7 @@ impl Database {
         let mut matched = 0usize;
         if limit != Some(0) || is_count {
             storage::scan_pdb6_table_rows(path, table_name, 512, |row| {
-                if !matches_sql_expression(&row.values, &predicates) {
+                if !matches_sql_expression(&row.values, &predicates)? {
                     return Ok(true);
                 }
                 matched = matched.checked_add(1)
@@ -2278,11 +2284,16 @@ impl Database {
                     table.matching_rows_for_predicates_limited(&equality_values, selection_limit)
                 }
             } else {
-                table.rows.iter().enumerate()
-                    .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
-                    .take(selection_limit.unwrap_or(usize::MAX))
-                    .map(|(position, _)| position)
-                    .collect()
+                let mut positions = Vec::new();
+                for (position, row) in table.rows.iter().enumerate() {
+                    if matches_sql_expression(&row.values, &expression)? {
+                        positions.push(position);
+                        if positions.len() >= selection_limit.unwrap_or(usize::MAX) {
+                            break;
+                        }
+                    }
+                }
+                positions
             }
         } else {
             (0..table.rows.len().min(selection_limit.unwrap_or(usize::MAX))).collect()
