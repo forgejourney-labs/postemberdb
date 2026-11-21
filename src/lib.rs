@@ -165,6 +165,10 @@ pub(crate) enum ComparisonOperator {
     Greater,
     GreaterOrEqual,
     Like,
+    In,
+    NotIn,
+    Between,
+    NotBetween,
     IsNull,
     IsNotNull,
 }
@@ -174,6 +178,8 @@ pub(crate) struct SqlPredicate {
     pub column_index: usize,
     pub operator: ComparisonOperator,
     pub value: Option<Value>,
+    /// Additional operands used by IN and BETWEEN predicates.
+    pub values: Vec<Value>,
     /// OR-group number; predicates inside one group are ANDed.
     pub group: usize,
 }
@@ -231,6 +237,18 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                 (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
                 _ => false,
             },
+            ComparisonOperator::In => !predicate.values.iter().any(|candidate| matches!(candidate, Value::Null))
+                && predicate.values.iter().any(|candidate| compare_sql_values(value, candidate) == std::cmp::Ordering::Equal),
+            ComparisonOperator::NotIn => !predicate.values.iter().any(|candidate| matches!(candidate, Value::Null))
+                && predicate.values.iter().all(|candidate| compare_sql_values(value, candidate) != std::cmp::Ordering::Equal),
+            ComparisonOperator::Between => predicate.values.get(0).zip(predicate.values.get(1)).is_some_and(|(lower, upper)| {
+                compare_sql_values(value, lower) != std::cmp::Ordering::Less
+                    && compare_sql_values(value, upper) != std::cmp::Ordering::Greater
+            }),
+            ComparisonOperator::NotBetween => predicate.values.get(0).zip(predicate.values.get(1)).is_some_and(|(lower, upper)| {
+                compare_sql_values(value, lower) == std::cmp::Ordering::Less
+                    || compare_sql_values(value, upper) == std::cmp::Ordering::Greater
+            }),
             operator => {
                 let Some(expected) = predicate.value.as_ref() else { return false; };
                 if matches!(expected, Value::Null) { return false; }
@@ -242,7 +260,9 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                     ComparisonOperator::LessOrEqual => ordering != std::cmp::Ordering::Greater,
                     ComparisonOperator::Greater => ordering == std::cmp::Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => ordering != std::cmp::Ordering::Less,
-                    ComparisonOperator::Like | ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
+                    ComparisonOperator::Like | ComparisonOperator::In | ComparisonOperator::NotIn
+                        | ComparisonOperator::Between | ComparisonOperator::NotBetween
+                        | ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
                 }
             }
         };
