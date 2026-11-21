@@ -166,6 +166,18 @@ pub(super) fn parse_order_by(columns: &[Column], clause: &str) -> Result<Vec<(us
     }).collect()
 }
 
+fn parse_parenthesized_values(input: &str) -> Result<Vec<Value>, DbError> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return Err(DbError::Parse("IN requires a parenthesized value list".into()));
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return Err(DbError::Parse("IN requires at least one value".into()));
+    }
+    split_csv(inner).into_iter().map(parse_value).collect()
+}
+
 pub(super) fn parse_where_predicates(
     columns: &[Column],
     predicate: &str,
@@ -183,12 +195,28 @@ pub(super) fn parse_where_predicates(
         }
         for condition in conditions {
         let trimmed = condition.trim();
-        let (left, operator, value) = if let Some(position) = find_unquoted_keyword(trimmed, " IS NOT NULL") {
-            (&trimmed[..position], ComparisonOperator::IsNotNull, None)
+        let (left, operator, value, values) = if let Some(position) = find_unquoted_keyword(trimmed, " NOT IN ") {
+            let list = parse_parenthesized_values(trimmed[position + 8..].trim())?;
+            (&trimmed[..position], ComparisonOperator::NotIn, None, list)
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " IN ") {
+            let list = parse_parenthesized_values(trimmed[position + 4..].trim())?;
+            (&trimmed[..position], ComparisonOperator::In, None, list)
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " NOT BETWEEN ") {
+            let bounds = split_and_conditions(trimmed[position + 13..].trim());
+            if bounds.len() != 2 { return Err(DbError::Parse("BETWEEN requires lower AND upper bounds".into())); }
+            (&trimmed[..position], ComparisonOperator::NotBetween, None,
+                vec![parse_value(bounds[0])?, parse_value(bounds[1])?])
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " BETWEEN ") {
+            let bounds = split_and_conditions(trimmed[position + 9..].trim());
+            if bounds.len() != 2 { return Err(DbError::Parse("BETWEEN requires lower AND upper bounds".into())); }
+            (&trimmed[..position], ComparisonOperator::Between, None,
+                vec![parse_value(bounds[0])?, parse_value(bounds[1])?])
+        } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NOT NULL") {
+            (&trimmed[..position], ComparisonOperator::IsNotNull, None, Vec::new())
         } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NULL") {
-            (&trimmed[..position], ComparisonOperator::IsNull, None)
+            (&trimmed[..position], ComparisonOperator::IsNull, None, Vec::new())
         } else if let Some(position) = find_unquoted_keyword(trimmed, " LIKE ") {
-            (&trimmed[..position], ComparisonOperator::Like, Some(parse_value(trimmed[position + 6..].trim())?))
+            (&trimmed[..position], ComparisonOperator::Like, Some(parse_value(trimmed[position + 6..].trim())?), Vec::new())
         } else {
             let operators = [
                 ("<=", ComparisonOperator::LessOrEqual),
@@ -203,7 +231,7 @@ pub(super) fn parse_where_predicates(
                 find_unquoted_keyword(trimmed, token).map(|position| (position, *operator, token.len()))
             }).ok_or_else(|| DbError::Parse(format!("unsupported WHERE predicate: {trimmed}")))?;
             let (position, operator, width) = found;
-            (&trimmed[..position], operator, Some(parse_value(trimmed[position + width..].trim())?))
+            (&trimmed[..position], operator, Some(parse_value(trimmed[position + width..].trim())?), Vec::new())
         };
         let column_name = normalize_ident(left);
         let column_index = columns.iter().position(|column| column.name == column_name)
@@ -212,6 +240,19 @@ pub(super) fn parse_where_predicates(
             if !matches!(value, Value::Null) {
                 validate_value(&columns[column_index], value)?;
             }
+        }
+        for candidate in &values {
+            if !matches!(candidate, Value::Null) {
+                validate_value(&columns[column_index], candidate)?;
+            }
+        }
+        if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) && values.is_empty() {
+            return Err(DbError::Parse("IN requires at least one value".into()));
+        }
+        if matches!(operator, ComparisonOperator::Between | ComparisonOperator::NotBetween)
+            && values.iter().any(|candidate| matches!(candidate, Value::Null))
+        {
+            return Err(DbError::Parse("BETWEEN bounds may not be NULL".into()));
         }
         if operator == ComparisonOperator::Like
             && !matches!(value, Some(Value::Null))
@@ -222,7 +263,7 @@ pub(super) fn parse_where_predicates(
                 expected: DataType::Text,
             });
         }
-        parsed.push(SqlPredicate { column_index, operator, value, group });
+        parsed.push(SqlPredicate { column_index, operator, value, values, group });
         }
     }
     Ok(parsed)
@@ -275,7 +316,50 @@ fn split_top_level_keyword<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
 }
 
 pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
-    split_top_level_keyword(input, " AND ")
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut between_pending = false;
+    let bytes = input.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(active) = quote {
+            if byte == active {
+                if bytes.get(cursor + 1) == Some(&active) { cursor += 2; continue; }
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if byte == b'\\'' || byte == b'"' { quote = Some(byte); cursor += 1; continue; }
+        if byte == b'(' { depth += 1; cursor += 1; continue; }
+        if byte == b')' { depth = depth.saturating_sub(1); cursor += 1; continue; }
+        if depth == 0 && cursor + 9 <= bytes.len()
+            && bytes[cursor..cursor + 9].eq_ignore_ascii_case(b" BETWEEN ")
+        {
+            between_pending = true;
+            cursor += 9;
+            continue;
+        }
+        if depth == 0 && cursor + 5 <= bytes.len()
+            && bytes[cursor..cursor + 5].eq_ignore_ascii_case(b" AND ")
+        {
+            if between_pending {
+                between_pending = false;
+                cursor += 5;
+                continue;
+            }
+            result.push(input[start..cursor].trim());
+            cursor += 5;
+            start = cursor;
+            continue;
+        }
+        cursor += 1;
+    }
+    result.push(input[start..].trim());
+    result
 }
 
 pub(super) fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
