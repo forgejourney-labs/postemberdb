@@ -187,85 +187,151 @@ pub(super) fn parse_where_predicates(
     if groups.is_empty() || groups.iter().any(|group| group.is_empty()) {
         return Err(DbError::Parse("empty WHERE predicate".into()));
     }
+
     let mut parsed = Vec::new();
     for (group, expression) in groups.iter().enumerate() {
         let conditions = split_and_conditions(expression);
         if conditions.is_empty() || conditions.iter().any(|condition| condition.is_empty()) {
             return Err(DbError::Parse("empty WHERE predicate".into()));
         }
+
         for condition in conditions {
-        let trimmed = condition.trim();
-        let (left, operator, value, values) = if let Some(position) = find_unquoted_keyword(trimmed, " NOT IN ") {
-            let list = parse_parenthesized_values(trimmed[position + 8..].trim())?;
-            (&trimmed[..position], ComparisonOperator::NotIn, None, list)
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " IN ") {
-            let list = parse_parenthesized_values(trimmed[position + 4..].trim())?;
-            (&trimmed[..position], ComparisonOperator::In, None, list)
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " NOT BETWEEN ") {
-            let bounds = split_and_conditions(trimmed[position + 13..].trim());
-            if bounds.len() != 2 { return Err(DbError::Parse("BETWEEN requires lower AND upper bounds".into())); }
-            (&trimmed[..position], ComparisonOperator::NotBetween, None,
-                vec![parse_value(bounds[0])?, parse_value(bounds[1])?])
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " BETWEEN ") {
-            let bounds = split_and_conditions(trimmed[position + 9..].trim());
-            if bounds.len() != 2 { return Err(DbError::Parse("BETWEEN requires lower AND upper bounds".into())); }
-            (&trimmed[..position], ComparisonOperator::Between, None,
-                vec![parse_value(bounds[0])?, parse_value(bounds[1])?])
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NOT NULL") {
-            (&trimmed[..position], ComparisonOperator::IsNotNull, None, Vec::new())
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NULL") {
-            (&trimmed[..position], ComparisonOperator::IsNull, None, Vec::new())
-        } else if let Some(position) = find_unquoted_keyword(trimmed, " LIKE ") {
-            (&trimmed[..position], ComparisonOperator::Like, Some(parse_value(trimmed[position + 6..].trim())?), Vec::new())
-        } else {
-            let operators = [
-                ("<=", ComparisonOperator::LessOrEqual),
-                (">=", ComparisonOperator::GreaterOrEqual),
-                ("<>", ComparisonOperator::NotEqual),
-                ("!=", ComparisonOperator::NotEqual),
-                ("=", ComparisonOperator::Equal),
-                ("<", ComparisonOperator::Less),
-                (">", ComparisonOperator::Greater),
-            ];
-            let found = operators.iter().find_map(|(token, operator)| {
-                find_unquoted_keyword(trimmed, token).map(|position| (position, *operator, token.len()))
-            }).ok_or_else(|| DbError::Parse(format!("unsupported WHERE predicate: {trimmed}")))?;
-            let (position, operator, width) = found;
-            (&trimmed[..position], operator, Some(parse_value(trimmed[position + width..].trim())?), Vec::new())
-        };
-        let column_name = normalize_ident(left);
-        let column_index = columns.iter().position(|column| column.name == column_name)
-            .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
-        if let Some(value) = &value {
-            if !matches!(value, Value::Null) {
-                validate_value(&columns[column_index], value)?;
+            let trimmed = condition.trim();
+            let (left, operator, value, values) =
+                if let Some(position) = find_unquoted_keyword(trimmed, " NOT IN ") {
+                    let list = parse_parenthesized_values(trimmed[position + 8..].trim())?;
+                    (&trimmed[..position], ComparisonOperator::NotIn, None, list)
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " IN ") {
+                    let list = parse_parenthesized_values(trimmed[position + 4..].trim())?;
+                    (&trimmed[..position], ComparisonOperator::In, None, list)
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " NOT BETWEEN ") {
+                    let bounds = split_and_conditions(trimmed[position + 13..].trim());
+                    if bounds.len() != 2 {
+                        return Err(DbError::Parse(
+                            "BETWEEN requires lower AND upper bounds".into(),
+                        ));
+                    }
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::NotBetween,
+                        None,
+                        vec![parse_value(bounds[0])?, parse_value(bounds[1])?],
+                    )
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " BETWEEN ") {
+                    let bounds = split_and_conditions(trimmed[position + 9..].trim());
+                    if bounds.len() != 2 {
+                        return Err(DbError::Parse(
+                            "BETWEEN requires lower AND upper bounds".into(),
+                        ));
+                    }
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::Between,
+                        None,
+                        vec![parse_value(bounds[0])?, parse_value(bounds[1])?],
+                    )
+                } else if let Some(position) =
+                    find_unquoted_keyword(trimmed, " IS NOT NULL")
+                {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::IsNotNull,
+                        None,
+                        Vec::new(),
+                    )
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " IS NULL") {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::IsNull,
+                        None,
+                        Vec::new(),
+                    )
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " LIKE ") {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::Like,
+                        Some(parse_value(trimmed[position + 6..].trim())?),
+                        Vec::new(),
+                    )
+                } else {
+                    let operators = [
+                        ("<=", ComparisonOperator::LessOrEqual),
+                        (">=", ComparisonOperator::GreaterOrEqual),
+                        ("<>", ComparisonOperator::NotEqual),
+                        ("!=", ComparisonOperator::NotEqual),
+                        ("=", ComparisonOperator::Equal),
+                        ("<", ComparisonOperator::Less),
+                        (">", ComparisonOperator::Greater),
+                    ];
+                    let found = operators
+                        .iter()
+                        .find_map(|(token, operator)| {
+                            find_unquoted_keyword(trimmed, token)
+                                .map(|position| (position, *operator, token.len()))
+                        })
+                        .ok_or_else(|| {
+                            DbError::Parse(format!(
+                                "unsupported WHERE predicate: {trimmed}"
+                            ))
+                        })?;
+                    let (position, operator, width) = found;
+                    (
+                        &trimmed[..position],
+                        operator,
+                        Some(parse_value(trimmed[position + width..].trim())?),
+                        Vec::new(),
+                    )
+                };
+
+            let column_name = normalize_ident(left);
+            let column_index = columns
+                .iter()
+                .position(|column| column.name == column_name)
+                .ok_or_else(|| DbError::ColumnNotFound(column_name.clone()))?;
+
+            if let Some(value) = &value {
+                if !matches!(value, Value::Null) {
+                    validate_value(&columns[column_index], value)?;
+                }
             }
-        }
-        for candidate in &values {
-            if !matches!(candidate, Value::Null) {
-                validate_value(&columns[column_index], candidate)?;
+            for candidate in &values {
+                if !matches!(candidate, Value::Null) {
+                    validate_value(&columns[column_index], candidate)?;
+                }
             }
-        }
-        if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) && values.is_empty() {
-            return Err(DbError::Parse("IN requires at least one value".into()));
-        }
-        if matches!(operator, ComparisonOperator::Between | ComparisonOperator::NotBetween)
-            && values.iter().any(|candidate| matches!(candidate, Value::Null))
-        {
-            return Err(DbError::Parse("BETWEEN bounds may not be NULL".into()));
-        }
-        if operator == ComparisonOperator::Like
-            && !matches!(value, Some(Value::Null))
-            && columns[column_index].data_type != DataType::Text
-        {
-            return Err(DbError::TypeMismatch {
-                column: column_name,
-                expected: DataType::Text,
+
+            if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn)
+                && values.is_empty()
+            {
+                return Err(DbError::Parse("IN requires at least one value".into()));
+            }
+            if matches!(
+                operator,
+                ComparisonOperator::Between | ComparisonOperator::NotBetween
+            ) && values.iter().any(|candidate| matches!(candidate, Value::Null))
+            {
+                return Err(DbError::Parse("BETWEEN bounds may not be NULL".into()));
+            }
+            if operator == ComparisonOperator::Like
+                && !matches!(value, Some(Value::Null))
+                && columns[column_index].data_type != DataType::Text
+            {
+                return Err(DbError::TypeMismatch {
+                    column: column_name,
+                    expected: DataType::Text,
+                });
+            }
+
+            parsed.push(SqlPredicate {
+                column_index,
+                operator,
+                value,
+                values,
+                group,
             });
         }
-        parsed.push(SqlPredicate { column_index, operator, value, values, group });
-        }
     }
+
     Ok(parsed)
 }
 
