@@ -1891,16 +1891,8 @@ impl Database {
             validate_value(&table.columns[target_index], &new_value)?;
 
             let matching = if let Some(predicate) = predicate {
-                let predicates = parse_where_expression(&table.columns, predicate)?;
-                if predicates.iter().all(|item| {
-                    item.group == predicates[0].group
-                        && item.operator == ComparisonOperator::Equal
-                        && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
-                }) {
-                    let equality = predicates.iter().map(|item| {
-                        Ok((item.column_index, item.value.clone()
-                            .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
-                    }).collect::<Result<Vec<_>, DbError>>()?;
+                let expression = parse_where_expression(&table.columns, predicate)?;
+                if let Some(equality) = sql_expression_equality_terms(&expression) {
                     table.matching_rows_for_predicates(&equality)
                 } else {
                     table.rows.iter().enumerate()
@@ -1945,16 +1937,8 @@ impl Database {
         let (removed, deltas) = {
             let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             let matches = if let Some(predicate) = predicate {
-                let predicates = parse_where_expression(&table.columns, predicate)?;
-                let positions = if predicates.iter().all(|item| {
-                    item.group == predicates[0].group
-                        && item.operator == ComparisonOperator::Equal
-                        && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
-                }) {
-                    let equality = predicates.iter().map(|item| {
-                        Ok((item.column_index, item.value.clone()
-                            .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
-                    }).collect::<Result<Vec<_>, DbError>>()?;
+                let expression = parse_where_expression(&table.columns, predicate)?;
+                let positions = if let Some(equality) = sql_expression_equality_terms(&expression) {
                     table.matching_rows_for_predicates(&equality)
                 } else {
                     table.rows.iter().enumerate()
