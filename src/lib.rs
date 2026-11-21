@@ -3561,6 +3561,30 @@ mod tests {
             vec![Value::Integer(3), Value::Integer(5)]
         );
 
+        let nested = db.execute(
+            "SELECT id FROM logical_filters WHERE (id = 1 OR id = 2) AND NOT (state = 'cold') ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            nested.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2)]
+        );
+
+        let nested_precedence = db.execute(
+            "SELECT id FROM logical_filters WHERE id = 1 OR (id = 2 AND (state = 'ready' OR state = 'cold')) ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            nested_precedence.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2)]
+        );
+
+        let negated = db.execute(
+            "SELECT id FROM logical_filters WHERE NOT (state = 'cold' OR id = 4) ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            negated.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2), Value::Integer(5)]
+        );
+
         let updated = db.execute(
             "UPDATE logical_filters SET state = 'changed' WHERE id = 1 OR id = 3"
         ).unwrap();
@@ -3676,6 +3700,20 @@ mod tests {
             "SELECT id FROM sql_ranges WHERE id NOT IN (3, NULL)"
         ).unwrap();
         assert!(not_in_with_null.rows.is_empty());
+
+        let not_comparison = db.execute(
+            "SELECT id FROM sql_ranges WHERE NOT (id = 1) ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            not_comparison.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2), Value::Integer(3), Value::Integer(4), Value::Integer(5), Value::Integer(6)]
+        );
+        let unknown_under_or = db.execute(
+            "SELECT id FROM sql_ranges WHERE (id = 1 OR id = 2) OR NOT (id = 3) ORDER BY id"
+        ).unwrap();
+        assert_eq!(unknown_under_or.rows.len(), 6);
+
+
 
         let updated = db.execute(
             "UPDATE sql_ranges SET label = 'chosen' WHERE id IN (2, 4)"
