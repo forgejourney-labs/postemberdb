@@ -3592,6 +3592,35 @@ mod tests {
             vec![Value::Integer(1), Value::Integer(3), Value::Integer(4)]
         );
 
+        let distinct_from_value = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IS DISTINCT FROM 3 ORDER BY id"
+        ).unwrap();
+        assert_eq!(distinct_from_value.rows.len(), 6);
+        assert_eq!(distinct_from_value.rows.last().unwrap().values[0], Value::Null);
+
+        let not_distinct_from_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IS NOT DISTINCT FROM NULL"
+        ).unwrap();
+        assert_eq!(not_distinct_from_null.rows.len(), 1);
+        assert_eq!(not_distinct_from_null.rows[0].values[0], Value::Null);
+
+        let distinct_from_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IS DISTINCT FROM NULL"
+        ).unwrap();
+        assert_eq!(distinct_from_null.rows.len(), 6);
+        assert!(distinct_from_null.rows.iter().all(|row| !matches!(row.values[0], Value::Null)));
+
+        let not_distinct_from_value = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IS NOT DISTINCT FROM 3"
+        ).unwrap();
+        assert_eq!(not_distinct_from_value.rows.len(), 1);
+        assert_eq!(not_distinct_from_value.rows[0].values[0], Value::Integer(3));
+
+        assert!(matches!(
+            db.execute("SELECT id FROM sql_ranges WHERE id IS DISTINCT FROM 'three'"),
+            Err(DbError::TypeMismatch { .. })
+        ));
+
         let in_with_null = db.execute(
             "SELECT id FROM sql_ranges WHERE id IN (3, NULL)"
         ).unwrap();
