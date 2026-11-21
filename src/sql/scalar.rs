@@ -168,6 +168,18 @@ impl<'a> Parser<'a> {
     }
 }
 
+pub(super) fn parse_scalar_value_expression(
+    columns: &[Column],
+    input: &str,
+) -> Result<SqlValueExpression, DbError> {
+    let mut parser = Parser::new(input, columns)?;
+    let expression = parser.value(0)?;
+    if !matches!(parser.current(), Token::End) {
+        return Err(DbError::Parse("unexpected token after scalar value expression".into()));
+    }
+    Ok(expression)
+}
+
 pub(super) fn parse_scalar_comparison(columns: &[Column], input: &str) -> Result<SqlExpression, DbError> {
     Parser::new(input, columns)?.comparison()
 }
