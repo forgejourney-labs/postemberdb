@@ -333,7 +333,7 @@ pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
             cursor += 1;
             continue;
         }
-        if byte == b'\\'' || byte == b'"' { quote = Some(byte); cursor += 1; continue; }
+        if byte == b'\'' || byte == b'"' { quote = Some(byte); cursor += 1; continue; }
         if byte == b'(' { depth += 1; cursor += 1; continue; }
         if byte == b')' { depth = depth.saturating_sub(1); cursor += 1; continue; }
         if depth == 0 && cursor + 9 <= bytes.len()
