@@ -3648,6 +3648,131 @@ mod tests {
     }
 
     #[test]
+    fn where_scalar_arithmetic_obeys_precedence_and_propagates_sql_null() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE scalar_math (id INTEGER, coins INTEGER, ceiling INTEGER)").unwrap();
+        db.execute("INSERT INTO scalar_math VALUES (1, 5, 6)").unwrap();
+        db.execute("INSERT INTO scalar_math VALUES (2, 10, 6)").unwrap();
+        db.execute("INSERT INTO scalar_math VALUES (3, 15, 20)").unwrap();
+        db.execute("INSERT INTO scalar_math VALUES (4, NULL, 100)").unwrap();
+
+        let precedence = db.execute(
+            "SELECT id FROM scalar_math WHERE coins + 2 * 3 = 11 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            precedence.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1)]
+        );
+
+        let parentheses = db.execute(
+            "SELECT id FROM scalar_math WHERE (coins + 2) * 2 = 24 ORDER BY id"
+        ).unwrap();
+        assert_eq!(parentheses.rows[0].values[0], Value::Integer(2));
+
+        let unary = db.execute(
+            "SELECT id FROM scalar_math WHERE -coins <= -10 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            unary.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2), Value::Integer(3)]
+        );
+
+        let column_comparison = db.execute(
+            "SELECT id FROM scalar_math WHERE coins < ceiling ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            column_comparison.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(3)]
+        );
+
+        let quoted_identifier_and_comment = db.execute(
+            "SELECT id FROM scalar_math WHERE [coins] /* ignored */ + 1 = 6"
+        ).unwrap();
+        assert_eq!(quoted_identifier_and_comment.rows[0].values[0], Value::Integer(1));
+
+        let boolean_mix = db.execute(
+            "SELECT id FROM scalar_math WHERE coins + 1 > 10 AND id < 4 OR id = 1 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            boolean_mix.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+
+        let divide_by_zero = db.execute(
+            "SELECT id FROM scalar_math WHERE coins / 0 = 1"
+        ).unwrap();
+        assert!(divide_by_zero.rows.is_empty(), "division by zero should produce SQL NULL");
+
+        assert!(db.execute(
+            "SELECT id FROM scalar_math WHERE coins + 9223372036854775807 > 0"
+        ).is_err(), "integer overflow must be reported rather than wrapped");
+
+        let updated = db.execute(
+            "UPDATE scalar_math SET coins = 8 WHERE (coins * 2) = 10"
+        ).unwrap();
+        assert_eq!(updated.affected_rows, 1);
+        assert_eq!(
+            db.execute("SELECT coins FROM scalar_math WHERE id = 1").unwrap().rows[0].values[0],
+            Value::Integer(8)
+        );
+
+        let deleted = db.execute(
+            "DELETE FROM scalar_math WHERE coins - ceiling >= 2"
+        ).unwrap();
+        assert_eq!(deleted.affected_rows, 2);
+        assert_eq!(
+            db.execute("SELECT id FROM scalar_math ORDER BY id").unwrap().rows
+                .iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(3), Value::Integer(4)]
+        );
+    }
+
+    #[test]
+    fn pdb6_scalar_where_expressions_run_against_cold_disk_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "postemberdb-pdb6-scalar-where-{}-{}.pbd",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database::create_pdb6(&path).unwrap();
+            db.execute("CREATE TABLE scalar_disk (id INTEGER, coins INTEGER)").unwrap();
+            db.execute("INSERT INTO scalar_disk VALUES (1, 5)").unwrap();
+            db.execute("INSERT INTO scalar_disk VALUES (2, 10)").unwrap();
+            db.execute("INSERT INTO scalar_disk VALUES (3, 15)").unwrap();
+
+            let selected = db.execute(
+                "SELECT id FROM scalar_disk WHERE coins * 2 >= 20 ORDER BY id"
+            ).unwrap();
+            assert_eq!(
+                selected.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+                vec![Value::Integer(2), Value::Integer(3)]
+            );
+            assert!(!db.tables["scalar_disk"].rows_loaded);
+
+            let updated = db.execute(
+                "UPDATE scalar_disk SET coins = 12 WHERE coins + 1 = 11"
+            ).unwrap();
+            assert_eq!(updated.affected_rows, 1);
+            assert!(!db.tables["scalar_disk"].rows_loaded);
+
+            let deleted = db.execute(
+                "DELETE FROM scalar_disk WHERE coins / 2 >= 6"
+            ).unwrap();
+            assert_eq!(deleted.affected_rows, 2);
+            assert!(!db.tables["scalar_disk"].rows_loaded);
+        }
+        for suffix in [
+            "", ".wal", ".lock", ".pdb6.lock", ".pdb6.pages", ".pdb6.wal",
+            ".pdb6.pages.wal", ".pdb6.pages.lock", ".pdb6.snapshots",
+        ] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
+
+    #[test]
     fn where_or_groups_follow_sql_and_before_or_precedence() {
         let mut db = Database::new();
         db.execute("CREATE TABLE logical_filters (id INTEGER, state TEXT)").unwrap();
