@@ -379,13 +379,6 @@ pub(super) fn parse_where_predicates(
             {
                 return Err(DbError::Parse("IN requires at least one value".into()));
             }
-            if matches!(
-                operator,
-                ComparisonOperator::Between | ComparisonOperator::NotBetween
-            ) && values.iter().any(|candidate| matches!(candidate, Value::Null))
-            {
-                return Err(DbError::Parse("BETWEEN bounds may not be NULL".into()));
-            }
             if matches!(operator, ComparisonOperator::Like | ComparisonOperator::NotLike)
                 && !matches!(value, Some(Value::Null))
                 && columns[column_index].data_type != DataType::Text
