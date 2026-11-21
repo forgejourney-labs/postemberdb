@@ -28,7 +28,7 @@ EF7 is an independent storage engine at this stage. The optional KSL addon expos
 The project is at an early development stage. The first prototype provides:
 
 - an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`; `.pbd` is the recommended extension, while existing `.db` paths remain accepted for legacy files;
-- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` comparisons, `LIKE` / `NOT LIKE`, `IS NULL` / `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, nested parenthesized boolean expressions, unary `NOT`, and SQL three-valued `AND` / `OR` / `NOT` semantics, bounded `LIMIT`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
+- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` comparisons and integer scalar arithmetic (`+`, `-`, `*`, `/`, `%`), unary signs, arithmetic parentheses, column-to-column comparisons, quoted identifiers, SQL comments, `LIKE` / `NOT LIKE`, `IS NULL` / `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, nested boolean expressions, unary `NOT`, SQL three-valued `AND` / `OR` / `NOT`, bounded `LIMIT`, `UPDATE`, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
 - integer, text, boolean, and nullable values;
 - basic column type, `NOT NULL`, and composite primary-key validation;
 - a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). See also [Native Key-Value and Registry](docs/KEY_VALUE_AND_REGISTRY.md), [RecordStore](docs/RECORD_STORE.md), and [EmberTree](docs/EMBER_TREE.md).
 
-1. Replace the prototype parser with a tokenizer and structured SQL AST.
+1. Extend the tokenizer and expression AST into a complete statement grammar; integer arithmetic predicates are now parsed, while scalar functions, REAL values, expression projections, CASE, and casts remain open.
 2. Add a bounded page cache and lazy page reads over the fixed-size page file.
 3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
 4. Add streaming table scans and bounded query result materialization.
