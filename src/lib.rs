@@ -240,58 +240,74 @@ fn estimate_row_values_heap_bytes(values: &[Value]) -> usize {
     }))
 }
 
-fn matches_sql_expression(values: &[Value], expression: &SqlExpression) -> bool {
+fn evaluate_sql_expression(values: &[Value], expression: &SqlExpression) -> Option<bool> {
     match expression {
-        SqlExpression::True => true,
+        SqlExpression::True => Some(true),
         SqlExpression::Predicate(predicate) => {
-            let Some(value) = values.get(predicate.column_index) else { return false; };
+            let value = values.get(predicate.column_index)?;
             match predicate.operator {
-                ComparisonOperator::IsNull => matches!(value, Value::Null),
-                ComparisonOperator::IsNotNull => !matches!(value, Value::Null),
-                ComparisonOperator::IsDistinctFrom => predicate.value.as_ref().is_some_and(|expected| {
-                    match (value, expected) {
+                ComparisonOperator::IsNull => Some(matches!(value, Value::Null)),
+                ComparisonOperator::IsNotNull => Some(!matches!(value, Value::Null)),
+                ComparisonOperator::IsDistinctFrom => {
+                    let expected = predicate.value.as_ref()?;
+                    Some(match (value, expected) {
                         (Value::Null, Value::Null) => false,
                         (Value::Null, _) | (_, Value::Null) => true,
                         _ => compare_sql_values(value, expected) != std::cmp::Ordering::Equal,
-                    }
-                }),
-                ComparisonOperator::IsNotDistinctFrom => predicate.value.as_ref().is_some_and(|expected| {
-                    match (value, expected) {
+                    })
+                }
+                ComparisonOperator::IsNotDistinctFrom => {
+                    let expected = predicate.value.as_ref()?;
+                    Some(match (value, expected) {
                         (Value::Null, Value::Null) => true,
                         (Value::Null, _) | (_, Value::Null) => false,
                         _ => compare_sql_values(value, expected) == std::cmp::Ordering::Equal,
+                    })
+                }
+                ComparisonOperator::Like | ComparisonOperator::NotLike => {
+                    let (Value::Text(actual), Some(Value::Text(pattern))) = (value, predicate.value.as_ref()) else {
+                        return None;
+                    };
+                    let matched = sql_like_matches(actual, pattern);
+                    Some(if predicate.operator == ComparisonOperator::NotLike { !matched } else { matched })
+                }
+                ComparisonOperator::In | ComparisonOperator::NotIn => {
+                    if matches!(value, Value::Null) { return None; }
+                    let mut saw_null = false;
+                    let mut found = false;
+                    for candidate in &predicate.values {
+                        if matches!(candidate, Value::Null) {
+                            saw_null = true;
+                        } else if compare_sql_values(value, candidate) == std::cmp::Ordering::Equal {
+                            found = true;
+                            break;
+                        }
                     }
-                }),
-                _ if matches!(value, Value::Null) => false,
-                ComparisonOperator::Like => match (value, predicate.value.as_ref()) {
-                    (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
-                    _ => false,
-                },
-                ComparisonOperator::NotLike => match (value, predicate.value.as_ref()) {
-                    (Value::Text(value), Some(Value::Text(pattern))) => !sql_like_matches(value, pattern),
-                    _ => false,
-                },
-                ComparisonOperator::In => predicate.values.iter().any(|candidate| {
-                    !matches!(candidate, Value::Null)
-                        && compare_sql_values(value, candidate) == std::cmp::Ordering::Equal
-                }),
-                ComparisonOperator::NotIn => !predicate.values.iter().any(|candidate| matches!(candidate, Value::Null))
-                    && predicate.values.iter().all(|candidate| {
-                        compare_sql_values(value, candidate) != std::cmp::Ordering::Equal
-                    }),
-                ComparisonOperator::Between => predicate.values.get(0).zip(predicate.values.get(1)).is_some_and(|(lower, upper)| {
-                    compare_sql_values(value, lower) != std::cmp::Ordering::Less
-                        && compare_sql_values(value, upper) != std::cmp::Ordering::Greater
-                }),
-                ComparisonOperator::NotBetween => predicate.values.get(0).zip(predicate.values.get(1)).is_some_and(|(lower, upper)| {
-                    compare_sql_values(value, lower) == std::cmp::Ordering::Less
-                        || compare_sql_values(value, upper) == std::cmp::Ordering::Greater
-                }),
+                    if predicate.operator == ComparisonOperator::In {
+                        if found { Some(true) } else if saw_null { None } else { Some(false) }
+                    } else if found {
+                        Some(false)
+                    } else if saw_null {
+                        None
+                    } else {
+                        Some(true)
+                    }
+                }
+                ComparisonOperator::Between | ComparisonOperator::NotBetween => {
+                    if matches!(value, Value::Null) { return None; }
+                    let (Some(lower), Some(upper)) = (predicate.values.first(), predicate.values.get(1)) else {
+                        return None;
+                    };
+                    if matches!(lower, Value::Null) || matches!(upper, Value::Null) { return None; }
+                    let inside = compare_sql_values(value, lower) != std::cmp::Ordering::Less
+                        && compare_sql_values(value, upper) != std::cmp::Ordering::Greater;
+                    Some(if predicate.operator == ComparisonOperator::NotBetween { !inside } else { inside })
+                }
                 operator => {
-                    let Some(expected) = predicate.value.as_ref() else { return false; };
-                    if matches!(expected, Value::Null) { return false; }
+                    let expected = predicate.value.as_ref()?;
+                    if matches!(value, Value::Null) || matches!(expected, Value::Null) { return None; }
                     let ordering = compare_sql_values(value, expected);
-                    match operator {
+                    Some(match operator {
                         ComparisonOperator::Equal => ordering == std::cmp::Ordering::Equal,
                         ComparisonOperator::NotEqual => ordering != std::cmp::Ordering::Equal,
                         ComparisonOperator::Less => ordering == std::cmp::Ordering::Less,
@@ -299,14 +315,38 @@ fn matches_sql_expression(values: &[Value], expression: &SqlExpression) -> bool 
                         ComparisonOperator::Greater => ordering == std::cmp::Ordering::Greater,
                         ComparisonOperator::GreaterOrEqual => ordering != std::cmp::Ordering::Less,
                         _ => false,
-                    }
+                    })
                 }
             }
         }
-        SqlExpression::And(expressions) => expressions.iter().all(|item| matches_sql_expression(values, item)),
-        SqlExpression::Or(expressions) => expressions.iter().any(|item| matches_sql_expression(values, item)),
-        SqlExpression::Not(inner) => !matches_sql_expression(values, inner),
+        SqlExpression::And(expressions) => {
+            let mut unknown = false;
+            for item in expressions {
+                match evaluate_sql_expression(values, item) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => unknown = true,
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        SqlExpression::Or(expressions) => {
+            let mut unknown = false;
+            for item in expressions {
+                match evaluate_sql_expression(values, item) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => unknown = true,
+                }
+            }
+            if unknown { None } else { Some(false) }
+        }
+        SqlExpression::Not(inner) => evaluate_sql_expression(values, inner).map(|value| !value),
     }
+}
+
+fn matches_sql_expression(values: &[Value], expression: &SqlExpression) -> bool {
+    evaluate_sql_expression(values, expression) == Some(true)
 }
 
 fn sql_expression_equality_terms(expression: &SqlExpression) -> Option<Vec<(usize, Value)>> {
