@@ -3596,7 +3596,7 @@ mod tests {
             "SELECT id FROM sql_ranges WHERE id IS DISTINCT FROM 3 ORDER BY id"
         ).unwrap();
         assert_eq!(distinct_from_value.rows.len(), 6);
-        assert_eq!(distinct_from_value.rows.last().unwrap().values[0], Value::Null);
+        assert_eq!(distinct_from_value.rows.first().unwrap().values[0], Value::Null);
 
         let not_distinct_from_null = db.execute(
             "SELECT id FROM sql_ranges WHERE id IS NOT DISTINCT FROM NULL"
@@ -3608,7 +3608,7 @@ mod tests {
             "SELECT id FROM sql_ranges WHERE id IS DISTINCT FROM NULL"
         ).unwrap();
         assert_eq!(distinct_from_null.rows.len(), 6);
-        assert!(distinct_from_null.rows.iter().all(|row| !matches!(row.values[0], Value::Null)));
+        assert!(distinct_from_null.rows.iter().all(|row| !matches!(&row.values[0], Value::Null)));
 
         let not_distinct_from_value = db.execute(
             "SELECT id FROM sql_ranges WHERE id IS NOT DISTINCT FROM 3"
