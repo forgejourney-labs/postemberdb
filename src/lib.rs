@@ -165,6 +165,7 @@ pub(crate) enum ComparisonOperator {
     Greater,
     GreaterOrEqual,
     Like,
+    NotLike,
     In,
     NotIn,
     Between,
@@ -237,6 +238,10 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                 (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
                 _ => false,
             },
+            ComparisonOperator::NotLike => match (value, predicate.value.as_ref()) {
+                (Value::Text(value), Some(Value::Text(pattern))) => !sql_like_matches(value, pattern),
+                _ => false,
+            },
             ComparisonOperator::In => predicate.values.iter().any(|candidate| {
                 !matches!(candidate, Value::Null)
                     && compare_sql_values(value, candidate) == std::cmp::Ordering::Equal
@@ -264,7 +269,7 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                     ComparisonOperator::LessOrEqual => ordering != std::cmp::Ordering::Greater,
                     ComparisonOperator::Greater => ordering == std::cmp::Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => ordering != std::cmp::Ordering::Less,
-                    ComparisonOperator::Like | ComparisonOperator::In | ComparisonOperator::NotIn
+                    ComparisonOperator::Like | ComparisonOperator::NotLike | ComparisonOperator::In | ComparisonOperator::NotIn
                         | ComparisonOperator::Between | ComparisonOperator::NotBetween
                         | ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
                 }
@@ -3518,6 +3523,12 @@ mod tests {
             db.execute(&format!("INSERT INTO sql_ranges VALUES ({id}, 'item-{id}')")).unwrap();
         }
         db.execute("INSERT INTO sql_ranges VALUES (NULL, 'unknown')").unwrap();
+
+        let not_like_rows = db.execute(
+            "SELECT id FROM sql_ranges WHERE label NOT LIKE 'item-%'"
+        ).unwrap();
+        assert_eq!(not_like_rows.rows.len(), 1);
+        assert_eq!(not_like_rows.rows[0].values[0], Value::Null);
 
         let in_rows = db.execute(
             "SELECT id FROM sql_ranges WHERE id IN (1, 3, 5) ORDER BY id"
