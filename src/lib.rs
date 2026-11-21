@@ -172,6 +172,8 @@ pub(crate) enum ComparisonOperator {
     NotBetween,
     IsNull,
     IsNotNull,
+    IsDistinctFrom,
+    IsNotDistinctFrom,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +235,20 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
         let matched = match predicate.operator {
             ComparisonOperator::IsNull => matches!(value, Value::Null),
             ComparisonOperator::IsNotNull => !matches!(value, Value::Null),
+            ComparisonOperator::IsDistinctFrom => predicate.value.as_ref().is_some_and(|expected| {
+                match (value, expected) {
+                    (Value::Null, Value::Null) => false,
+                    (Value::Null, _) | (_, Value::Null) => true,
+                    _ => compare_sql_values(value, expected) != std::cmp::Ordering::Equal,
+                }
+            }),
+            ComparisonOperator::IsNotDistinctFrom => predicate.value.as_ref().is_some_and(|expected| {
+                match (value, expected) {
+                    (Value::Null, Value::Null) => true,
+                    (Value::Null, _) | (_, Value::Null) => false,
+                    _ => compare_sql_values(value, expected) == std::cmp::Ordering::Equal,
+                }
+            }),
             _ if matches!(value, Value::Null) => false,
             ComparisonOperator::Like => match (value, predicate.value.as_ref()) {
                 (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
