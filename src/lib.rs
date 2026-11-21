@@ -3574,6 +3574,21 @@ mod tests {
         ).unwrap();
         assert!(not_in_with_null.rows.is_empty());
 
+        let updated = db.execute(
+            "UPDATE sql_ranges SET label = 'chosen' WHERE id IN (2, 4)"
+        ).unwrap();
+        assert_eq!(updated.affected_rows, 2);
+        let chosen = db.execute(
+            "SELECT id FROM sql_ranges WHERE label = 'chosen' ORDER BY id"
+        ).unwrap();
+        assert_eq!(chosen.rows.len(), 2);
+
+        let deleted = db.execute(
+            "DELETE FROM sql_ranges WHERE id NOT BETWEEN 1 AND 4"
+        ).unwrap();
+        assert_eq!(deleted.affected_rows, 2);
+        assert_eq!(db.execute("SELECT * FROM sql_ranges").unwrap().rows.len(), 5);
+
         assert!(db.execute("SELECT * FROM sql_ranges WHERE id IN ()").is_err());
         assert!(db.execute("SELECT * FROM sql_ranges WHERE id BETWEEN 1 AND").is_err());
     }
