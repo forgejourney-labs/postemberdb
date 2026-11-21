@@ -4,74 +4,82 @@ use super::{Column, ComparisonOperator, DataType, DbError, IndexKey, SqlExpressi
 
 
 #[derive(Debug, Clone, PartialEq)]
-enum SqlTokenKind { Identifier(String), Integer(i64), Text(String), Operator(String), LeftParen, RightParen, End }
-#[derive(Debug, Clone, PartialEq)]
-struct SqlToken { kind: SqlTokenKind, offset: usize }
+enum ScalarToken { Ident(String), Integer(i64), Text(String), Operator(String), Left, Right, End }
 
-fn tokenize_scalar_expression(input: &str) -> Result<Vec<SqlToken>, DbError> {
+fn tokenize_scalar(input: &str) -> Result<Vec<ScalarToken>, DbError> {
     let bytes = input.as_bytes();
-    let mut cursor = 0usize;
-    let mut tokens = Vec::new();
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if byte.is_ascii_whitespace() { cursor += 1; continue; }
-        if byte == b'-' && bytes.get(cursor + 1) == Some(&b'-') {
-            cursor += 2;
-            while cursor < bytes.len() && bytes[cursor] != b'\n' { cursor += 1; }
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() { i += 1; continue; }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
             continue;
         }
-        if byte == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-            let start = cursor; cursor += 2;
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let start = i;
+            i += 2;
             let mut closed = false;
-            while cursor + 1 < bytes.len() {
-                if bytes[cursor] == b'*' && bytes[cursor + 1] == b'/' { cursor += 2; closed = true; break; }
-                cursor += 1;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' { i += 2; closed = true; break; }
+                i += 1;
             }
             if !closed { return Err(DbError::Parse(format!("unclosed SQL comment at byte {start}"))); }
             continue;
         }
-        if byte == b'\'' {
-            let start = cursor; cursor += 1;
-            let mut value = String::new(); let mut closed = false;
-            while cursor < bytes.len() {
-                if bytes[cursor] == b'\'' {
-                    if bytes.get(cursor + 1) == Some(&b'\'') { value.push('\''); cursor += 2; continue; }
-                    cursor += 1; closed = true; break;
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') { value.push('\''); i += 2; continue; }
+                    i += 1; closed = true; break;
                 }
-                let ch = input[cursor..].chars().next().ok_or_else(|| DbError::Parse("invalid SQL string boundary".into()))?;
-                value.push(ch); cursor += ch.len_utf8();
+                let ch = input[i..].chars().next().ok_or_else(|| DbError::Parse("invalid SQL string boundary".into()))?;
+                value.push(ch); i += ch.len_utf8();
             }
             if !closed { return Err(DbError::Parse(format!("unclosed SQL string at byte {start}"))); }
-            tokens.push(SqlToken { kind: SqlTokenKind::Text(value), offset: start }); continue;
+            out.push(ScalarToken::Text(value));
+            continue;
         }
-        if byte == b'"' || byte == 0x60 || byte == b'[' {
-            let start = cursor; let closing = if byte == b'[' { b']' } else { byte }; cursor += 1;
-            let mut value = String::new(); let mut closed = false;
-            while cursor < bytes.len() {
-                if bytes[cursor] == closing {
-                    if bytes.get(cursor + 1) == Some(&closing) { value.push(closing as char); cursor += 2; continue; }
-                    cursor += 1; closed = true; break;
+        if b == b'"' || b == 0x60 || b == b'[' {
+            let start = i;
+            let close = if b == b'[' { b']' } else { b };
+            i += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == close {
+                    if bytes.get(i + 1) == Some(&close) { value.push(close as char); i += 2; continue; }
+                    i += 1; closed = true; break;
                 }
-                let ch = input[cursor..].chars().next().ok_or_else(|| DbError::Parse("invalid quoted identifier boundary".into()))?;
-                value.push(ch); cursor += ch.len_utf8();
+                let ch = input[i..].chars().next().ok_or_else(|| DbError::Parse("invalid quoted identifier boundary".into()))?;
+                value.push(ch); i += ch.len_utf8();
             }
             if !closed { return Err(DbError::Parse(format!("unclosed quoted identifier at byte {start}"))); }
-            tokens.push(SqlToken { kind: SqlTokenKind::Identifier(value), offset: start }); continue;
+            out.push(ScalarToken::Ident(value));
+            continue;
         }
-        if byte.is_ascii_digit() {
-            let start = cursor;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() { cursor += 1; }
-            if cursor < bytes.len() && matches!(bytes[cursor], b'.' | b'e' | b'E') {
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if i < bytes.len() && matches!(bytes[i], b'.' | b'e' | b'E') {
                 return Err(DbError::Unsupported("REAL numeric literals are not supported by the current Value model".into()));
             }
-            let number = input[start..cursor].parse::<i64>().map_err(|_| DbError::Parse(format!("integer literal is out of range: {}", &input[start..cursor])))?;
-            tokens.push(SqlToken { kind: SqlTokenKind::Integer(number), offset: start }); continue;
+            let number = input[start..i].parse::<i64>().map_err(|_| DbError::Parse("integer literal out of range".into()))?;
+            out.push(ScalarToken::Integer(number));
+            continue;
         }
-        let ch = input[cursor..].chars().next().ok_or_else(|| DbError::Parse("invalid expression boundary".into()))?;
+        let ch = input[i..].chars().next().ok_or_else(|| DbError::Parse("invalid expression boundary".into()))?;
         if ch == '_' || ch.is_alphabetic() || !ch.is_ascii() {
-            let start = cursor; cursor += ch.len_utf8();
-            while cursor < bytes.len() {
-                let next = input[cursor..].chars().next().expect("UTF-8 boundary");
+            let start = i;
+            i += ch.len_utf8();
+            while i < bytes.len() {
+                let next = input[i..].chars().next().expect("UTF-8 boundary");
                 if next == '_' || next == '
     let input = input.trim_start();
     if !input.starts_with('(') {
@@ -669,70 +677,73 @@ pub(super) fn validate_value(column: &Column, value: &Value) -> Result<(), DbErr
         Err(DbError::TypeMismatch { column: column.name.clone(), expected: column.data_type.clone() })
     }
 }
- || next.is_alphanumeric() || !next.is_ascii() { cursor += next.len_utf8(); } else { break; }
+ || next.is_alphanumeric() || !next.is_ascii() { i += next.len_utf8(); }
+                else { break; }
             }
-            tokens.push(SqlToken { kind: SqlTokenKind::Identifier(input[start..cursor].to_owned()), offset: start }); continue;
+            out.push(ScalarToken::Ident(input[start..i].to_owned()));
+            continue;
         }
-        if byte == b'(' { tokens.push(SqlToken { kind: SqlTokenKind::LeftParen, offset: cursor }); cursor += 1; continue; }
-        if byte == b')' { tokens.push(SqlToken { kind: SqlTokenKind::RightParen, offset: cursor }); cursor += 1; continue; }
-        let two = if cursor + 1 < bytes.len() { &input[cursor..cursor + 2] } else { "" };
+        if b == b'(' { out.push(ScalarToken::Left); i += 1; continue; }
+        if b == b')' { out.push(ScalarToken::Right); i += 1; continue; }
+        let two = if i + 1 < bytes.len() { &input[i..i + 2] } else { "" };
         if matches!(two, "<=" | ">=" | "<>" | "!=" | "==") {
-            tokens.push(SqlToken { kind: SqlTokenKind::Operator(two.to_owned()), offset: cursor }); cursor += 2; continue;
+            out.push(ScalarToken::Operator(two.to_owned())); i += 2; continue;
         }
-        if matches!(byte, b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>') {
-            tokens.push(SqlToken { kind: SqlTokenKind::Operator((byte as char).to_string()), offset: cursor }); cursor += 1; continue;
+        if matches!(b, b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>') {
+            out.push(ScalarToken::Operator((b as char).to_string())); i += 1; continue;
         }
-        return Err(DbError::Parse(format!("unexpected character '{}' in scalar expression at byte {cursor}", ch)));
+        return Err(DbError::Parse(format!("unexpected character '{ch}' in scalar expression")));
     }
-    tokens.push(SqlToken { kind: SqlTokenKind::End, offset: input.len() });
-    Ok(tokens)
+    out.push(ScalarToken::End);
+    Ok(out)
 }
 
-struct ScalarExpressionParser<'a> { tokens: Vec<SqlToken>, cursor: usize, columns: &'a [Column] }
-impl<'a> ScalarExpressionParser<'a> {
+struct ScalarParser<'a> { tokens: Vec<ScalarToken>, cursor: usize, columns: &'a [Column] }
+
+impl<'a> ScalarParser<'a> {
     fn new(input: &str, columns: &'a [Column]) -> Result<Self, DbError> {
-        Ok(Self { tokens: tokenize_scalar_expression(input)?, cursor: 0, columns })
+        Ok(Self { tokens: tokenize_scalar(input)?, cursor: 0, columns })
     }
-    fn current(&self) -> &SqlTokenKind { &self.tokens[self.cursor].kind }
-    fn advance(&mut self) -> SqlTokenKind {
-        let kind = self.tokens[self.cursor].kind.clone();
-        if !matches!(kind, SqlTokenKind::End) { self.cursor += 1; }
-        kind
+    fn current(&self) -> &ScalarToken { &self.tokens[self.cursor] }
+    fn advance(&mut self) -> ScalarToken {
+        let token = self.tokens[self.cursor].clone();
+        if !matches!(token, ScalarToken::End) { self.cursor += 1; }
+        token
     }
-    fn parse_value_expression(&mut self, minimum_binding_power: u8) -> Result<SqlValueExpression, DbError> {
+    fn value(&mut self, min_power: u8) -> Result<SqlValueExpression, DbError> {
         let mut left = match self.advance() {
-            SqlTokenKind::Integer(value) => SqlValueExpression::Literal(Value::Integer(value)),
-            SqlTokenKind::Text(value) => SqlValueExpression::Literal(Value::Text(value)),
-            SqlTokenKind::Identifier(value) if value.eq_ignore_ascii_case("NULL") => SqlValueExpression::Literal(Value::Null),
-            SqlTokenKind::Identifier(value) if value.eq_ignore_ascii_case("TRUE") => SqlValueExpression::Literal(Value::Boolean(true)),
-            SqlTokenKind::Identifier(value) if value.eq_ignore_ascii_case("FALSE") => SqlValueExpression::Literal(Value::Boolean(false)),
-            SqlTokenKind::Identifier(value) => {
-                let name = normalize_ident(&value);
-                let index = self.columns.iter().position(|column| column.name == name).ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
+            ScalarToken::Integer(v) => SqlValueExpression::Literal(Value::Integer(v)),
+            ScalarToken::Text(v) => SqlValueExpression::Literal(Value::Text(v)),
+            ScalarToken::Ident(v) if v.eq_ignore_ascii_case("NULL") => SqlValueExpression::Literal(Value::Null),
+            ScalarToken::Ident(v) if v.eq_ignore_ascii_case("TRUE") => SqlValueExpression::Literal(Value::Boolean(true)),
+            ScalarToken::Ident(v) if v.eq_ignore_ascii_case("FALSE") => SqlValueExpression::Literal(Value::Boolean(false)),
+            ScalarToken::Ident(v) => {
+                let name = normalize_ident(&v);
+                let index = self.columns.iter().position(|c| c.name == name).ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
                 SqlValueExpression::Column(index)
             }
-            SqlTokenKind::Operator(op) if op == "+" => SqlValueExpression::UnaryPlus(Box::new(self.parse_value_expression(30)?)),
-            SqlTokenKind::Operator(op) if op == "-" => SqlValueExpression::UnaryMinus(Box::new(self.parse_value_expression(30)?)),
-            SqlTokenKind::LeftParen => {
-                let expression = self.parse_value_expression(0)?;
-                if !matches!(self.current(), SqlTokenKind::RightParen) { return Err(DbError::Parse("expected ')' in scalar expression".into())); }
-                self.advance(); expression
+            ScalarToken::Operator(op) if op == "+" => SqlValueExpression::UnaryPlus(Box::new(self.value(30)?)),
+            ScalarToken::Operator(op) if op == "-" => SqlValueExpression::UnaryMinus(Box::new(self.value(30)?)),
+            ScalarToken::Left => {
+                let value = self.value(0)?;
+                if !matches!(self.current(), ScalarToken::Right) { return Err(DbError::Parse("expected ')' in scalar expression".into())); }
+                self.advance(); value
             }
-            other => return Err(DbError::Parse(format!("expected scalar value, found {other:?}"))),
+            token => return Err(DbError::Parse(format!("expected scalar value, found {token:?}"))),
         };
         loop {
-            let (power, operation) = match self.current() {
-                SqlTokenKind::Operator(op) if op == "+" => (10, 0),
-                SqlTokenKind::Operator(op) if op == "-" => (10, 1),
-                SqlTokenKind::Operator(op) if op == "*" => (20, 2),
-                SqlTokenKind::Operator(op) if op == "/" => (20, 3),
-                SqlTokenKind::Operator(op) if op == "%" => (20, 4),
+            let (power, op) = match self.current() {
+                ScalarToken::Operator(v) if v == "+" => (10, 0),
+                ScalarToken::Operator(v) if v == "-" => (10, 1),
+                ScalarToken::Operator(v) if v == "*" => (20, 2),
+                ScalarToken::Operator(v) if v == "/" => (20, 3),
+                ScalarToken::Operator(v) if v == "%" => (20, 4),
                 _ => break,
             };
-            if power < minimum_binding_power { break; }
+            if power < min_power { break; }
             self.advance();
-            let right = self.parse_value_expression(power + 1)?;
-            left = match operation {
+            let right = self.value(power + 1)?;
+            left = match op {
                 0 => SqlValueExpression::Add(Box::new(left), Box::new(right)),
                 1 => SqlValueExpression::Subtract(Box::new(left), Box::new(right)),
                 2 => SqlValueExpression::Multiply(Box::new(left), Box::new(right)),
@@ -743,29 +754,29 @@ impl<'a> ScalarExpressionParser<'a> {
         }
         Ok(left)
     }
-    fn parse_comparison(mut self) -> Result<SqlExpression, DbError> {
-        let left = self.parse_value_expression(0)?;
+    fn comparison(mut self) -> Result<SqlExpression, DbError> {
+        let left = self.value(0)?;
         let operator = match self.advance() {
-            SqlTokenKind::Operator(op) => match op.as_str() {
+            ScalarToken::Operator(v) => match v.as_str() {
                 "=" | "==" => ComparisonOperator::Equal,
                 "!=" | "<>" => ComparisonOperator::NotEqual,
                 "<" => ComparisonOperator::Less,
                 "<=" => ComparisonOperator::LessOrEqual,
                 ">" => ComparisonOperator::Greater,
                 ">=" => ComparisonOperator::GreaterOrEqual,
-                _ => return Err(DbError::Parse(format!("expected comparison operator, found {op}"))),
+                _ => return Err(DbError::Parse(format!("expected comparison operator, found {v}"))),
             },
-            other => return Err(DbError::Parse(format!("expected comparison operator, found {other:?}"))),
+            token => return Err(DbError::Parse(format!("expected comparison operator, found {token:?}"))),
         };
-        let right = self.parse_value_expression(0)?;
-        if !matches!(self.current(), SqlTokenKind::End) { return Err(DbError::Parse(format!("unexpected token {:?} after scalar comparison", self.current()))); }
+        let right = self.value(0)?;
+        if !matches!(self.current(), ScalarToken::End) { return Err(DbError::Parse("unexpected tokens after scalar comparison".into())); }
         Ok(SqlExpression::ValueComparison { left, operator, right })
     }
 }
-fn parse_scalar_comparison(columns: &[Column], input: &str) -> Result<SqlExpression, DbError> {
-    ScalarExpressionParser::new(input, columns)?.parse_comparison()
-}
 
+fn parse_scalar_comparison(columns: &[Column], input: &str) -> Result<SqlExpression, DbError> {
+    ScalarParser::new(input, columns)?.comparison()
+}
 
 pub(super) fn take_parenthesized(input: &str) -> Result<(&str, &str), DbError> {
     let input = input.trim_start();
