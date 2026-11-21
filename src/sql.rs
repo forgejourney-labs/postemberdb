@@ -231,6 +231,24 @@ pub(super) fn parse_where_predicates(
                         vec![parse_value(bounds[0])?, parse_value(bounds[1])?],
                     )
                 } else if let Some(position) =
+                    find_unquoted_keyword(trimmed, " IS NOT DISTINCT FROM ")
+                {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::IsNotDistinctFrom,
+                        Some(parse_value(trimmed[position + " IS NOT DISTINCT FROM ".len()..].trim())?),
+                        Vec::new(),
+                    )
+                } else if let Some(position) =
+                    find_unquoted_keyword(trimmed, " IS DISTINCT FROM ")
+                {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::IsDistinctFrom,
+                        Some(parse_value(trimmed[position + " IS DISTINCT FROM ".len()..].trim())?),
+                        Vec::new(),
+                    )
+                } else if let Some(position) =
                     find_unquoted_keyword(trimmed, " IS NOT NULL")
                 {
                     (
