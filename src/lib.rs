@@ -237,10 +237,14 @@ fn matches_sql_predicates(values: &[Value], predicates: &[SqlPredicate]) -> bool
                 (Value::Text(value), Some(Value::Text(pattern))) => sql_like_matches(value, pattern),
                 _ => false,
             },
-            ComparisonOperator::In => !predicate.values.iter().any(|candidate| matches!(candidate, Value::Null))
-                && predicate.values.iter().any(|candidate| compare_sql_values(value, candidate) == std::cmp::Ordering::Equal),
+            ComparisonOperator::In => predicate.values.iter().any(|candidate| {
+                !matches!(candidate, Value::Null)
+                    && compare_sql_values(value, candidate) == std::cmp::Ordering::Equal
+            }),
             ComparisonOperator::NotIn => !predicate.values.iter().any(|candidate| matches!(candidate, Value::Null))
-                && predicate.values.iter().all(|candidate| compare_sql_values(value, candidate) != std::cmp::Ordering::Equal),
+                && predicate.values.iter().all(|candidate| {
+                    compare_sql_values(value, candidate) != std::cmp::Ordering::Equal
+                }),
             ComparisonOperator::Between => predicate.values.get(0).zip(predicate.values.get(1)).is_some_and(|(lower, upper)| {
                 compare_sql_values(value, lower) != std::cmp::Ordering::Less
                     && compare_sql_values(value, upper) != std::cmp::Ordering::Greater
@@ -3503,6 +3507,61 @@ mod tests {
         ).unwrap();
         assert_eq!(deleted.affected_rows, 2);
         assert_eq!(db.execute("SELECT * FROM logical_filters").unwrap().rows.len(), 3);
+    }
+
+
+    #[test]
+    fn where_in_not_in_and_between_predicates_follow_sql_null_rules() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE sql_ranges (id INTEGER, label TEXT)").unwrap();
+        for id in 1..=6 {
+            db.execute(&format!("INSERT INTO sql_ranges VALUES ({id}, 'item-{id}')")).unwrap();
+        }
+        db.execute("INSERT INTO sql_ranges VALUES (NULL, 'unknown')").unwrap();
+
+        let in_rows = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IN (1, 3, 5) ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            in_rows.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(3), Value::Integer(5)]
+        );
+
+        let not_in_rows = db.execute(
+            "SELECT id FROM sql_ranges WHERE id NOT IN (1, 3, 5) ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            not_in_rows.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2), Value::Integer(4), Value::Integer(6)]
+        );
+
+        let between_rows = db.execute(
+            "SELECT id FROM sql_ranges WHERE id BETWEEN 2 AND 4 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            between_rows.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(2), Value::Integer(3), Value::Integer(4)]
+        );
+
+        let not_between_rows = db.execute(
+            "SELECT id FROM sql_ranges WHERE id NOT BETWEEN 2 AND 4 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            not_between_rows.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(5), Value::Integer(6)]
+        );
+
+        let in_with_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE id IN (3, NULL)"
+        ).unwrap();
+        assert_eq!(in_with_null.rows.len(), 1);
+        let not_in_with_null = db.execute(
+            "SELECT id FROM sql_ranges WHERE id NOT IN (3, NULL)"
+        ).unwrap();
+        assert!(not_in_with_null.rows.is_empty());
+
+        assert!(db.execute("SELECT * FROM sql_ranges WHERE id IN ()").is_err());
+        assert!(db.execute("SELECT * FROM sql_ranges WHERE id BETWEEN 1 AND").is_err());
     }
 
 
