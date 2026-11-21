@@ -27,7 +27,7 @@ pub use storage::emberforge7::{EmberForge7Namespace, EmberForge7NamespaceKind, E
 
 use sql::{
     apply_upsert, bind_parameters, find_kw, find_unquoted_keyword, normalize_ident,
-    parse_order_by, parse_value, parse_where_expression,
+    parse_order_by, parse_scalar_value_expression, parse_value, parse_where_expression,
     split_csv, starts_with_kw, take_parenthesized, value_to_sql, validate_value,
 };
 
@@ -623,12 +623,11 @@ impl Table {
     /// cannot introduce duplicates among the rows being changed.
     fn validate_unique_update(
         &self,
-        row_positions: &[usize],
+        updates: &[(usize, Value)],
         target_column: usize,
-        new_value: &Value,
     ) -> Result<(), DbError> {
-        let changing_ids = row_positions.iter()
-            .filter_map(|position| self.rows.get(*position).map(|row| row.row_id))
+        let changing_ids = updates.iter()
+            .filter_map(|(position, _)| self.rows.get(*position).map(|row| row.row_id))
             .collect::<std::collections::BTreeSet<_>>();
 
         for (name, index) in &self.indexes {
@@ -644,7 +643,7 @@ impl Table {
                 seen.insert(IndexKey::from_columns(&row.values, &index.column_indices));
             }
 
-            for position in row_positions {
+            for (position, new_value) in updates {
                 let Some(row) = self.rows.get(*position) else { continue; };
                 let mut values = row.values.clone();
                 values[target_column] = new_value.clone();
@@ -883,7 +882,7 @@ pub struct Database {
 #[derive(Debug)]
 enum Pdb6DmlOperation {
     Insert { columns: Option<Vec<String>>, supplied: Vec<Value> },
-    Update { column: String, value: Value, predicate: Option<String> },
+    Update { column: String, expression: String, predicate: Option<String> },
     Delete { predicate: Option<String> },
 }
 
@@ -1142,8 +1141,8 @@ impl Database {
             let equals = assignment.find('=')
                 .ok_or_else(|| DbError::Parse("expected '=' in UPDATE assignment".into()))?;
             let column = normalize_ident(assignment[..equals].trim());
-            let value = parse_value(assignment[equals + 1..].trim())?;
-            (name, Pdb6DmlOperation::Update { column, value, predicate: predicate.map(str::to_owned) })
+            let expression = assignment[equals + 1..].trim().to_owned();
+            (name, Pdb6DmlOperation::Update { column, expression, predicate: predicate.map(str::to_owned) })
         } else {
             let rest = statement["DELETE FROM".len()..].trim();
             let where_pos = find_unquoted_keyword(rest, " WHERE ");
@@ -1270,10 +1269,10 @@ impl Database {
                 }
                 affected_rows = 1;
             }
-            Pdb6DmlOperation::Update { column, value, predicate } => {
+            Pdb6DmlOperation::Update { column, expression, predicate } => {
                 let target_index = table_schema.columns.iter().position(|item| item.name == *column)
                     .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
-                validate_value(&table_schema.columns[target_index], value)?;
+                let value_expression = parse_scalar_value_expression(&table_schema.columns, expression)?;
                 let predicates = predicate.as_deref()
                     .map(|text| parse_where_expression(&table_schema.columns, text))
                     .transpose()?.unwrap_or_default();
@@ -1292,39 +1291,40 @@ impl Database {
                             validate_value(column, value)?;
                         }
                         let matches = matches_sql_expression(&values, &predicates)?;
-                        if matches {
-                            matched_count = matched_count.checked_add(1)
-                                .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
+                        if !matches { continue; }
+                        matched_count = matched_count.checked_add(1)
+                            .ok_or_else(|| DbError::Storage("SQL UPDATE match count overflow".into()))?;
+                        let new_value = evaluate_sql_value_expression(&values, &value_expression)?
+                            .unwrap_or(Value::Null);
+                        validate_value(&table_schema.columns[target_index], &new_value)?;
+                        if values[target_index] == new_value { continue; }
+                        if changed.len() == MAX_CHANGED_ROWS {
+                            return Err(DbError::Constraint(format!(
+                                "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
+                            )));
                         }
-                        if matches && values[target_index] != *value {
-                            if changed.len() == MAX_CHANGED_ROWS {
-                                return Err(DbError::Constraint(format!(
-                                    "PDB6 bounded UPDATE matches more than {MAX_CHANGED_ROWS} changed rows; split it into smaller statements"
-                                )));
-                            }
-                            let old_row_bytes = estimate_row_values_heap_bytes(&values);
-                            let replaced_value_bytes = match &values[target_index] {
-                                Value::Text(text) => text.capacity(),
-                                Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
-                            };
-                            let replacement_value_bytes = match value {
-                                Value::Text(text) => text.capacity(),
-                                Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
-                            };
-                            let retained_bytes = old_row_bytes.saturating_mul(2)
-                                .saturating_sub(replaced_value_bytes)
-                                .saturating_add(replacement_value_bytes);
-                            staged_row_bytes = staged_row_bytes.checked_add(retained_bytes)
-                                .ok_or_else(|| DbError::Storage("SQL UPDATE staging byte count overflow".into()))?;
-                            if staged_row_bytes > MAX_STAGED_ROW_BYTES {
-                                return Err(DbError::Constraint(format!(
-                                    "PDB6 bounded UPDATE exceeds the {MAX_STAGED_ROW_BYTES}-byte staging budget; split it into smaller statements"
-                                )));
-                            }
-                            let mut new_values = values.clone();
-                            new_values[target_index] = (*value).clone();
-                            changed.push((Row { row_id: *row_id, values: new_values }, values));
+                        let old_row_bytes = estimate_row_values_heap_bytes(&values);
+                        let replaced_value_bytes = match &values[target_index] {
+                            Value::Text(text) => text.capacity(),
+                            Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
+                        };
+                        let replacement_value_bytes = match &new_value {
+                            Value::Text(text) => text.capacity(),
+                            Value::Null | Value::Integer(_) | Value::Boolean(_) => 0,
+                        };
+                        let retained_bytes = old_row_bytes.saturating_mul(2)
+                            .saturating_sub(replaced_value_bytes)
+                            .saturating_add(replacement_value_bytes);
+                        staged_row_bytes = staged_row_bytes.checked_add(retained_bytes)
+                            .ok_or_else(|| DbError::Storage("SQL UPDATE staging byte count overflow".into()))?;
+                        if staged_row_bytes > MAX_STAGED_ROW_BYTES {
+                            return Err(DbError::Constraint(format!(
+                                "PDB6 bounded UPDATE exceeds the {MAX_STAGED_ROW_BYTES}-byte staging budget; split it into smaller statements"
+                            )));
                         }
+                        let mut new_values = values.clone();
+                        new_values[target_index] = new_value;
+                        changed.push((Row { row_id: *row_id, values: new_values }, values));
                     }
                     after = ids.last().copied();
                     if ids.len() < SCAN_BATCH { break; }
@@ -2034,14 +2034,13 @@ impl Database {
         };
         let equals = assignment.find('=').ok_or_else(|| DbError::Parse("expected '=' in UPDATE assignment".into()))?;
         let target_column = normalize_ident(assignment[..equals].trim());
-        let new_value = parse_value(assignment[equals + 1..].trim())?;
+        let value_expression_text = assignment[equals + 1..].trim().to_owned();
 
         let (affected, deltas) = {
             let table = self.tables.get_mut(&table_name).ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
             let target_index = table.columns.iter().position(|column| column.name == target_column)
                 .ok_or_else(|| DbError::ColumnNotFound(target_column.clone()))?;
-            validate_value(&table.columns[target_index], &new_value)?;
-
+            let value_expression = parse_scalar_value_expression(&table.columns, &value_expression_text)?;
             let matching = if let Some(predicate) = predicate {
                 let expression = parse_where_expression(&table.columns, predicate)?;
                 if let Some(equality) = sql_expression_equality_terms(&expression) {
@@ -2058,13 +2057,21 @@ impl Database {
             } else {
                 (0..table.rows.len()).collect()
             };
-            table.validate_unique_update(&matching, target_index, &new_value)?;
+            let updates = matching.iter().map(|position| {
+                let row = table.rows.get(*position)
+                    .ok_or_else(|| DbError::Storage("UPDATE matched an unknown row position".into()))?;
+                let value = evaluate_sql_value_expression(&row.values, &value_expression)?
+                    .unwrap_or(Value::Null);
+                validate_value(&table.columns[target_index], &value)?;
+                Ok((*position, value))
+            }).collect::<Result<Vec<_>, DbError>>()?;
+            table.validate_unique_update(&updates, target_index)?;
             let old_rows = matching.iter().filter_map(|position| table.rows.get(*position).cloned()).collect::<Vec<_>>();
-            for row_index in &matching {
-                let old_values = table.rows[*row_index].values.clone();
+            for (row_index, new_value) in updates {
+                let old_values = table.rows[row_index].values.clone();
                 if old_values[target_index] != new_value {
-                    table.rows[*row_index].values[target_index] = new_value.clone();
-                    table.reindex_row(*row_index, &old_values);
+                    table.rows[row_index].values[target_index] = new_value;
+                    table.reindex_row(row_index, &old_values);
                 }
             }
             let new_rows = old_rows.iter().filter_map(|old| {
@@ -3708,7 +3715,7 @@ mod tests {
         ).is_err(), "integer overflow must be reported rather than wrapped");
 
         let updated = db.execute(
-            "UPDATE scalar_math SET coins = 8 WHERE (coins * 2) = 10"
+            "UPDATE scalar_math SET coins = coins + 3 WHERE (coins * 2) = 10"
         ).unwrap();
         assert_eq!(updated.affected_rows, 1);
         assert_eq!(
@@ -3751,7 +3758,7 @@ mod tests {
             assert!(!db.tables["scalar_disk"].rows_loaded);
 
             let updated = db.execute(
-                "UPDATE scalar_disk SET coins = 12 WHERE coins + 1 = 11"
+                "UPDATE scalar_disk SET coins = coins + 2 WHERE coins + 1 = 11"
             ).unwrap();
             assert_eq!(updated.affected_rows, 1);
             assert!(!db.tables["scalar_disk"].rows_loaded);
