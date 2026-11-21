@@ -246,6 +246,13 @@ pub(super) fn parse_where_predicates(
                         None,
                         Vec::new(),
                     )
+                } else if let Some(position) = find_unquoted_keyword(trimmed, " NOT LIKE ") {
+                    (
+                        &trimmed[..position],
+                        ComparisonOperator::NotLike,
+                        Some(parse_value(trimmed[position + 10..].trim())?),
+                        Vec::new(),
+                    )
                 } else if let Some(position) = find_unquoted_keyword(trimmed, " LIKE ") {
                     (
                         &trimmed[..position],
@@ -312,7 +319,7 @@ pub(super) fn parse_where_predicates(
             {
                 return Err(DbError::Parse("BETWEEN bounds may not be NULL".into()));
             }
-            if operator == ComparisonOperator::Like
+            if matches!(operator, ComparisonOperator::Like | ComparisonOperator::NotLike)
                 && !matches!(value, Some(Value::Null))
                 && columns[column_index].data_type != DataType::Text
             {
