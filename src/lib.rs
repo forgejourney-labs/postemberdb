@@ -1896,7 +1896,7 @@ impl Database {
                     table.matching_rows_for_predicates(&equality)
                 } else {
                     table.rows.iter().enumerate()
-                        .filter(|(_, row)| matches_sql_expression(&row.values, &predicates))
+                        .filter(|(_, row)| matches_sql_expression(&row.values, &expression))
                         .map(|(position, _)| position)
                         .collect()
                 }
@@ -2094,17 +2094,8 @@ impl Database {
         }
         let selection_limit = if is_count || !order.is_empty() { None } else { limit };
         let selected_rows: Vec<usize> = if let Some(predicate) = predicate {
-            let predicates = parse_where_expression(&table.columns, predicate)?;
-            let equality = predicates.iter().all(|item| {
-                item.group == predicates[0].group
-                        && item.operator == ComparisonOperator::Equal
-                    && item.value.as_ref().is_some_and(|value| !matches!(value, Value::Null))
-            });
-            if equality {
-                let equality_values = predicates.iter().map(|item| {
-                    Ok((item.column_index, item.value.clone()
-                        .ok_or_else(|| DbError::Parse("equality predicate is missing a value".into()))?))
-                }).collect::<Result<Vec<_>, DbError>>()?;
+            let expression = parse_where_expression(&table.columns, predicate)?;
+            if let Some(equality_values) = sql_expression_equality_terms(&expression) {
                 let columns = equality_values.iter().map(|(index, _)| *index).collect::<Vec<_>>();
                 let persistent_index = if self.ember_indexes_valid {
                     self.storage_path.as_deref().and_then(|path| {
