@@ -7,7 +7,7 @@ This directory contains a separate KSL addon. It does not modify or vendor Kotli
 - PostemberDB remains the Rust database engine and owns the data file.
 - The addon registers a postemberdb service with KSL's public addon API.
 - Scripts use the versioned POSTEMBERDB JSONL/1 loopback protocol.
-- Each operation uses a short-lived TCP connection; asynchronous methods run on a bounded worker pool (1–8 workers, queue capped at 256 requests) to apply backpressure.
+- The addon reuses a bounded pool of persistent JSONL/1 loopback connections (at most one per worker, 1–8 workers); idle sockets are retired before the server's 30-second idle timeout. The async worker queue is capped at 256 requests to apply backpressure.
 - The addon refuses non-loopback hosts because the current PostemberDB server has no TLS or authentication.
 
 ## Build
@@ -24,16 +24,36 @@ Requirements: JDK 21, Gradle, Paper API 1.21.1, and the matching KSL API JAR.
 
 The addon adds io.postemberdb.ksl.* as default imports and registers the postemberdb service.
 
-Example script call:
+Example: parameterized asynchronous query. Values are sent as typed JSON parameters instead of being interpolated into SQL text:
 
-    postemberDb().queryAsync(
-        "SELECT balance FROM player_economy WHERE uuid = ${postemberText(player.uniqueId.toString())}"
+    postemberDb().queryParamsAsync(
+        "SELECT balance FROM player_economy WHERE uuid = ?",
+        player.uniqueId.toString()
     ).thenAccept { result ->
         val balance = result.long(0, 0) ?: 0L
         runSync { player.sendMessage("Balance: $balance") }
     }
 
-Use queryAsync / executeAsync from script callbacks. Synchronous query and execute reject Paper's main thread to prevent server stalls. postemberText safely quotes SQL text values; keep SQL identifiers static. The current wire protocol accepts one SQL statement per line and does not yet expose native prepared statements or a transaction scope in the addon. Requests beyond the bounded async queue are rejected rather than accumulated without limit.
+Use queryAsync / executeAsync for fixed SQL and queryParamsAsync / executeParamsAsync when values are dynamic. The typed parameter API accepts String, Byte/Short/Int/Long, Boolean and null. SQL identifiers must remain static; parameters are for values, not table or column names.
+
+Use one atomic SQL batch when several changes belong together:
+
+    postemberDb().transactionAsync {
+        execute(
+            "UPDATE player_economy SET balance = balance + ? WHERE uuid = ?",
+            100L,
+            player.uniqueId.toString()
+        )
+        execute(
+            "INSERT INTO player_audit (uuid, action) VALUES (?, ?)",
+            player.uniqueId.toString(),
+            "daily-reward"
+        )
+    }.thenAccept { results ->
+        // Every statement committed together, or the entire batch rolled back.
+    }
+
+The JSONL/1 SQL_PARAMS command supports up to 1,024 typed parameters per statement. SQL_BATCH accepts 1..500 statements and returns one result per statement. Both are bounded by the server's 64 KiB request-line limit. The transaction builder only collects statements on the calling thread; database I/O runs on the bounded worker pool. Synchronous query, execute, and transaction methods reject Paper's main thread to prevent server stalls. Requests beyond the bounded async queue or connection pool are rejected rather than accumulated without limit. postemberText remains available for legacy SQL text construction, but typed parameters should be preferred for dynamic values.
 
 ## EF7 Minecraft player profiles
 
@@ -141,7 +161,7 @@ The line-oriented JSONL/1 bridge caps chunk payloads at 24 KiB because binary da
 
 ## Protocol and safety limits
 
-- JSONL protocol version: 1, including EF7 player-profile, namespace, chunk, generic-record, and TTL command extensions.
+- JSONL protocol version: 1, including EF7 player-profile, namespace, chunk, generic-record, TTL, typed SQL parameter (SQL_PARAMS), and atomic SQL batch (SQL_BATCH) commands.
 - The Rust server also accepts the initial Binary/1 handshake for framed SQL and single-frame chunk operations; the Kotlin addon still uses JSONL/1.
 - Maximum request line: 64 KiB; EF7 custom profile and chunk payloads are limited to 24 KiB in this bridge.
 - Namespace listing through KSL is capped at 64 metadata entries per request; chunk and generic-record reads enforce byte budgets before loading payload pages.
