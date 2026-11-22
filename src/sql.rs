@@ -508,7 +508,7 @@ pub(super) fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String,
     let mut chars = sql.chars().peekable();
 
     while let Some(character) = chars.next() {
-        if character == '\'' || character == '"' || character == '\`' || character == '[' {
+        if character == '\'' || character == '"' || character == '`' || character == '[' {
             let closing = if character == '[' { ']' } else { character };
             output.push(character);
             let mut closed = false;
