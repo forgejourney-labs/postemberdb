@@ -1583,6 +1583,130 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn jsonl_parameterized_sql_keeps_values_typed_and_prevents_text_injection() {
+        let database = Mutex::new(Database::new());
+        {
+            let mut database = database.lock().unwrap();
+            database.execute("CREATE TABLE ksl_parameters (id INTEGER PRIMARY KEY, label TEXT, enabled BOOLEAN)").unwrap();
+        }
+
+        let inserted = handle_jsonl_sql_params(
+            &serde_json::json!({
+                "sql": "INSERT INTO ksl_parameters VALUES (?, ?, ?)",
+                "parameters": [
+                    {"type": "integer", "value": 1},
+                    {"type": "text", "value": "Alice's account"},
+                    {"type": "boolean", "value": true}
+                ]
+            }).to_string(),
+            &database,
+            &mut None,
+            None,
+            false,
+        );
+        assert!(serde_json::from_str::<JsonValue>(inserted.trim()).unwrap()["ok"].as_bool().unwrap());
+
+        let selected = handle_jsonl_sql_params(
+            &serde_json::json!({
+                "sql": "SELECT id, label, enabled FROM ksl_parameters WHERE label = ?",
+                "parameters": [{"type": "text", "value": "Alice's account"}]
+            }).to_string(),
+            &database,
+            &mut None,
+            None,
+            false,
+        );
+        let selected: JsonValue = serde_json::from_str(selected.trim()).unwrap();
+        assert_eq!(selected["rows"][0][0], 1);
+        assert_eq!(selected["rows"][0][1], "Alice's account");
+        assert_eq!(selected["rows"][0][2], true);
+
+        let injection = handle_jsonl_sql_params(
+            &serde_json::json!({
+                "sql": "SELECT id FROM ksl_parameters WHERE label = ?",
+                "parameters": [{"type": "text", "value": "' OR 1=1 --"}]
+            }).to_string(),
+            &database,
+            &mut None,
+            None,
+            false,
+        );
+        let injection: JsonValue = serde_json::from_str(injection.trim()).unwrap();
+        assert_eq!(injection["rows"].as_array().unwrap().len(), 0);
+
+        let bad_type = handle_jsonl_sql_params(
+            &serde_json::json!({
+                "sql": "SELECT id FROM ksl_parameters WHERE id = ?",
+                "parameters": [{"type": "text", "value": "not-an-integer"}]
+            }).to_string(),
+            &database,
+            &mut None,
+            None,
+            false,
+        );
+        assert_eq!(serde_json::from_str::<JsonValue>(bad_type.trim()).unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn jsonl_sql_batch_is_atomic_and_returns_each_statement_result() {
+        let database = Mutex::new(Database::new());
+        database.lock().unwrap()
+            .execute("CREATE TABLE ksl_batch (id INTEGER PRIMARY KEY, balance INTEGER)")
+            .unwrap();
+
+        let failed = handle_jsonl_sql_batch(
+            &serde_json::json!({
+                "statements": [
+                    {"sql": "INSERT INTO ksl_batch VALUES (?, ?)", "parameters": [
+                        {"type": "integer", "value": 1}, {"type": "integer", "value": 100}
+                    ]},
+                    {"sql": "INSERT INTO ksl_batch VALUES (?, ?)", "parameters": [
+                        {"type": "integer", "value": 1}, {"type": "integer", "value": 200}
+                    ]}
+                ]
+            }).to_string(),
+            &database,
+            false,
+            None,
+            false,
+        );
+        assert_eq!(serde_json::from_str::<JsonValue>(failed.trim()).unwrap()["ok"], false);
+        assert_eq!(
+            database.lock().unwrap().execute("SELECT * FROM ksl_batch").unwrap().rows.len(),
+            0,
+            "a failed statement must roll back every earlier statement in the batch"
+        );
+
+        let succeeded = handle_jsonl_sql_batch(
+            &serde_json::json!({
+                "statements": [
+                    {"sql": "INSERT INTO ksl_batch VALUES (?, ?)", "parameters": [
+                        {"type": "integer", "value": 1}, {"type": "integer", "value": 100}
+                    ]},
+                    {"sql": "UPDATE ksl_batch SET balance = balance + ? WHERE id = ?", "parameters": [
+                        {"type": "integer", "value": 25}, {"type": "integer", "value": 1}
+                    ]},
+                    {"sql": "SELECT balance FROM ksl_batch WHERE id = ?", "parameters": [
+                        {"type": "integer", "value": 1}
+                    ]}
+                ]
+            }).to_string(),
+            &database,
+            false,
+            None,
+            false,
+        );
+        let succeeded: JsonValue = serde_json::from_str(succeeded.trim()).unwrap();
+        assert_eq!(succeeded["ok"], true);
+        assert_eq!(succeeded["statements"], 3);
+        assert_eq!(succeeded["results"][2]["rows"][0][0], 125);
+        assert_eq!(
+            database.lock().unwrap().execute("SELECT balance FROM ksl_batch WHERE id = 1").unwrap().rows[0].values[0],
+            Value::Integer(125)
+        );
+    }
+
+    #[test]
     fn server_startup_recovers_committed_sql_kv_registry_and_ef7_participants() {
         let directory = std::env::temp_dir().join(format!(
             "postemberdb-server-recovery-{}-{}",
