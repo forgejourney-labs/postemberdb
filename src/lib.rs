@@ -202,6 +202,10 @@ pub(crate) enum SqlValueExpression {
     Multiply(Box<SqlValueExpression>, Box<SqlValueExpression>),
     Divide(Box<SqlValueExpression>, Box<SqlValueExpression>),
     Remainder(Box<SqlValueExpression>, Box<SqlValueExpression>),
+    Function {
+        name: String,
+        arguments: Vec<SqlValueExpression>,
+    },
 }
 
 impl Default for SqlExpression {
@@ -272,6 +276,87 @@ fn evaluate_sql_value_expression(
             Ok((!matches!(value, Value::Null)).then(|| value.clone()))
         }
         Expr::Literal(value) => Ok((!matches!(value, Value::Null)).then(|| value.clone())),
+        Expr::Function { name, arguments } => {
+            let expected_arity = match name.as_str() {
+                "COALESCE" => None,
+                "NULLIF" => Some(2usize),
+                "ABS" | "LENGTH" | "LOWER" | "UPPER" => Some(1usize),
+                other => return Err(DbError::Unsupported(format!("scalar SQL function {other}"))),
+            };
+            if let Some(expected) = expected_arity {
+                if arguments.len() != expected {
+                    return Err(DbError::Parse(format!(
+                        "SQL function {name} expects {expected} argument(s), received {}",
+                        arguments.len()
+                    )));
+                }
+            } else if arguments.len() < 2 {
+                return Err(DbError::Parse("COALESCE requires at least two arguments".into()));
+            }
+
+            match name.as_str() {
+                "COALESCE" => {
+                    for argument in arguments {
+                        if let Some(value) = evaluate_sql_value_expression(values, argument)? {
+                            return Ok(Some(value));
+                        }
+                    }
+                    Ok(None)
+                }
+                "NULLIF" => {
+                    let left = evaluate_sql_value_expression(values, &arguments[0])?;
+                    let right = evaluate_sql_value_expression(values, &arguments[1])?;
+                    match left {
+                        None => Ok(None),
+                        Some(left) if right.as_ref().is_some_and(|right| {
+                            compare_sql_values(&left, right) == std::cmp::Ordering::Equal
+                        }) => Ok(None),
+                        Some(left) => Ok(Some(left)),
+                    }
+                }
+                "ABS" => {
+                    let Some(value) = evaluate_sql_value_expression(values, &arguments[0])? else {
+                        return Ok(None);
+                    };
+                    let Value::Integer(number) = value else {
+                        return Err(DbError::TypeMismatch {
+                            column: "ABS".into(),
+                            expected: DataType::Integer,
+                        });
+                    };
+                    number.checked_abs().map(Value::Integer).map(Some)
+                        .ok_or_else(|| DbError::Constraint("integer overflow in ABS".into()))
+                }
+                "LENGTH" => {
+                    let Some(value) = evaluate_sql_value_expression(values, &arguments[0])? else {
+                        return Ok(None);
+                    };
+                    let Value::Text(text) = value else {
+                        return Err(DbError::TypeMismatch {
+                            column: "LENGTH".into(),
+                            expected: DataType::Text,
+                        });
+                    };
+                    let length = i64::try_from(text.chars().count())
+                        .map_err(|_| DbError::Constraint("text length exceeds signed 64-bit SQL integer range".into()))?;
+                    Ok(Some(Value::Integer(length)))
+                }
+                "LOWER" | "UPPER" => {
+                    let Some(value) = evaluate_sql_value_expression(values, &arguments[0])? else {
+                        return Ok(None);
+                    };
+                    let Value::Text(text) = value else {
+                        return Err(DbError::TypeMismatch {
+                            column: name.clone(),
+                            expected: DataType::Text,
+                        });
+                    };
+                    let normalized = if name == "LOWER" { text.to_lowercase() } else { text.to_uppercase() };
+                    Ok(Some(Value::Text(normalized)))
+                }
+                _ => unreachable!("function names are validated above"),
+            }
+        }
         Expr::UnaryPlus(inner) | Expr::UnaryMinus(inner) => {
             let Some(value) = evaluate_sql_value_expression(values, inner)? else {
                 return Ok(None);
@@ -323,6 +408,7 @@ fn evaluate_sql_value_expression(
         }
     }
 }
+
 
 fn evaluate_sql_expression(
     values: &[Value],
