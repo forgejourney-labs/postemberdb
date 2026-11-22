@@ -873,6 +873,11 @@ class PostemberDbClient internal constructor(
                 ?: throw PostemberDbException("PostemberDB closed a pooled JSONL/1 connection")
             val response = json.parseToJsonElement(responseLine).jsonObject
             reusable = true
+            if (response["ok"]?.jsonPrimitive?.boolean != true) {
+                throw PostemberDbException(
+                    response["error"]?.jsonPrimitive?.contentOrNull ?: "PostemberDB request failed"
+                )
+            }
             return response
         } catch (error: Exception) {
             throw if (error is PostemberDbException) error
