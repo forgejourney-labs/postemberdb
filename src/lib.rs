@@ -3821,6 +3821,77 @@ mod tests {
     }
 
     #[test]
+    fn scalar_sql_functions_follow_null_and_type_rules_in_where_and_update() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE sql_functions (id INTEGER PRIMARY KEY, label TEXT, score INTEGER)").unwrap();
+        db.execute("INSERT INTO sql_functions VALUES (1, 'Alpha', NULL)").unwrap();
+        db.execute("INSERT INTO sql_functions VALUES (2, 'Bravo', 0)").unwrap();
+        db.execute("INSERT INTO sql_functions VALUES (3, 'Delta', 12)").unwrap();
+        db.execute("INSERT INTO sql_functions VALUES (4, NULL, NULL)").unwrap();
+
+        let coalesced = db.execute(
+            "SELECT id FROM sql_functions WHERE COALESCE(score, 0) = 0 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            coalesced.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(4)]
+        );
+
+        let absolute = db.execute(
+            "SELECT id FROM sql_functions WHERE ABS(score - 5) >= 7 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            absolute.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(3)]
+        );
+
+        let lengths = db.execute(
+            "SELECT id FROM sql_functions WHERE LENGTH(label) = 5 ORDER BY id"
+        ).unwrap();
+        assert_eq!(
+            lengths.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+
+        let lower = db.execute(
+            "SELECT id FROM sql_functions WHERE LOWER(label) = 'alpha'"
+        ).unwrap();
+        assert_eq!(lower.rows[0].values[0], Value::Integer(1));
+
+        let nullif = db.execute(
+            "SELECT id FROM sql_functions WHERE NULLIF(score, 0) = 12"
+        ).unwrap();
+        assert_eq!(nullif.rows[0].values[0], Value::Integer(3));
+
+        let nullif_equal = db.execute(
+            "SELECT id FROM sql_functions WHERE NULLIF(score, 0) = 0"
+        ).unwrap();
+        assert!(nullif_equal.rows.is_empty());
+
+        let updated = db.execute(
+            "UPDATE sql_functions SET score = COALESCE(score, 0) + 1 WHERE id IN (1, 2)"
+        ).unwrap();
+        assert_eq!(updated.affected_rows, 2);
+        assert_eq!(
+            db.execute("SELECT score FROM sql_functions WHERE id = 1").unwrap().rows[0].values[0],
+            Value::Integer(1)
+        );
+
+        let upper = db.execute(
+            "UPDATE sql_functions SET label = UPPER(label) WHERE id = 1"
+        ).unwrap();
+        assert_eq!(upper.affected_rows, 1);
+        assert_eq!(
+            db.execute("SELECT label FROM sql_functions WHERE id = 1").unwrap().rows[0].values[0],
+            Value::Text("ALPHA".into())
+        );
+
+        assert!(db.execute("SELECT id FROM sql_functions WHERE ABS(label) > 0").is_err());
+        assert!(db.execute("SELECT id FROM sql_functions WHERE ABS(score, 1) > 0").is_err());
+        assert!(db.execute("SELECT id FROM sql_functions WHERE UNKNOWN_FN(score) > 0").is_err());
+    }
+
+    #[test]
     fn pdb6_scalar_where_expressions_run_against_cold_disk_rows() {
         let path = std::env::temp_dir().join(format!(
             "postemberdb-pdb6-scalar-where-{}-{}.pbd",
