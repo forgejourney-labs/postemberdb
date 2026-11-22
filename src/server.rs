@@ -328,6 +328,30 @@ fn handle_client<S: Read + Write>(
             reader.get_mut().flush()?;
             continue;
         }
+        if jsonl_mode && command.starts_with("SQL_PARAMS ") {
+            let response = handle_jsonl_sql_params(
+                command["SQL_PARAMS ".len()..].trim(),
+                database.as_ref(),
+                &mut session,
+                principal.as_ref(),
+                auth_required,
+            );
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
+        if jsonl_mode && command.starts_with("SQL_BATCH ") {
+            let response = handle_jsonl_sql_batch(
+                command["SQL_BATCH ".len()..].trim(),
+                database.as_ref(),
+                session.is_some(),
+                principal.as_ref(),
+                auth_required,
+            );
+            reader.get_mut().write_all(response.as_bytes())?;
+            reader.get_mut().flush()?;
+            continue;
+        }
         if jsonl_mode && command.starts_with("EF7 ") {
             let permission_error = if auth_required {
                 principal.as_ref().and_then(|p| permission_for_ef7(command).and_then(|permission| p.require(permission).err()))
@@ -817,6 +841,205 @@ struct TablePageRequest {
 struct BatchQueryRequest {
     statements: Vec<String>,
 }
+
+#[derive(serde::Deserialize)]
+struct JsonlSqlParameter {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    value: Option<JsonValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct JsonlSqlParamsRequest {
+    sql: String,
+    #[serde(default)]
+    parameters: Vec<JsonlSqlParameter>,
+}
+
+#[derive(serde::Deserialize)]
+struct JsonlSqlBatchRequest {
+    statements: Vec<JsonlSqlParamsRequest>,
+}
+
+const MAX_JSONL_SQL_PARAMETERS: usize = 1_024;
+const MAX_JSONL_SQL_BATCH_STATEMENTS: usize = 500;
+
+fn decode_jsonl_sql_parameters(parameters: &[JsonlSqlParameter]) -> Result<Vec<Value>, String> {
+    if parameters.len() > MAX_JSONL_SQL_PARAMETERS {
+        return Err(format!("SQL statement exceeds the {MAX_JSONL_SQL_PARAMETERS}-parameter limit"));
+    }
+    parameters.iter().map(|parameter| {
+        match parameter.kind.to_ascii_lowercase().as_str() {
+            "null" => {
+                if parameter.value.as_ref().is_some_and(|value| !value.is_null()) {
+                    return Err("NULL SQL parameter must not contain a non-null value".into());
+                }
+                Ok(Value::Null)
+            }
+            "integer" => parameter.value.as_ref()
+                .and_then(JsonValue::as_i64)
+                .map(Value::Integer)
+                .ok_or_else(|| "integer SQL parameter requires a signed 64-bit integer value".into()),
+            "text" => parameter.value.as_ref()
+                .and_then(JsonValue::as_str)
+                .map(|value| Value::Text(value.to_owned()))
+                .ok_or_else(|| "text SQL parameter requires a string value".into()),
+            "boolean" => parameter.value.as_ref()
+                .and_then(JsonValue::as_bool)
+                .map(Value::Boolean)
+                .ok_or_else(|| "boolean SQL parameter requires a boolean value".into()),
+            other => Err(format!("unsupported SQL parameter type: {other}")),
+        }
+    }).collect()
+}
+
+fn validate_jsonl_parameterized_statement(sql: &str) -> Result<(), String> {
+    let statement = sql.trim();
+    if statement.is_empty() {
+        return Err("SQL statement cannot be empty".into());
+    }
+    if statement.len() > MAX_SQL_LINE_BYTES || statement.contains('\n') || statement.contains('\r') {
+        return Err("SQL statement must fit on one line within the configured SQL limit".into());
+    }
+    if ["BEGIN", "BEGIN TRANSACTION", "COMMIT", "ROLLBACK"]
+        .iter().any(|keyword| statement.eq_ignore_ascii_case(keyword))
+    {
+        return Err("transaction control is not allowed inside a parameterized request; use SQL_BATCH for atomic batches".into());
+    }
+    if permission_for_sql(statement).is_none() {
+        return Err("SQL statement is not covered by the server SQL permission policy".into());
+    }
+    Ok(())
+}
+
+fn authorize_jsonl_parameterized_statement(
+    sql: &str,
+    principal: Option<&Principal>,
+    auth_required: bool,
+) -> Result<(), String> {
+    let permission = permission_for_sql(sql)
+        .ok_or_else(|| "SQL statement is not covered by the server SQL permission policy".to_owned())?;
+    if auth_required {
+        principal
+            .ok_or_else(|| "authentication required".to_owned())?
+            .require(permission)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn query_result_json(result: QueryResult) -> JsonValue {
+    let rows = result.rows.into_iter().map(|row| {
+        row.values.into_iter().map(|value| match value {
+            Value::Null => JsonValue::Null,
+            Value::Integer(value) => json!(value),
+            Value::Text(value) => json!(value),
+            Value::Boolean(value) => json!(value),
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    json!({
+        "ok": true,
+        "message": result.message,
+        "affected_rows": result.affected_rows,
+        "columns": result.columns,
+        "rows": rows
+    })
+}
+
+fn handle_jsonl_sql_params(
+    payload: &str,
+    database: &std::sync::Mutex<Database>,
+    session: &mut Option<DatabaseSession>,
+    principal: Option<&Principal>,
+    auth_required: bool,
+) -> String {
+    let request = match serde_json::from_str::<JsonlSqlParamsRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => return json_error(&format!("invalid SQL parameter request: {error}")),
+    };
+    if let Err(error) = validate_jsonl_parameterized_statement(&request.sql)
+        .and_then(|_| authorize_jsonl_parameterized_statement(&request.sql, principal, auth_required))
+    {
+        return json_error(&error);
+    }
+    let parameters = match decode_jsonl_sql_parameters(&request.parameters) {
+        Ok(parameters) => parameters,
+        Err(error) => return json_error(&error),
+    };
+
+    let result = if let Some(transaction) = session.as_mut() {
+        transaction.execute_params(&request.sql, &parameters)
+    } else {
+        match database.lock() {
+            Ok(mut database) => database.execute_params(&request.sql, &parameters),
+            Err(_) => return json_error("database lock poisoned"),
+        }
+    };
+    match result {
+        Ok(result) => format_result_json(result),
+        Err(error) => json_error(&error.to_string()),
+    }
+}
+
+fn handle_jsonl_sql_batch(
+    payload: &str,
+    database: &std::sync::Mutex<Database>,
+    transaction_active: bool,
+    principal: Option<&Principal>,
+    auth_required: bool,
+) -> String {
+    if transaction_active {
+        return json_error("SQL_BATCH cannot run inside an open SQL session; submit the whole batch in one request");
+    }
+    let request = match serde_json::from_str::<JsonlSqlBatchRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => return json_error(&format!("invalid SQL batch request: {error}")),
+    };
+    if request.statements.is_empty() || request.statements.len() > MAX_JSONL_SQL_BATCH_STATEMENTS {
+        return json_error(&format!(
+            "SQL batch must contain 1..={MAX_JSONL_SQL_BATCH_STATEMENTS} statements"
+        ));
+    }
+
+    let mut decoded = Vec::with_capacity(request.statements.len());
+    for statement in request.statements {
+        if let Err(error) = validate_jsonl_parameterized_statement(&statement.sql)
+            .and_then(|_| authorize_jsonl_parameterized_statement(&statement.sql, principal, auth_required))
+        {
+            return json_error(&error);
+        }
+        let parameters = match decode_jsonl_sql_parameters(&statement.parameters) {
+            Ok(parameters) => parameters,
+            Err(error) => return json_error(&error),
+        };
+        decoded.push((statement.sql, parameters));
+    }
+
+    let results = match database.lock() {
+        Ok(mut database) => database.transaction(|transaction| {
+            let mut results = Vec::with_capacity(decoded.len());
+            for (sql, parameters) in &decoded {
+                results.push(transaction.execute_params(sql, parameters)?);
+            }
+            Ok(results)
+        }),
+        Err(_) => return json_error("database lock poisoned"),
+    };
+    match results {
+        Ok(results) => {
+            let result_values = results.into_iter().map(query_result_json).collect::<Vec<_>>();
+            json!({
+                "ok": true,
+                "message": "SQL batch committed",
+                "statements": result_values.len(),
+                "results": result_values
+            }).to_string() + "\n"
+        }
+        Err(error) => json_error(&error.to_string()),
+    }
+}
+
 
 fn active_admin_count_after(
     store: &mut AuthStore,
