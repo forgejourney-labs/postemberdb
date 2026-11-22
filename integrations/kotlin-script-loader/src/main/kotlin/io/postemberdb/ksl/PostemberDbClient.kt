@@ -25,6 +25,29 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
+data class PostemberSqlStatement(
+    val sql: String,
+    val parameters: List<Any?> = emptyList()
+)
+
+/**
+ * Collects parameterized statements for one atomic server-side SQL transaction.
+ * The block only builds the batch; database I/O happens on the bounded worker pool.
+ */
+class PostemberSqlBatch internal constructor() {
+    private val pending = ArrayList<PostemberSqlStatement>()
+
+    fun execute(sql: String, vararg parameters: Any?) {
+        pending += PostemberSqlStatement(sql, parameters.toList())
+    }
+
+    fun query(sql: String, vararg parameters: Any?) {
+        pending += PostemberSqlStatement(sql, parameters.toList())
+    }
+
+    internal fun snapshot(): List<PostemberSqlStatement> = pending.toList()
+}
+
 data class PostemberQueryResult(
     val message: String,
     val affectedRows: Long,
@@ -118,6 +141,57 @@ class PostemberDbClient internal constructor(
 
     fun queryAsync(sql: String): CompletableFuture<PostemberQueryResult> =
         CompletableFuture.supplyAsync({ request(sql) }, executor)
+
+    /**
+     * Execute SQL with typed, positional parameters. Values are sent separately
+     * from the SQL text and encoded as explicit integer/text/boolean/null types.
+     */
+    fun queryParams(sql: String, vararg parameters: Any?): PostemberQueryResult {
+        check(!Bukkit.isPrimaryThread()) { "Use queryParamsAsync() on Paper's main thread" }
+        return parameterizedRequest(sql, parameters.toList())
+    }
+
+    fun executeParams(sql: String, vararg parameters: Any?): Long {
+        check(!Bukkit.isPrimaryThread()) { "Use executeParamsAsync() on Paper's main thread" }
+        return parameterizedRequest(sql, parameters.toList()).affectedRows
+    }
+
+    fun queryParamsAsync(sql: String, vararg parameters: Any?): CompletableFuture<PostemberQueryResult> =
+        CompletableFuture.supplyAsync({ parameterizedRequest(sql, parameters.toList()) }, executor)
+
+    fun executeParamsAsync(sql: String, vararg parameters: Any?): CompletableFuture<Long> =
+        CompletableFuture.supplyAsync({ parameterizedRequest(sql, parameters.toList()).affectedRows }, executor)
+
+    /** Submit a bounded statement batch as one atomic database transaction. */
+    fun executeBatch(statements: List<PostemberSqlStatement>): List<PostemberQueryResult> {
+        check(!Bukkit.isPrimaryThread()) { "Use executeBatchAsync() on Paper's main thread" }
+        return batchRequest(statements)
+    }
+
+    fun executeBatchAsync(statements: List<PostemberSqlStatement>): CompletableFuture<List<PostemberQueryResult>> =
+        CompletableFuture.supplyAsync({ batchRequest(statements) }, executor)
+
+    /**
+     * Convenient transaction builder for KSL scripts:
+     *
+     * postemberDb().transactionAsync {
+     *     execute("UPDATE players SET coins = coins + ? WHERE uuid = ?", 25, uuid)
+     *     execute("INSERT INTO audit_log (uuid, action) VALUES (?, ?)", uuid, "reward")
+     * }
+     *
+     * The builder performs no I/O while the block runs. All statements are then
+     * validated and committed by the server in a single atomic request.
+     */
+    fun transaction(block: PostemberSqlBatch.() -> Unit): List<PostemberQueryResult> {
+        check(!Bukkit.isPrimaryThread()) { "Use transactionAsync() on Paper's main thread" }
+        val batch = PostemberSqlBatch().apply(block)
+        return batchRequest(batch.snapshot())
+    }
+
+    fun transactionAsync(block: PostemberSqlBatch.() -> Unit): CompletableFuture<List<PostemberQueryResult>> {
+        val batch = PostemberSqlBatch().apply(block).snapshot()
+        return executeBatchAsync(batch)
+    }
 
 
     fun queryBinary(sql: String): PostemberQueryResult {
@@ -631,6 +705,64 @@ class PostemberDbClient internal constructor(
         )
     }
 
+    private fun encodeSqlParameter(value: Any?): JsonObject = when (value) {
+        null -> buildJsonObject { put("type", "null") }
+        is String -> buildJsonObject {
+            put("type", "text")
+            put("value", JsonPrimitive(value))
+        }
+        is Boolean -> buildJsonObject {
+            put("type", "boolean")
+            put("value", JsonPrimitive(value))
+        }
+        is Byte, is Short, is Int, is Long -> buildJsonObject {
+            put("type", "integer")
+            put("value", JsonPrimitive((value as Number).toLong()))
+        }
+        else -> throw IllegalArgumentException(
+            "Unsupported PostemberDB SQL parameter type \${value::class.qualifiedName}; use String, integral numbers, Boolean or null"
+        )
+    }
+
+    private fun encodeSqlStatement(statement: PostemberSqlStatement): JsonObject {
+        require(statement.sql.isNotBlank()) { "SQL statement cannot be blank" }
+        require('\n' !in statement.sql && '\r' !in statement.sql) {
+            "SQL statements must not contain line breaks"
+        }
+        require(statement.sql.toByteArray(StandardCharsets.UTF_8).size <= MAX_LINE_BYTES) {
+            "SQL statement exceeds the JSONL/1 line limit"
+        }
+        return buildJsonObject {
+            put("sql", statement.sql)
+            put("parameters", JsonArray(statement.parameters.map(::encodeSqlParameter)))
+        }
+    }
+
+    private fun parameterizedRequest(sql: String, parameters: List<Any?>): PostemberQueryResult {
+        val statement = encodeSqlStatement(PostemberSqlStatement(sql, parameters))
+        val response = protocolRequestLine("SQL_PARAMS $statement")
+        return response.toQueryResult()
+    }
+
+    private fun batchRequest(statements: List<PostemberSqlStatement>): List<PostemberQueryResult> {
+        require(statements.isNotEmpty() && statements.size <= MAX_SQL_BATCH_STATEMENTS) {
+            "SQL transaction batch must contain 1..$MAX_SQL_BATCH_STATEMENTS statements"
+        }
+        val payload = buildJsonObject {
+            put("statements", JsonArray(statements.map(::encodeSqlStatement)))
+        }
+        val response = protocolRequestLine("SQL_BATCH $payload")
+        val results = response["results"]?.jsonArray
+            ?: throw PostemberDbException("PostemberDB SQL batch response did not contain statement results")
+        if (results.size != statements.size) {
+            throw PostemberDbException("PostemberDB SQL batch returned \${results.size} results for \${statements.size} statements")
+        }
+        return results.map { element ->
+            val result = element.jsonObject
+            result.toQueryResult()
+        }
+    }
+
     private fun request(sql: String): PostemberQueryResult {
         require(sql.isNotBlank()) { "SQL statement cannot be blank" }
         val response = protocolRequestLine(sql)
@@ -777,6 +909,7 @@ class PostemberDbClient internal constructor(
 }
 
 private const val MAX_LINE_BYTES = 64 * 1024
+private const val MAX_SQL_BATCH_STATEMENTS = 500
 private const val BINARY_HEADER_BYTES = 24
 private const val BINARY_PROTOCOL_VERSION = 1
 private const val MAX_BINARY_FRAME_PAYLOAD = 8 * 1024 * 1024
