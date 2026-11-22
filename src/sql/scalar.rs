@@ -1,4 +1,4 @@
-use super::{Column, ComparisonOperator, DbError, SqlExpression, SqlValueExpression, Value};
+use crate::{Column, ComparisonOperator, DbError, SqlExpression, SqlValueExpression, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token { Name(String), Number(i64), Text(String), Op(String), Open, Close, Comma, End }
@@ -206,7 +206,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub(super) fn parse_scalar_value_expression(
+pub fn parse_scalar_value_expression(
     columns: &[Column],
     input: &str,
 ) -> Result<SqlValueExpression, DbError> {
