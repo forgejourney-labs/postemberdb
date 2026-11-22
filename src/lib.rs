@@ -3920,7 +3920,7 @@ mod tests {
             ).unwrap();
             assert_eq!(
                 function_selected.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
-                vec![Value::Integer(1), Value::Integer(3)]
+                vec![Value::Integer(1), Value::Integer(3), Value::Integer(4)]
             );
             assert!(!db.tables["scalar_disk"].rows_loaded);
 
