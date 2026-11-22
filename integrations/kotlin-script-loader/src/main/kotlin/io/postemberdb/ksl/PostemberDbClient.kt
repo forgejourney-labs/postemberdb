@@ -50,15 +50,55 @@ class PostemberSqlBatch internal constructor() {
     internal fun snapshot(): List<PostemberSqlStatement> = pending.toList()
 }
 
+data class PostemberQueryRow internal constructor(
+    val columns: List<String>,
+    val values: List<Any?>
+) {
+    private fun indexOf(column: String): Int =
+        columns.indexOfFirst { it.equals(column, ignoreCase = true) }
+            .takeIf { it >= 0 }
+            ?: throw IllegalArgumentException("Query result does not contain column '$column'")
+
+    operator fun get(column: String): Any? = values.getOrNull(indexOf(column))
+
+    fun string(column: String): String? = get(column) as? String
+    fun long(column: String): Long? = (get(column) as? Number)?.toLong()
+    fun boolean(column: String): Boolean? = get(column) as? Boolean
+}
+
 data class PostemberQueryResult(
     val message: String,
     val affectedRows: Long,
     val columns: List<String>,
     val rows: List<List<Any?>>
 ) {
-    fun string(row: Int, column: Int): String? = rows[row][column] as? String
-    fun long(row: Int, column: Int): Long? = (rows[row][column] as? Number)?.toLong()
-    fun boolean(row: Int, column: Int): Boolean? = rows[row][column] as? Boolean
+    val rowCount: Int get() = rows.size
+    val columnCount: Int get() = columns.size
+
+    fun columnIndex(name: String): Int =
+        columns.indexOfFirst { it.equals(name, ignoreCase = true) }
+            .takeIf { it >= 0 }
+            ?: throw IllegalArgumentException("Query result does not contain column '$name'")
+
+    fun value(row: Int, column: Int): Any? = rows.getOrNull(row)?.getOrNull(column)
+    fun value(row: Int, column: String): Any? = rows.getOrNull(row)?.getOrNull(columnIndex(column))
+
+    fun string(row: Int, column: Int): String? = value(row, column) as? String
+    fun string(row: Int, column: String): String? = value(row, column) as? String
+
+    fun long(row: Int, column: Int): Long? = (value(row, column) as? Number)?.toLong()
+    fun long(row: Int, column: String): Long? = (value(row, column) as? Number)?.toLong()
+
+    fun boolean(row: Int, column: Int): Boolean? = value(row, column) as? Boolean
+    fun boolean(row: Int, column: String): Boolean? = value(row, column) as? Boolean
+
+    fun row(index: Int): PostemberQueryRow? =
+        rows.getOrNull(index)?.let { PostemberQueryRow(columns, it) }
+
+    fun firstOrNull(): PostemberQueryRow? = row(0)
+
+    fun asRows(): List<PostemberQueryRow> =
+        rows.map { PostemberQueryRow(columns, it) }
 }
 
 data class PostemberPlayerProfile(
