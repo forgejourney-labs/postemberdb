@@ -118,7 +118,7 @@ impl<'a> Parser<'a> {
                 if !matches!(self.current(), Token::Close) {
                     loop {
                         arguments.push(self.value(0)?);
-                        match self.current() {
+                        match self.current().clone() {
                             Token::Comma => { self.pop(); }
                             Token::Close => break,
                             token => return Err(DbError::Parse(format!(
