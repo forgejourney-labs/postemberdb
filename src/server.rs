@@ -1574,7 +1574,7 @@ fn format_result(result: QueryResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_sidecar_suffix, open_recovered_stores, read_bounded_line, validate_bind_address};
+    use super::{append_sidecar_suffix, handle_jsonl_sql_batch, handle_jsonl_sql_params, open_recovered_stores, read_bounded_line, validate_bind_address, JsonValue};
     use postemberdb::protocol::{Frame, FrameKind, DEFAULT_MAX_PAYLOAD};
     use postemberdb::{AuthStore, Database, EmberForge7NamespaceKind, EmberForge7Store, KeyValueStore, Permissions, QueryResult, Registry, TransactionCoordinator, Value};
     use std::io::{self, BufRead, BufReader, Cursor, Write};
