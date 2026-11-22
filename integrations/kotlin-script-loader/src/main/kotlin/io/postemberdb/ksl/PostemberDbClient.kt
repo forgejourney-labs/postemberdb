@@ -865,7 +865,7 @@ class PostemberDbClient internal constructor(
                 connection = connectJsonl()
             }
 
-            val active = connection
+            val active = connection ?: throw PostemberDbException("could not acquire a JSONL/1 connection")
             active.writer.write(command)
             active.writer.write("\n")
             active.writer.flush()
