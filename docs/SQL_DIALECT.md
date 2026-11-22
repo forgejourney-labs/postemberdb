@@ -14,7 +14,7 @@ PostemberDB implements its own SQL dialect. It is not yet a complete SQLite or P
 | Updates | Single-target \`UPDATE SET\` with constants or integer scalar expressions evaluated against each matched row |
 | Deletes | \`DELETE FROM\` with optional nested predicates |
 | Queries | \`SELECT *\`, selected columns, \`COUNT(*)\`, \`WHERE\` comparisons, \`IS NULL\`, \`IS NOT NULL\`, \`IS [NOT] DISTINCT FROM\`, \`LIKE\` / \`NOT LIKE\`, \`IN\` / \`NOT IN\`, \`BETWEEN\` / \`NOT BETWEEN\`, nested \`AND\` / \`OR\` / \`NOT\`, \`LIMIT\` |
-| Scalar expressions | Integer literals, quoted identifiers, escaped text literals, unary signs, arithmetic \`+\` / \`-\` / \`*\` / \`/\` / \`%\`, parentheses, and column-to-column comparisons in \`WHERE\` and single-target \`UPDATE SET\` |
+| Scalar expressions | Integer literals, quoted identifiers, escaped text literals, unary signs, arithmetic `+` / `-` / `*` / `/` / `%`, parentheses, column-to-column comparisons, and `COALESCE`, `NULLIF`, `ABS`, `LENGTH`, `LOWER`, `UPPER` in `WHERE` and single-target `UPDATE SET` |
 | Sorting | \`ORDER BY column [ASC|DESC]\`, multiple sort keys |
 | Parameters | Typed positional \`?\` values through Rust Database / session APIs and the KSL JSONL/1 \`SQL_PARAMS\` command |
 | Transactions | Rust transaction callback and sessions, per-connection \`BEGIN\` / \`COMMIT\` / \`ROLLBACK\`, and atomic JSONL/1 \`SQL_BATCH\` requests from KSL |
@@ -67,7 +67,7 @@ PDB6 queries read row IDs and row payloads in bounded batches. An unordered scan
 - Aggregates beyond \`COUNT(*)\`, including \`SUM\`, \`AVG\`, \`MIN\`, and \`MAX\`.
 - \`OFFSET\`, window functions, and recursive queries.
 - Multiple \`UPDATE SET\` assignments and expression projections.
-- Scalar functions such as \`COALESCE\`, \`NULLIF\`, \`ABS\`, and \`LENGTH\`; \`CASE\`; casts; REAL values; collations; and date/time types.
+- Additional scalar functions, `CASE`, casts, REAL values, collations, and date/time types.
 - \`DROP TABLE\`, \`DROP INDEX\`, \`ALTER TABLE\`, foreign keys, check constraints, and default expressions.
 - Savepoints, configurable isolation levels, and cross-domain transactions spanning SQL, KV, Registry, and EF7.
 - Cost-based optimization, index range scans, \`EXPLAIN\`, server-side prepared-statement handles, and parsed-plan caching.
