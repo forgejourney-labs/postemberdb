@@ -720,7 +720,7 @@ class PostemberDbClient internal constructor(
             put("value", JsonPrimitive((value as Number).toLong()))
         }
         else -> throw IllegalArgumentException(
-            "Unsupported PostemberDB SQL parameter type \${value::class.qualifiedName}; use String, integral numbers, Boolean or null"
+            "Unsupported PostemberDB SQL parameter type ${value::class.qualifiedName}; use String, integral numbers, Boolean or null"
         )
     }
 
@@ -755,7 +755,7 @@ class PostemberDbClient internal constructor(
         val results = response["results"]?.jsonArray
             ?: throw PostemberDbException("PostemberDB SQL batch response did not contain statement results")
         if (results.size != statements.size) {
-            throw PostemberDbException("PostemberDB SQL batch returned \${results.size} results for \${statements.size} statements")
+            throw PostemberDbException("PostemberDB SQL batch returned ${results.size} results for ${statements.size} statements")
         }
         return results.map { element ->
             val result = element.jsonObject
