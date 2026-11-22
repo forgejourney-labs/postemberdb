@@ -1,7 +1,7 @@
 use super::{Column, ComparisonOperator, DbError, SqlExpression, SqlValueExpression, Value};
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token { Name(String), Number(i64), Text(String), Op(String), Open, Close, End }
+enum Token { Name(String), Number(i64), Text(String), Op(String), Open, Close, Comma, End }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, DbError> {
     let b = input.as_bytes();
@@ -79,6 +79,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, DbError> {
         }
         if c == b'(' { out.push(Token::Open); i += 1; continue; }
         if c == b')' { out.push(Token::Close); i += 1; continue; }
+        if c == b',' { out.push(Token::Comma); i += 1; continue; }
         let pair = if i + 1 < b.len() { &input[i..i + 2] } else { "" };
         if matches!(pair, "<=" | ">=" | "<>" | "!=" | "==") {
             out.push(Token::Op(pair.to_owned())); i += 2; continue;
@@ -111,6 +112,27 @@ impl<'a> Parser<'a> {
             Token::Name(s) if s.eq_ignore_ascii_case("NULL") => SqlValueExpression::Literal(Value::Null),
             Token::Name(s) if s.eq_ignore_ascii_case("TRUE") => SqlValueExpression::Literal(Value::Boolean(true)),
             Token::Name(s) if s.eq_ignore_ascii_case("FALSE") => SqlValueExpression::Literal(Value::Boolean(false)),
+            Token::Name(name) if matches!(self.current(), Token::Open) => {
+                self.pop();
+                let mut arguments = Vec::new();
+                if !matches!(self.current(), Token::Close) {
+                    loop {
+                        arguments.push(self.value(0)?);
+                        match self.current() {
+                            Token::Comma => { self.pop(); }
+                            Token::Close => break,
+                            token => return Err(DbError::Parse(format!(
+                                "expected ',' or ')' in function call, found {token:?}"
+                            ))),
+                        }
+                    }
+                }
+                self.pop();
+                SqlValueExpression::Function {
+                    name: name.to_ascii_uppercase(),
+                    arguments,
+                }
+            }
             Token::Name(s) => {
                 let name = s.trim().to_ascii_lowercase();
                 let index = self.columns.iter().position(|c| c.name == name).ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
