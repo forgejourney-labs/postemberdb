@@ -22,6 +22,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Semaphore
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
@@ -104,6 +106,19 @@ data class PostemberStoredRecord(
 )
 
 /** Thread-safe loopback bridge to the PostemberDB JSONL/1 protocol. */
+private class PooledJsonlConnection(
+    val socket: Socket,
+    val reader: BufferedReader,
+    val writer: BufferedWriter
+) {
+    @Volatile
+    var lastUsedAtNanos: Long = System.nanoTime()
+
+    fun closeQuietly() {
+        try { socket.close() } catch (_: Exception) {}
+    }
+}
+
 class PostemberDbClient internal constructor(
     private val host: String,
     private val port: Int,
@@ -119,6 +134,13 @@ class PostemberDbClient internal constructor(
         ArrayBlockingQueue(256), ThreadPoolExecutor.AbortPolicy()
     )
     private val json = Json { ignoreUnknownKeys = true }
+
+    // Keep at most one live JSONL socket per bounded worker. The server accepts
+    // multiple line requests on one connection, so KSL avoids a TCP/TLS handshake
+    // for every SQL statement without creating an unbounded connection queue.
+    private val jsonlPermits = Semaphore(workerCount)
+    private val idleJsonlConnections = ArrayBlockingQueue<PooledJsonlConnection>(workerCount)
+    private val jsonlConnections = ConcurrentHashMap.newKeySet<PooledJsonlConnection>()
 
     init {
         require(port in 1..65535) { "PostemberDB port must be between 1 and 65535" }
@@ -778,17 +800,12 @@ class PostemberDbClient internal constructor(
         )
     }
 
-    private fun protocolRequestLine(command: String): JsonObject {
+    private fun connectJsonl(): PooledJsonlConnection {
         check(!closed.get()) { "PostemberDB KSL client is closed" }
-        require(command.isNotBlank()) { "PostemberDB request cannot be blank" }
-        require('\n' !in command && '\r' !in command) { "PostemberDB JSONL/1 accepts one command per line" }
-        require(command.toByteArray(StandardCharsets.UTF_8).size <= MAX_LINE_BYTES) {
-            "PostemberDB request exceeds 64 KiB"
-        }
         val address = InetAddress.getByName(host)
         require(address.isLoopbackAddress) { "PostemberDB connection must use loopback" }
-
-        Socket().use { socket ->
+        val socket = Socket()
+        try {
             socket.tcpNoDelay = true
             socket.connect(InetSocketAddress(address, port), connectTimeoutMs)
             socket.soTimeout = readTimeoutMs
@@ -802,18 +819,79 @@ class PostemberDbClient internal constructor(
             check(hello["ready"]?.jsonPrimitive?.boolean == true && hello["version"]?.jsonPrimitive?.int == 1) {
                 "PostemberDB server does not support JSONL/1"
             }
-            writer.write(command)
-            writer.write("\n")
-            writer.flush()
-            val responseLine = reader.readLine() ?: error("PostemberDB returned an empty response")
-            val response = json.parseToJsonElement(responseLine).jsonObject
-            if (response["ok"]?.jsonPrimitive?.boolean != true) {
-                throw PostemberDbException(response["error"]?.jsonPrimitive?.contentOrNull ?: "unknown database error")
-            }
-            return response
+            return PooledJsonlConnection(socket, reader, writer).also(jsonlConnections::add)
+        } catch (error: Exception) {
+            try { socket.close() } catch (_: Exception) {}
+            throw error
         }
     }
 
+    private fun discardJsonlConnection(connection: PooledJsonlConnection) {
+        idleJsonlConnections.remove(connection)
+        jsonlConnections.remove(connection)
+        connection.closeQuietly()
+    }
+
+    private fun protocolRequestLine(command: String): JsonObject {
+        check(!closed.get()) { "PostemberDB KSL client is closed" }
+        require(command.isNotBlank()) { "PostemberDB request cannot be blank" }
+        require('\n' !in command && '\r' !in command) { "PostemberDB JSONL/1 accepts one command per line" }
+        require(command.toByteArray(StandardCharsets.UTF_8).size <= MAX_LINE_BYTES) {
+            "PostemberDB request exceeds 64 KiB"
+        }
+
+        val acquired = try {
+            jsonlPermits.tryAcquire(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw PostemberDbException("Interrupted while waiting for a PostemberDB connection")
+        }
+        if (!acquired) {
+            throw PostemberDbException("PostemberDB connection pool is busy; retry from an asynchronous worker")
+        }
+
+        var connection: PooledJsonlConnection? = null
+        var reusable = false
+        try {
+            connection = idleJsonlConnections.poll()
+            if (connection != null) {
+                val idleNanos = System.nanoTime() - connection.lastUsedAtNanos
+                if (connection.socket.isClosed || idleNanos >= JSONL_CONNECTION_MAX_IDLE_NANOS) {
+                    discardJsonlConnection(connection)
+                    connection = null
+                }
+            }
+            if (connection == null) {
+                connection = connectJsonl()
+            }
+
+            val active = connection
+            active.writer.write(command)
+            active.writer.write("\n")
+            active.writer.flush()
+            val responseLine = active.reader.readLine()
+                ?: throw PostemberDbException("PostemberDB closed a pooled JSONL/1 connection")
+            val response = json.parseToJsonElement(responseLine).jsonObject
+            reusable = true
+            return response
+        } catch (error: Exception) {
+            throw if (error is PostemberDbException) error
+                else PostemberDbException("PostemberDB JSONL/1 request failed: " + (error.message ?: error.javaClass.simpleName))
+        } finally {
+            val usedConnection = connection
+            if (usedConnection != null) {
+                if (reusable && !closed.get() && !usedConnection.socket.isClosed) {
+                    usedConnection.lastUsedAtNanos = System.nanoTime()
+                    if (!idleJsonlConnections.offer(usedConnection)) {
+                        discardJsonlConnection(usedConnection)
+                    }
+                } else {
+                    discardJsonlConnection(usedConnection)
+                }
+            }
+            jsonlPermits.release()
+        }
+    }
 
     private fun JsonObject.readNamespace(): PostemberNamespace? {
         val element = this["namespace"] ?: return null
@@ -904,12 +982,17 @@ class PostemberDbClient internal constructor(
 
 
     override fun close() {
-        if (closed.compareAndSet(false, true)) executor.shutdownNow()
+        if (closed.compareAndSet(false, true)) {
+            jsonlConnections.toList().forEach(::discardJsonlConnection)
+            idleJsonlConnections.clear()
+            executor.shutdownNow()
+        }
     }
 }
 
 private const val MAX_LINE_BYTES = 64 * 1024
 private const val MAX_SQL_BATCH_STATEMENTS = 500
+private val JSONL_CONNECTION_MAX_IDLE_NANOS = TimeUnit.SECONDS.toNanos(25)
 private const val BINARY_HEADER_BYTES = 24
 private const val BINARY_PROTOCOL_VERSION = 1
 private const val MAX_BINARY_FRAME_PAYLOAD = 8 * 1024 * 1024
