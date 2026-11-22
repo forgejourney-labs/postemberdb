@@ -128,8 +128,24 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.pop();
+                let normalized_name = name.to_ascii_uppercase();
+                match normalized_name.as_str() {
+                    "COALESCE" if arguments.len() < 2 => {
+                        return Err(DbError::Parse("COALESCE requires at least two arguments".into()));
+                    }
+                    "COALESCE" => {}
+                    "NULLIF" if arguments.len() != 2 => {
+                        return Err(DbError::Parse("NULLIF expects exactly two arguments".into()));
+                    }
+                    "NULLIF" => {}
+                    "ABS" | "LENGTH" | "LOWER" | "UPPER" if arguments.len() != 1 => {
+                        return Err(DbError::Parse(format!("{normalized_name} expects exactly one argument")));
+                    }
+                    "ABS" | "LENGTH" | "LOWER" | "UPPER" => {}
+                    _ => return Err(DbError::Unsupported(format!("scalar SQL function {normalized_name}"))),
+                }
                 SqlValueExpression::Function {
-                    name: name.to_ascii_uppercase(),
+                    name: normalized_name,
                     arguments,
                 }
             }
