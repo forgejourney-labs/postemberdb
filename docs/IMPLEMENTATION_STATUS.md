@@ -133,11 +133,16 @@ EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent re
 - [x] Versioned JSONL/1 request/response protocol with typed JSON values and legacy line-protocol compatibility.
 - [ ] JDBC driver and service-provider registration.
 - [x] Separate KSL addon service with loopback-only client, configuration, and async query/write methods.
-- [ ] JDBC driver, native prepared statements, transaction scope in the addon, and KSL JDBC dialect/connection-pool integration.
+- [x] JSONL/1 SQL_PARAMS accepts typed NULL, signed 64-bit integer, text, and boolean parameters and routes them through the same Rust parameter-binding API used by embedded callers.
+- [x] JSONL/1 SQL_BATCH commits 1..=500 parameterized statements through one Database transaction and returns one typed result per statement; failed statements roll back the entire batch.
+- [x] KSL exposes queryParamsAsync / executeParamsAsync, executeBatchAsync, and a transactionAsync builder for atomic SQL batches.
+- [x] KSL reuses a bounded persistent JSONL connection pool, capped at the configured 1..=8 worker count, with idle connections retired before the server timeout.
+- [ ] Server-side prepared-statement handles, parsed-plan caching, and cancellation across script reload remain unfinished. JSONL parameter requests bind values per execution and do not claim reusable server-side prepared plans.
+- [ ] Native prepared-statement handles/plan caching, KSL JDBC dialect selection, cancellation across script reload, and live Paper/KSL validation.
 - [ ] PreparedStatement, ResultSet, timeout, row-limit, and cancellation compatibility tests.
 - [ ] End-to-end tests using the actual KSL plugin.
 
-A separate PostemberDBKSL addon now registers a KSL service and exposes async query/write methods over JSONL/1. It is not a JDBC driver and does not replace KSL's existing JDBC backend. End-to-end testing against a running Paper/KSL server is still pending.
+A separate PostemberDBKSL addon now registers a KSL service and exposes async query/write methods, typed positional SQL parameters, and atomic statement batches over JSONL/1. The client reuses a bounded pool of persistent loopback connections. The addon is not itself a JDBC driver and does not replace KSL's existing JDBC backend. End-to-end testing against a running Paper/KSL server is still pending.
 
 ## 5. Security and operations
 
