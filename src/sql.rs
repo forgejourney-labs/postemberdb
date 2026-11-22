@@ -505,38 +505,97 @@ pub(super) fn split_and_conditions(input: &str) -> Vec<&str> {
 pub(super) fn bind_parameters(sql: &str, parameters: &[Value]) -> Result<String, DbError> {
     let mut output = String::with_capacity(sql.len() + parameters.len() * 8);
     let mut parameter_index = 0usize;
-    let mut quote = None;
     let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if let Some(active_quote) = quote {
-            output.push(ch);
-            if ch == active_quote {
-                if chars.peek() == Some(&active_quote) {
-                    output.push(chars.next().expect("peeked quote"));
-                } else {
-                    quote = None;
+
+    while let Some(character) = chars.next() {
+        if character == '\'' || character == '"' || character == '\`' || character == '[' {
+            let closing = if character == '[' { ']' } else { character };
+            output.push(character);
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                output.push(next);
+                if next == closing {
+                    if chars.peek() == Some(&closing) {
+                        output.push(chars.next().expect("peeked closing quote"));
+                    } else {
+                        closed = true;
+                        break;
+                    }
                 }
+            }
+            if !closed {
+                return Err(DbError::Parse("unclosed quoted value or identifier while binding SQL parameters".into()));
             }
             continue;
         }
-        if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-            output.push(ch);
-        } else if ch == '?' {
+
+        if character == '-' && chars.peek() == Some(&'-') {
+            output.push(character);
+            output.push(chars.next().expect("peeked second line-comment marker"));
+            while let Some(next) = chars.next() {
+                output.push(next);
+                if next == '\n' { break; }
+            }
+            continue;
+        }
+
+        if character == '/' && chars.peek() == Some(&'*') {
+            output.push(character);
+            output.push(chars.next().expect("peeked block-comment marker"));
+            let mut previous = '\0';
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                output.push(next);
+                if previous == '*' && next == '/' {
+                    closed = true;
+                    break;
+                }
+                previous = next;
+            }
+            if !closed {
+                return Err(DbError::Parse("unclosed SQL block comment while binding parameters".into()));
+            }
+            continue;
+        }
+
+        if character == '?' {
             let value = parameters.get(parameter_index)
                 .ok_or_else(|| DbError::Parse("not enough SQL parameters".into()))?;
             output.push_str(&value_to_sql(value));
             parameter_index += 1;
         } else {
-            output.push(ch);
+            output.push(character);
         }
     }
+
     if parameter_index != parameters.len() {
         return Err(DbError::Parse(format!(
             "expected {parameter_index} SQL parameters, received {}", parameters.len()
         )));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod parameter_binding_tests {
+    use super::bind_parameters;
+    use crate::Value;
+
+    #[test]
+    fn question_marks_inside_sql_literals_identifiers_and_comments_are_not_parameters() {
+        let sql = "SELECT '?' AS literal, \"?\" AS quoted -- ? is a comment\n/* another ? */ WHERE id = ?";
+        let bound = bind_parameters(sql, &[Value::Integer(42)]).unwrap();
+        assert_eq!(
+            bound,
+            "SELECT '?' AS literal, \"?\" AS quoted -- ? is a comment\n/* another ? */ WHERE id = 42"
+        );
+    }
+
+    #[test]
+    fn parameter_binding_rejects_unclosed_comments_and_quotes() {
+        assert!(bind_parameters("SELECT ? /* unfinished", &[Value::Integer(1)]).is_err());
+        assert!(bind_parameters("SELECT 'unfinished ?", &[Value::Integer(1)]).is_err());
+    }
 }
 
 pub(super) fn value_to_sql(value: &Value) -> String {
