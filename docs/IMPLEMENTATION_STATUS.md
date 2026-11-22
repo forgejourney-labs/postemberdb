@@ -115,7 +115,7 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [ ] Multi-frame chunk streaming, aggregate in-flight byte budgets, backpressure, cancellation, range scans, atomic chunk batches, and Kotlin binary client.
 - [ ] Binary/1 transaction-control frames and cross-domain transaction coordination.
 - [ ] Build the addon against the installed KSL API and Paper dependencies; run end-to-end Paper/KSL integration tests.
-- [ ] JDBC driver and KSL SQL dialect/PreparedStatement support.
+- [ ] Full JDBC compliance, native server-side prepared statements, and KSL-selectable SQL dialect remain pending.
 - [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
 
 EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent record engine and does not yet provide cross-domain atomicity with SQL, KV, Registry, or other sidecars. FNV-style checksums detect accidental corruption; they are not cryptographic authentication.
@@ -131,14 +131,15 @@ EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent re
 - [x] Bounded bulk insert API aligned with KSL's configurable batch ceiling.
 - [x] Transaction callback API for Rust callers.
 - [x] Versioned JSONL/1 request/response protocol with typed JSON values and legacy line-protocol compatibility.
-- [ ] JDBC driver and service-provider registration.
+- [x] Standalone `jdbc-driver` Maven module and JDBC service-provider registration; JDBC compliance and live validation remain pending.
 - [x] Separate KSL addon service with loopback-only client, configuration, and async query/write methods.
 - [x] JSONL/1 SQL_PARAMS accepts typed NULL, signed 64-bit integer, text, and boolean parameters and routes them through the same Rust parameter-binding API used by embedded callers.
 - [x] JSONL/1 SQL_BATCH commits 1..=500 parameterized statements through one Database transaction and returns one typed result per statement; failed statements roll back the entire batch.
 - [x] KSL exposes queryParamsAsync / executeParamsAsync, executeBatchAsync, and a transactionAsync builder for atomic SQL batches.
+- [x] KSL query results expose safe nullable index access, case-insensitive column-name lookup, row/column counts, and row wrappers.
 - [x] KSL reuses a bounded persistent JSONL connection pool, capped at the configured 1..=8 worker count, with idle connections retired before the server timeout.
 - [ ] Server-side prepared-statement handles, parsed-plan caching, and cancellation across script reload remain unfinished. JSONL parameter requests bind values per execution and do not claim reusable server-side prepared plans.
-- [ ] Native prepared-statement handles/plan caching, KSL JDBC dialect selection, cancellation across script reload, and live Paper/KSL validation.
+- [ ] Native prepared-statement handles/parsed-plan caching, JDBC batching/generated keys/savepoints/streaming, KSL-selectable JDBC dialect, cancellation across script reload, and live Paper/KSL validation.
 - [ ] PreparedStatement, ResultSet, timeout, row-limit, and cancellation compatibility tests.
 - [ ] End-to-end tests using the actual KSL plugin.
 
