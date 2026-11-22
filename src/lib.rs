@@ -3904,6 +3904,7 @@ mod tests {
             db.execute("INSERT INTO scalar_disk VALUES (1, 5)").unwrap();
             db.execute("INSERT INTO scalar_disk VALUES (2, 10)").unwrap();
             db.execute("INSERT INTO scalar_disk VALUES (3, 15)").unwrap();
+            db.execute("INSERT INTO scalar_disk VALUES (4, NULL)").unwrap();
 
             let selected = db.execute(
                 "SELECT id FROM scalar_disk WHERE coins * 2 >= 20 ORDER BY id"
@@ -3912,6 +3913,21 @@ mod tests {
                 selected.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
                 vec![Value::Integer(2), Value::Integer(3)]
             );
+            assert!(!db.tables["scalar_disk"].rows_loaded);
+
+            let function_selected = db.execute(
+                "SELECT id FROM scalar_disk WHERE ABS(COALESCE(coins, 0) - 10) >= 5 ORDER BY id"
+            ).unwrap();
+            assert_eq!(
+                function_selected.rows.iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+                vec![Value::Integer(1), Value::Integer(3)]
+            );
+            assert!(!db.tables["scalar_disk"].rows_loaded);
+
+            let function_updated = db.execute(
+                "UPDATE scalar_disk SET coins = COALESCE(coins, 0) + 2 WHERE id = 4"
+            ).unwrap();
+            assert_eq!(function_updated.affected_rows, 1);
             assert!(!db.tables["scalar_disk"].rows_loaded);
 
             let updated = db.execute(
