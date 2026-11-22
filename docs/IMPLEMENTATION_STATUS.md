@@ -140,10 +140,11 @@ EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent re
 - [x] KSL reuses a bounded persistent JSONL connection pool, capped at the configured 1..=8 worker count, with idle connections retired before the server timeout.
 - [ ] Server-side prepared-statement handles, parsed-plan caching, and cancellation across script reload remain unfinished. JSONL parameter requests bind values per execution and do not claim reusable server-side prepared plans.
 - [ ] Native prepared-statement handles/parsed-plan caching, JDBC batching/generated keys/savepoints/streaming, KSL-selectable JDBC dialect, cancellation across script reload, and live Paper/KSL validation.
+- [ ] Bounded multi-statement PDB6 SQL_BATCH staging without compatibility-path table hydration.
 - [ ] PreparedStatement, ResultSet, timeout, row-limit, and cancellation compatibility tests.
 - [ ] End-to-end tests using the actual KSL plugin.
 
-A separate PostemberDBKSL addon now registers a KSL service and exposes async query/write methods, typed positional SQL parameters, and atomic statement batches over JSONL/1. The client reuses a bounded pool of persistent loopback connections. The addon is not itself a JDBC driver and does not replace KSL's existing JDBC backend. End-to-end testing against a running Paper/KSL server is still pending.
+A separate PostemberDBKSL addon now registers a KSL service and exposes async query/write methods, typed positional SQL parameters, and atomic statement batches over JSONL/1. The client reuses a bounded pool of persistent loopback connections. The addon is not itself a JDBC driver and does not replace KSL's existing JDBC backend. End-to-end testing against a running Paper/KSL server is still pending. Multi-statement PDB6 batches currently use the compatibility transaction path; large-table mass DML should use the bounded single-statement executor until bounded atomic batch staging is implemented.
 
 ## 5. Security and operations
 
