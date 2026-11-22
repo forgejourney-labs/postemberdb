@@ -30,7 +30,7 @@ Example: parameterized asynchronous query. Values are sent as typed JSON paramet
         "SELECT balance FROM player_economy WHERE uuid = ?",
         player.uniqueId.toString()
     ).thenAccept { result ->
-        val balance = result.long(0, 0) ?: 0L
+        val balance = result.long(0, "balance") ?: 0L
         runSync { player.sendMessage("Balance: $balance") }
     }
 
@@ -53,7 +53,7 @@ Use one atomic SQL batch when several changes belong together:
         // Every statement committed together, or the entire batch rolled back.
     }
 
-The JSONL/1 SQL_PARAMS command supports up to 1,024 typed parameters per statement. SQL_BATCH accepts 1..500 statements and returns one result per statement. Both are bounded by the server's 64 KiB request-line limit. The transaction builder only collects statements on the calling thread; database I/O runs on the bounded worker pool. Synchronous query, execute, and transaction methods reject Paper's main thread to prevent server stalls. Requests beyond the bounded async queue or connection pool are rejected rather than accumulated without limit. postemberText remains available for legacy SQL text construction, but typed parameters should be preferred for dynamic values.
+The JSONL/1 SQL_PARAMS command supports up to 1,024 typed parameters per statement. SQL_BATCH accepts 1..500 statements and returns one result per statement. Both are bounded by the server's 64 KiB request-line limit. The transaction builder only collects statements on the calling thread; database I/O runs on the bounded worker pool. Query results provide case-insensitive column-name access (`result.long(0, "balance")`, `result.firstOrNull()?.get("uuid")`), safe nullable index access, and row/column counts. Synchronous query, execute, and transaction methods reject Paper's main thread to prevent server stalls. Requests beyond the bounded async queue or connection pool are rejected rather than accumulated without limit. postemberText remains available for legacy SQL text construction, but typed parameters should be preferred for dynamic values.
 
 ## EF7 Minecraft player profiles
 
