@@ -15,39 +15,29 @@ KSL remains optional. The Rust core includes bounded bulk operations and typed p
 
 ## Storage architecture
 
-Our native B+ tree and evolving tree-oriented storage engine are named **EmberTree**. The in-memory B+ tree backs SQL equality indexes using stable table-local row IDs; ordinary INSERT, UPDATE, DELETE, and UPSERT operations touch only affected index keys. A persistent CoW tree mirrors supported SQL index entries in EPG1 pages with EAM3 root metadata and a dedicated redo WAL. Supported equality lookups use this mirror when valid and fall back to in-memory indexes otherwise. SQL commits feed the mirror through a row-level mutation journal rather than rescanning every index. The file-backed extent layer now has a bounded per-handle LRU cache for validated EPG1 page payloads; KeyValueStore and the new variable-length RecordStore can configure capacity and inspect hit/miss/eviction counters. RecordStore uses multi-page extents for records up to 64 MiB and an EmberTree B+ Tree descriptor index. It is an independent sidecar, not yet the canonical SQL row store. SQL rows and catalog metadata are still stored in the main snapshot/WAL and reconstructed in memory. Design and recovery boundaries are documented in [docs/EMBER_TREE.md](docs/EMBER_TREE.md).
+The native in-memory B+ tree backs SQL equality indexes with stable table-local row IDs, while **EmberTree** provides the persistent copy-on-write page tree, EPG1 data pages, EAM3 allocator/root metadata, and its redo WAL. After explicit PDB6 creation or migration, the SQL catalog, row descriptors, row payload pages, index mutations, and manifest share one PDB6 page-tree root. PDB6 startup loads bounded catalog metadata rather than hydrating every row; SELECT and table-page reads stream rows from disk in bounded batches. Simple single-statement DML also has a bounded page-native path. Multi-statement transaction compatibility paths still hydrate participating tables, and a shared SQL buffer pool with page pinning remains unfinished. The file-backed extent layer includes a bounded per-handle LRU page cache. `KeyValueStore` and the variable-length `RecordStore` are separate sidecar stores; `RecordStore` supports records up to 64 MiB but is not the SQL executor's canonical row store. See [PDB6 storage](docs/PDB6_CANONICAL_SQL_STORAGE.md), [EmberTree](docs/EMBER_TREE.md), and [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
 ## EmberForge 7 — Minecraft/KSL storage
 
 **EmberForge 7 (EF7)** is a dedicated persistent record engine for Minecraft servers and KotlinScriptLoader. It uses independent `.ef7.pages`, `.ef7.wal`, and `.ef7.lock` sidecars over the PDB6 extent-page allocator and CoW B+ tree. EF7 currently provides hierarchical server/world/plugin namespaces, typed Minecraft player profiles with UUID and case-insensitive username indexes, bounded player scans, signed-coordinate chunk storage, rectangular chunk reads, and atomic player/chunk batches. Large payloads use checksummed overflow pages up to 64 MiB per record.
 
-EF7 is an independent storage engine at this stage. The optional KSL addon exposes namespace administration, typed player-profile CRUD, bounded chunk CRUD, and generic record TTL operations over the loopback JSONL/1 bridge. Profile custom data, chunk payloads, and generic record payloads are capped at 24 KiB by the hex-encoded line transport. An opt-in Binary/1 client path now supports SQL statements and single-frame chunk CRUD up to 8 MiB; it does not yet stream full 64 MiB EF7 records/chunks. EF7 generic records now support an ordered TTL expiry index and explicit bounded sweeps; KSL exposes the record TTL API with a 24 KiB JSONL transport cap. See [EF7 TTL](docs/EF7_TTL.md). The addon is not a JDBC driver or KSL SQL dialect. EF7 does **not** replace the canonical PDB5 SQL snapshot/WAL and does not yet provide cross-domain SQL/KV/Registry transactions. See [EmberForge 7 documentation](docs/EMBERFORGE7.md), [KSL bridge API](integrations/kotlin-script-loader/README.md), and [implementation gates](docs/IMPLEMENTATION_STATUS.md).
+EF7 is a separate durable data domain using `.ef7.pages`, `.ef7.wal`, and `.ef7.lock` sidecars over the PDB6 extent allocator and CoW tree. It provides hierarchical namespaces, typed Minecraft player profiles with UUID and case-insensitive username indexes, chunk CRUD and bounded rectangular reads, player/chunk batches, generic records up to 64 MiB in the native Rust API, and ordered TTL expiry with explicit bounded sweeps. The KSL JSONL/1 bridge is loopback-only and caps hex-encoded profile/chunk/record payloads at 24 KiB; the opt-in Binary/1 transport currently carries single-frame chunk payloads up to 8 MiB. Durable prepared-participant adapters exist for SQL, KV, Registry, and EF7, but ordinary SQL transactions and KSL `transactionAsync` do not automatically enlist all domains; general cross-domain transaction control is not exposed through Binary/1 or KSL yet. See [EmberForge 7](docs/EMBERFORGE7.md), [EF7 TTL](docs/EF7_TTL.md), and [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
 ## Current status
 
-The project is at an early development stage. The first prototype provides:
+PostemberDB is an experimental Rust database engine. It is not production-ready. The implementation currently includes:
 
-- an in-memory database for `Database::new()` and a persistent database opened with `Database::open(path)`; `.pbd` is the recommended extension, while existing `.db` paths remain accepted for legacy files;
-- a growing SQL subset: `CREATE TABLE IF NOT EXISTS`, column-list `INSERT`, projections, `WHERE` comparisons and integer scalar arithmetic (`+`, `-`, `*`, `/`, `%`), unary signs, arithmetic parentheses, column-to-column comparisons, scalar functions `COALESCE`, `NULLIF`, `ABS`, `LENGTH`, `LOWER`, and `UPPER` in `WHERE` and single-target `UPDATE SET` expressions, quoted identifiers, SQL comments, `LIKE` / `NOT LIKE`, `IS NULL` / `IS NOT NULL`, null-safe `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, nested boolean expressions, unary `NOT`, SQL three-valued `AND` / `OR` / `NOT`, bounded `LIMIT`, single-target `UPDATE SET` integer expressions evaluated per row, `DELETE`, `CREATE INDEX`, and PostgreSQL/MariaDB-style upserts;
-- integer, text, boolean, and nullable values;
-- basic column type, `NOT NULL`, and composite primary-key validation;
-- a versioned PPG1 fixed-4-KiB-page snapshot format with per-page and whole-payload checksums;
-- an EmberTree page-backed CoW B+ tree using EPG1 pages, EAM3 root metadata, and a dedicated redo WAL; supported SQL equality indexes are mirrored to it and queried from it when the mirror is valid;
-- an append-only, checksummed WAL with transaction frames, recovery replay, incomplete-tail truncation, and sequence-aware checkpoints;
-- staged transaction sessions with optimistic conflict detection and SQL `BEGIN`/`COMMIT`/`ROLLBACK` in the development server;
-- secondary indexes backed by the native in-memory B+ tree and stable table-local row IDs;
-- incremental index-key maintenance for INSERT, UPDATE, DELETE, and UPSERT; DELETE compacts table rows without rebuilding index trees;
-- direct row-level SQL index mutation journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX, applied in one mixed CoW batch after the canonical SQL WAL commit;
-- a standalone persistent byte-oriented `KeyValueStore` with prefix scans, bounded batches, atomic prefix deletion, bounded per-call cleanup, and a configurable page cache with runtime statistics;
-- an independent page-backed `RecordStore` for variable-length records up to 64 MiB, indexed by stable caller-supplied IDs; bounded multi-record batches use one descriptor-tree publication, but it is not yet wired as SQL's canonical row store;
-- a typed `SqlRowStore` prototype for SQL row payloads, using SRW1 records over multi-page EPG1 storage with stable-ID lookup, bounded scans, and atomic mixed upsert/delete batches; see [docs/SQL_ROW_STORE.md](docs/SQL_ROW_STORE.md);
-- a typed hierarchical `Registry` with hives, nested keys, named values, case-insensitive paths, and String/Integer/Boolean/Binary/JSON value types;
-- temporary-file writes followed by rename when checkpointing the database;
-- an OS-level exclusive sidecar lock preventing a second process/handle from opening the same database path;
-- atomic bulk insertion of up to 5,000 typed rows with one persistence operation per batch;
-- a loopback-only unauthenticated development server and a TLS-enabled authenticated server with JSONL/1 compatibility and versioned Binary/1 remote operator support.
+- An in-memory database through `Database::new()`, legacy PDB5 persistence, and page-backed PDB6 persistence. `.pbd` is the recommended file extension; existing `.db` files remain readable for compatibility.
+- A growing SQL subset: table creation, inserts, projections, typed values, primary and secondary indexes, equality and bounded range scans, `WHERE` comparisons, `LIKE`, `IN`, `BETWEEN`, NULL-aware predicates, nested boolean logic, checked integer arithmetic, selected scalar functions, bounded `LIMIT`, `ORDER BY`, updates, deletes, and PostgreSQL/MariaDB-style upserts. This is not full PostgreSQL or SQLite SQL compatibility.
+- PDB6 catalog records, row descriptors, overflow row pages, index entries, and manifest published through a shared CoW B+ Tree root. PDB6 is authoritative after explicit migration; new PDB6 databases can be created directly. Unmigrated legacy databases remain PDB5-backed.
+- Metadata-only PDB6 open, bounded streaming SELECT/table-page reads, early LIMIT termination, streaming `COUNT(*)`, and page-native bounded single-statement INSERT/UPDATE/DELETE. Multi-statement transactions, `DatabaseSession`, and UPSERT still use compatibility hydration paths.
+- A checksummed append-only SQL WAL, a separate EmberTree redo WAL, durable EAM3 allocator metadata, B+ Tree recovery validation, named PDB6 snapshots, and conservative vacuum/reclamation.
+- A native in-memory B+ Tree for SQL indexes, persistent CoW tree pages, a standalone byte-oriented `KeyValueStore`, a typed `Registry`, a variable-length `RecordStore`, and the specialized EmberForge 7 Minecraft record engine.
+- An embedded Rust API, a loopback-only development server, an authenticated TLS server with Argon2id authentication and RBAC, a versioned Binary/1 operator protocol, and a JSONL/1 loopback compatibility protocol.
+- A separate KSL addon with asynchronous typed SQL parameters and atomic SQL statement batches, plus an experimental JDBC 4.2 baseline. The JDBC driver is not yet fully JDBC-compliant and still uses client-side parameter binding.
+- Separate Browser and Admin operator applications. Their CI checks currently compile and test those applications, but this does not replace live production-like integration testing.
 
-**Current limitations:** SQL table rows and catalog metadata are still stored in memory after snapshot/WAL replay; the page cache, lazy row-page access, and page-backed SQL table storage are not implemented. The persistent SQL index mirror is derived and rebuilt on open; unsupported index-key encodings use the in-memory fallback. KV and Registry use separate page/WAL sidecars and are not part of the SQL transaction's cross-domain atomic commit. Large values need an overflow-page/blob layer. The plain `server` command remains loopback-only and unauthenticated. Remote access is available only through `server-tls`, which uses TLS, password authentication, RBAC, and the versioned Binary/1 operator protocol. The bundled Rust RemoteClient validates the configured CA bundle and TLS server name; there is no insecure certificate-validation option. Binary/1 supports SQL, catalog reads, bounded table pages, SQL write batches, server status, remote user/role/audit administration, ping/pong, and single-frame EF7 chunk CRUD up to 8 MiB per frame. Multi-frame streaming, multiplexing, request cancellation, mutual TLS, per-user quotas, and cross-domain transaction batches are not implemented. JSONL/1 remains a loopback/development compatibility protocol and must not be exposed to untrusted networks. Composite primary-key uniqueness is supported. The SQL parser is deliberately small, and the project is not yet a production database. The plain `server` command and JSONL/1 compatibility protocol are loopback-only and have no TLS, authentication, or authorization. Remote operator access must use `server-tls` with the authenticated Binary/1 protocol; this does not make the current engine production-ready, and the remaining protocol and recovery limitations above still apply.
+**Important limitations:** PDB6 still lacks a shared bounded SQL buffer pool and page pinning. Multi-statement SQL transactions and selected compatibility operations can hydrate whole participating tables; UPDATE/DELETE predicate selection still scans rows. The cost-aware query planner, full SQL expression grammar, general composite secondary indexes, server-side prepared-statement handles, streaming protocol results, multi-frame large-record transport, request cancellation, mutual TLS, per-user resource quotas, and backup/restore workflow are unfinished. PDB6 vacuum conservatively retains overflow pages while named snapshots exist; active-reader epochs, fine-grained per-snapshot overflow tracing, and crash-resumable vacuum remain open. KV, Registry, SQL, and EF7 have durable coordinator participant adapters, but normal SQL/KSL transactions do not automatically span all four domains. See [implementation gates](docs/IMPLEMENTATION_STATUS.md) and [security gates](docs/SECURITY_MODEL.md).
 
 ## CLI
 
@@ -99,23 +89,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Roadmap
 
-Detailed implementation status and acceptance criteria: [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). See also [Native Key-Value and Registry](docs/KEY_VALUE_AND_REGISTRY.md), [RecordStore](docs/RECORD_STORE.md), and [EmberTree](docs/EMBER_TREE.md).
+The near-term order is reliability first, then performance and compatibility:
 
-1. Extend the tokenizer and expression AST into a complete statement grammar; integer arithmetic predicates and single-target `UPDATE SET` expressions are implemented, while multiple assignments, scalar functions, REAL values, expression projections, CASE, and casts remain open.
-2. Add a bounded page cache and lazy page reads over the fixed-size page file.
-3. Expand WAL transactions with savepoints, checkpoint scheduling, and recovery stress tests.
-4. Add streaming table scans and bounded query result materialization.
-5. Extend indexes to range/composite keys and add a cost-aware query planner.
-6. Replace the development line protocol with a framed, parameter-aware server protocol.
-7. Add a stable KSL/JVM JDBC adapter and benchmark it against the general API.
-8. Run the Minecraft workload benchmark with `cargo bench --bench minecraft_workload`.
+1. Expand crash-point and subprocess fault-injection coverage across PDB6, the SQL WAL, EmberTree redo, allocator metadata, the cross-domain coordinator, and vacuum/reclamation.
+2. Finish the shared bounded SQL buffer pool, page pinning, memory budgets, and bounded multi-statement transaction staging.
+3. Improve the query planner, persistent index range planning, predicate pushdown, composite secondary indexes, and SQL expression/statement coverage.
+4. Add reader epochs/pins, per-snapshot overflow reachability, crash-safe vacuum progress, and verified backup/restore.
+5. Complete the Binary/1 transaction and streaming protocol, server-side prepared statements, cancellation, backpressure, and large EF7 payload streaming.
+6. Bring JDBC closer to full compliance and validate the KSL addon against a real Paper/KSL runtime.
+7. Record repeatable Minecraft workload results and compare the same dataset and hardware against the existing SQLite path.
+
+The exact acceptance criteria and current implementation checkboxes live in [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). PDB6 format and migration behavior are specified in [docs/PDB6_CANONICAL_SQL_STORAGE.md](docs/PDB6_CANONICAL_SQL_STORAGE.md).
 
 ## Development branches
 
-- `dev` — newest active development changes.
-- `canary` — raw but implemented features under early testing.
-- `unstable` — implemented and polished, but not release-ready.
-- `stable` — thoroughly validated, reliable, and security-reviewed releases.
+- `dev` — newest active development changes and fixes.
+- `canary` — early validation of implemented features.
+- `unstable` — polished release candidates that are not yet release-ready.
+- `stable` — supported releases that passed the full release and security gates.
+
+Promotion policy, required checks, and the rule against automatic merges between diverged histories are documented in [docs/BRANCH_POLICY.md](docs/BRANCH_POLICY.md).
 
 
 See [JDBC Driver](docs/JDBC_DRIVER.md) for Maven setup, TLS configuration, connection properties and current JDBC feature limits.

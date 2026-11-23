@@ -1,139 +1,113 @@
 # PDB6: canonical page-backed SQL storage
 
-## Status
+## Current authority and compatibility
 
-PDB6 is the canonical SQL persistence format after explicit `Database::migrate_to_pdb6()`. `Database::open` detects and loads its published manifest; committed SQL writes publish catalog, row descriptors, index mutations and the manifest through one PDB6 CoW root. PDB5 remains the compatibility format for databases that have not been migrated.
+PDB6 is the canonical SQL persistence format after either:
 
-PDB6 open now loads table schemas, index definitions and row counts without reading row payloads into RAM. PDB6 `SELECT` and table-page reads fetch validated row payloads directly from disk in bounded row-ID batches; `LIMIT` stops scanning early and `COUNT(*)` does not build a result vector of every row. Write transactions hydrate full table state temporarily to preserve existing constraint/index semantics, publish the PDB6 root, then evict that row cache before returning. This removes eager full-database RAM loading, but bounded DML staging and a shared bounded row cache are still required for a fully disk-native executor.
+- creating a new database with `Database::create_pdb6()` / `create-pdb6`; or
+- explicitly migrating a legacy PDB5 database with `Database::migrate_to_pdb6()` / `migrate-pdb6`.
 
-## Implemented PDB6 row-payload primitive
+When `Database::open()` finds a valid, published PDB6 manifest, it opens PDB6 as the SQL authority. PDB6-backed handles do not append to or rewrite the retained PDB5 snapshot/WAL. A database without a published PDB6 manifest remains on its existing PDB5 compatibility path. Opening a PDB5 database does not silently migrate it.
 
-The shared PDB6 store now supports versioned P6R1 row pages and P6D1 row descriptors
-under the existing table/row keyspace. A row may span multiple checksummed 4 KiB
-extent pages up to 64 MiB. Batches are bounded to 5,000 logical mutations and
-256 MiB of aggregate row/logical data.
+This document describes the current implementation on `dev`. It distinguishes completed behavior from remaining engineering gates; a completed checkbox is not a production-readiness claim.
 
-Row payload pages are allocated and synced before their descriptors become
-reachable. The row descriptors can then be published in the same copy-on-write
-root update as catalog and index key mutations. A crash before publication can
-leave unreachable pages, but cannot expose only part of the logical mutation.
-Reads validate page identity, sequence, lengths, and whole-row checksum. Row IDs
-can be scanned in bounded keyset pages.
+## What PDB6 stores
 
-This is **not yet the live SQL row store**. Database still loads PDB5 rows into
-memory and commits through the PDB5 SQL WAL. PDB6 row payload pages are not yet
-automatically enlisted in Database transactions, and replaced/deleted extents
-remain allocated until vacuum is implemented.
+PDB6 uses a shared page-backed copy-on-write B+ Tree and one published root/manifest for the SQL catalog, row descriptors, index entries, and table counters. The main pieces are:
 
-## Non-negotiable invariants
+- `PCT1` — versioned catalog/schema records.
+- `PDM1` — the published database manifest and root metadata.
+- `P6D1` — row descriptors that reference row payload pages.
+- `P6R1` — checksummed overflow row payload pages.
+- `EAM3` — mirrored allocator metadata and durable root-page publication.
+- `EPG1` — fixed-size extent data pages.
+- A dedicated page-tree redo WAL for copy-on-write page publication.
 
-1. **One SQL transaction, one durable commit decision.** Catalog changes, row inserts/updates/deletes, index-definition changes, and row-ID allocator changes in a transaction must be covered by one commit record. Independent per-table root publications are not sufficient.
-2. **WAL before data publication.** The commit record is appended and synced before a transaction becomes visible. Recovery replays committed transactions idempotently and ignores/truncates only a torn final frame; corruption in a complete frame fails closed.
-3. **One atomic database root.** A committed transaction publishes a single database root/manifest that names the catalog and all table/index roots. Readers must never observe a catalog from one transaction and rows from another.
-4. **Large values are overflow records.** B+ tree leaves contain bounded descriptors, not arbitrary row payloads. Row payload pages are checksummed and validated before descriptor publication.
-5. **No eager table reconstruction on open.** Opening a PDB6 database loads bounded metadata and roots. SELECT resolves only needed pages; full scans stream bounded batches.
-6. **PDB5 compatibility.** Existing PDB1-PDB5 files remain readable. Migration is explicit, restartable, and never overwrites the last known-good source before the new root is durable.
+The shared binary keyspace is versioned and prefix-separated:
 
-## Logical keyspace
+| Prefix | Key shape | Purpose |
+|---|---|---|
+| `0x10` | table ID | Table/catalog metadata |
+| `0x20` | table ID + stable row ID | Row descriptor |
+| `0x30` | table ID + index ID + encoded key | Secondary-index entries |
+| `0x40` | table ID | Monotonic next-row-ID and table counters |
+| `0x7f` | fixed catalog key | Database catalog/root metadata |
 
-The initial shared tree uses versioned, binary, prefix-separated keys:
+Integer key components use big-endian encoding so bytewise ordering matches numeric ordering. Key codecs reject unknown tags, invalid lengths, duplicate IDs, and non-canonical encodings.
 
-- 0x10 | table_id:u64be — table/catalog metadata.
-- 0x20 | table_id:u64be | row_id:u64be — row descriptor.
-- 0x30 | table_id:u64be | index_id:u64be | encoded_key — secondary-index posting/row references.
-- 0x40 | table_id:u64be — monotonic next-row-ID and table counters.
-- 0x7f — database catalog/root metadata.
+Rows can span multiple checksummed 4 KiB extent pages up to 64 MiB per row. PDB6 write batches are bounded by mutation count and aggregate payload limits; the row-store primitive supports up to 5,000 logical mutations and 256 MiB aggregate row/logical data per batch. The page-native SQL DML path applies a stricter retained-row budget (up to 5,000 changed rows and 128 MiB of retained row values).
 
-All integer key components use big-endian encoding so bytewise order matches numeric order. Key codecs are versioned and reject unknown tags, invalid lengths, duplicate IDs, and non-canonical encodings.
+## Open and read path
 
-## Transaction protocol
+Opening PDB6 reads and validates the published manifest, catalog/schema metadata, index definitions, and row counts. It does not eagerly hydrate every row payload into RAM.
 
-1. Parse and validate the complete statement/transaction against a staged catalog view.
-2. Assign stable table and row IDs without publishing allocator changes.
-3. Encode row overflow pages and index mutations into a bounded transaction batch.
-4. Append a checksummed redo frame containing transaction ID, base root generation, new catalog/root metadata, page images or redo operations, and a commit marker; sync it.
-5. Write/sync immutable data pages and new CoW tree pages.
-6. Atomically publish the new root manifest with generation compare-and-swap semantics; sync metadata.
-7. Acknowledge commit only after durable root publication. If a crash occurs after the commit record but before root publication, recovery completes publication. If the commit record is absent, the transaction is not committed.
+- `SELECT` and table-page reads fetch validated row payloads from disk in bounded row-ID batches.
+- `LIMIT` can stop a scan early when no requested ordering requires consuming the remainder.
+- `COUNT(*)` counts through a streaming scan without materializing a result row for every stored row.
+- Supported equality and bounded range lookups can use persistent index entries; unsupported key encodings or unavailable derived/index paths use the safe in-memory fallback where applicable.
+- `ORDER BY` is supported, but a disk-backed ordered result may need to retain and sort its matching rows; this is not a streaming external sort.
 
-The exact ordering of page images and redo payload must be finalized against the existing EAM3 metadata and page-tree recovery implementation before coding. The existing independent RecordStore WAL cannot serve as the transaction coordinator for multi-table SQL.
+## Write path and its limits
 
-## Read path and resource bounds
+PDB6 committed writes publish catalog changes, row descriptors/payload references, index mutations, counters, and the new manifest through a shared CoW root. New row payload pages are written and validated before descriptors become reachable. A successful root publication is the atomic visibility boundary.
 
-- Point lookup: catalog/schema lookup, index/root traversal, then only the selected row overflow pages.
-- Equality/range scans: ordered B+ tree cursor with LIMIT and bounded page batches.
-- Buffer pool: bounded shared cache with pin counts, dirty-page rules, and explicit memory budget; no per-table unbounded cache multiplication.
-- Every batch has independent row-count, encoded-byte, page-count, and WAL-frame limits.
-- Vacuum/reclamation is generation-aware: pages are reusable only after no published root or active reader can reference them.
+The following page-native paths are implemented:
 
-## Migration
+- `insert_many` writes bounded row batches without hydrating the entire target table.
+- Plain single-statement `INSERT`, single-column `UPDATE`, and `DELETE` through `Database::execute()` scan row IDs in bounded batches and retain only changed rows. The current page-native DML path has a 5,000-row ceiling and a 128 MiB retained-row-value budget.
+- Index mutations for affected rows are published with row/catalog changes through one CoW root.
 
-PDB5 migration must use a side-by-side target file or a new versioned sidecar, persist a migration state marker, copy catalog and rows in bounded batches, validate row counts/checksums/index definitions, sync the target, then atomically publish the PDB6 manifest. Reopening during migration resumes or safely discards the incomplete target; the original PDB5 file remains intact until validation succeeds.
+Important boundaries remain:
 
-## Implementation gates
+- UPDATE and DELETE still scan rows to evaluate their predicates unless a supported lookup narrows the work; full predicate pushdown and a cost-aware planner are unfinished.
+- Multi-statement SQL transactions, `DatabaseSession`, and UPSERT still use compatibility hydration paths to preserve current constraint and transaction semantics. These operations can materialize the participating table state.
+- The shared bounded SQL row cache, page pinning, and database-wide memory-budget enforcement are unfinished.
+- The canonical SQL row store is the PDB6 catalog/descriptor/payload keyspace. The separate `RecordStore` and `SqlRowStore` APIs remain useful storage primitives, but they are not a separate SQL executor backend.
 
-- [x] Binary catalog/schema codec and corruption tests.
-- [x] Shared keyspace and root-manifest codec.
-- [x] Bounded overflow row payload pages and descriptors with checksum validation and shared-root batch publication.
-- [ ] Transaction redo format and crash-point fault injection.
-- [ ] Atomic multi-table root publication and recovery.
-- [ ] PDB5 read-only compatibility and restartable migration.
-- [x] PDB6 SQL commit path publishes row payloads, catalog and index changes through one CoW root after explicit migration.
-- [x] PDB6 SELECT and table-page reads stream row payloads from disk in bounded batches.
-- [x] Remove eager PDB6 row reconstruction on open; load catalog metadata and row counts only.
-- [x] Use stable-ID disk scans for SELECT/table-page reads and evict temporary full-table caches after committed DML.
-- [ ] Stage INSERT/UPDATE/DELETE in bounded page batches without hydrating/cloning whole tables; preserve unique-index validation and one-root atomic publication.
-- [ ] Add a shared bounded SQL row cache with explicit capacity, pinning and observable hit/miss/eviction metrics.
-- [ ] Lazy point reads, bounded scans, and shared buffer pool.
-- [x] Durable named snapshot roots and tree-page reachability across retained snapshots; PDB6's exclusive page-store lock serializes store access.
-- [ ] Active-reader epochs/pins, per-snapshot overflow-descriptor tracing, and crash-safe vacuum progress.
-- [ ] Recovery, migration, and large Minecraft workload benchmarks.
+## Indexes and stable row identity
 
-Until these gates pass, PostemberDB must not describe its SQL tables as disk-native or production-ready.
+SQL index entries use stable table-local row IDs rather than mutable vector positions. INSERT adds affected row IDs; UPDATE changes index entries only when indexed values change; DELETE removes the affected keys; UPSERT rekeys the affected row. The row-ID-to-position map remains an in-memory lookup aid and can be rebuilt after vector compaction.
 
-## Explicit PDB5-to-PDB6 copy operation
+The persistent B+ Tree performs copy-on-write path updates and bounded range traversal. Recovery validates reachable-tree structure, separators, ordered child ranges, cycles, multiply referenced pages, page images, and redo records. Persistent sibling pointers and byte-balanced redistribution of underfull siblings are not currently required for correctness and remain potential performance/space improvements.
 
-`Database::migrate_to_pdb6()` performs an explicit copy of the currently
-opened PDB5 state into PDB6 catalog, typed row-payload, and index keyspaces.
-Table IDs and index IDs are assigned deterministically from sorted catalog
-names; stable row IDs are preserved. Row and index writes are bounded to 5,000
-mutations per batch. The PDB6 completion manifest is published last.
+## Durability, migration, and recovery
 
-The operation does not modify the PDB5 snapshot or WAL and does not switch
-normal SQL execution to PDB6. If interrupted, PDB5 remains authoritative. An
-incomplete PDB6 sidecar is detected and must currently be removed by the operator
-before restarting the copy; automatic progress tracking and orphan-page
-reclamation are not yet implemented. Do not treat the copied sidecar as production-ready
-or switch authority until the verification and recovery gates pass.
+The PDB6 root is published only after the write path has validated staged mutations and synchronized the required redo/page data. The allocator keeps mirrored EAM3 metadata slots; one damaged copy can be repaired from the valid copy, while two invalid copies fail closed. The page tree replays pending redo during open before exposing the store.
 
+PDB5-to-PDB6 migration is explicit and non-destructive:
 
-## Live SQL authority transition
+1. Copy table definitions, stable row IDs, row payloads, and index entries in bounded batches.
+2. Read back and verify catalog records, row payloads, index keys, checksums, and catalog cardinality.
+3. Publish the PDB6 completion manifest last.
+4. Retain the original PDB5 snapshot/WAL for compatibility and recovery.
 
-A complete PDB6 manifest is now authoritative when Database::open() finds it.
-The old PDB5 snapshot and SQL WAL are retained and are not replayed or rewritten
-by PDB6-backed handles. SQL commits compare the in-memory before/after table
-states and publish row payload descriptors, catalog records, secondary-index
-deltas, and the new database manifest in one PDB6 page-tree transaction.
+An interrupted migration can leave incomplete PDB6 sidecars. Automatic progress resume and cleanup are not yet complete; an operator may need to remove the incomplete sidecars before retrying. Never remove or overwrite the original PDB5 source as part of an unverified migration.
 
-The current implementation still eagerly materializes table rows into memory
-when opening PDB6. It is an authority transition, not yet the final lazy RowStore:
-point reads, bounded scans, and a shared row/page cache remain future work.
-Transactions are bounded by the current PDB6 5,000-mutation limit. Dropping
-tables is not supported by the PDB6 transition writer.
+## Named snapshots and vacuum
 
+PDB6 exposes:
 
-Existing PDB5 databases are migrated explicitly with `postemberdb migrate-pdb6 <data-file>`. The migration is non-destructive: the PDB5 snapshot/WAL remain in place, and the new PDB6 manifest becomes the SQL authority. Opening an unmigrated PDB5 database does not silently change its format.
+- `create_pdb6_snapshot(name)` — durably retain the current immutable root.
+- `list_pdb6_snapshots()` — list retained snapshot names.
+- `delete_pdb6_snapshot(name)` — remove a named root reference; pages are reclaimed later.
+- `vacuum_pdb6()` — trace the current root and retained snapshot roots before reclaiming eligible pages.
 
+The `.pdb6.snapshots` registry uses versioned `PSN1` records, bounded names/counts, checksums, and atomic temporary-file replacement with file and parent-directory sync.
 
-## Named PDB6 snapshots and Vacuum protection
+Vacuum can reclaim unreachable tree pages across the current and named roots. Overflow reclamation is conservative: while any named snapshot exists, all `P6R1` overflow pages are retained because old snapshot descriptors are not yet independently traced. Once no named snapshots remain, a later vacuum can trace current descriptors and reclaim orphan overflow pages. Unknown page types are retained.
 
-PDB6 exposes explicit named-root operations on a PDB6-backed `Database`:
+PDB6 currently serializes page-store access with an exclusive file lock; concurrent shared readers and active-reader epochs/pins are not implemented. Crash-resumable vacuum progress and fault injection across every allocator-release boundary remain open.
 
-- `create_pdb6_snapshot(name)` durably records the currently published immutable root.
-- `list_pdb6_snapshots()` returns the retained names in lexical order.
-- `delete_pdb6_snapshot(name)` removes the root reference; it does not immediately free pages.
-- `vacuum_pdb6()` reclaims unreachable tree pages only after tracing the current root and every retained snapshot root.
+## Remaining implementation gates
 
-The registry is stored in the `.pdb6.snapshots` sidecar using the versioned `PSN1` format, bounded names/counts, a checksum, and atomic temporary-file replacement. The file and its parent directory are synced before a registry mutation reports success. A malformed or oversized registry fails closed rather than being silently discarded.
+- Shared bounded SQL buffer pool, page pinning, and explicit global memory budgets.
+- Bounded staging for multi-statement transactions, `DatabaseSession`, and UPSERT without compatibility table hydration.
+- Full SQL predicate pushdown, composite secondary indexes, cost-aware planning, `EXPLAIN`, and streaming/external sort.
+- Persistent B+ Tree sibling links or redistribution only if benchmarks demonstrate a need.
+- Active-reader epochs/pins and per-snapshot overflow descriptor tracing.
+- Crash-resumable vacuum and broader subprocess/device-level fault injection.
+- Verified full/incremental backup and restore.
+- Optional page compression with strict decompression limits.
+- Explicit in-place update mode only after an independent page-recovery mechanism is designed and tested.
 
-Overflow-page reclamation is deliberately more conservative: while any named snapshot exists, Vacuum retains all `P6R1` pages because old row descriptors are not yet enumerated independently from every snapshot root. After the final snapshot is deleted, a later Vacuum can reclaim orphaned overflow pages using the current-root descriptor scan. Unknown page kinds are always retained. PDB6 currently serializes page-store access with an exclusive file lock and does not support concurrent shared readers; reader epochs/pins, per-snapshot overflow tracing, and crash-resumable Vacuum progress remain future work.
+PDB6 is a real page-backed SQL persistence path, but PostemberDB remains experimental and must not be described as production-ready until the recovery, concurrency, backup/restore, resource-budget, security, compatibility, and repeatable performance release gates are complete.

@@ -1,6 +1,6 @@
 # Implementation status
 
-This file tracks implemented behavior separately from planned work. A checked box means code and focused tests have been added; it does not mean the feature is production-ready.
+This file tracks the current implementation on `dev` separately from planned work. A checked box means code and focused tests have been added; it does not mean the feature is production-ready. When older implementation notes conflict with the current-state summaries below, the current PDB6, coordinator, and release-gate sections take precedence.
 
 ## 1. WAL and transactions
 
@@ -86,9 +86,9 @@ This file tracks implemented behavior separately from planned work. A checked bo
 - [x] Native in-memory B+ tree core with leaf-only values, internal separators, node splitting, point lookup, inclusive range scan, and structural validation.
 - [x] In-memory B+ tree deletion with leaf/internal borrowing, merging, root collapse, and strict occupancy validation; focused and deterministic reference tests added.
 - [x] Stack-based successor-leaf traversal for in-memory range scans.
-- [ ] Persistent leaf sibling links (optional follow-up), page serialization, persistent index nodes, and catalog/page-file integration.
+- [ ] Persistent leaf sibling links (optional follow-up); the persistent page codec, tree nodes, catalog/root integration, and page-file publication are implemented.
 
-The native in-memory B+ tree backs SQL equality indexes and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and range scans. A stable EIK1/EIR1 codec defines the disk representation for SQL index keys. The persistent EmberTree sidecar stores one namespaced entry per indexed row using stable table-local row IDs. Supported SQL equality queries read this persistent mirror when valid, resolve row IDs through a table-local position map, and validate references; unsupported oversized keys or a failed mirror safely fall back to the in-memory index. The SQL snapshot/WAL remains authoritative for table rows and catalog metadata, and the persistent index mirror is rebuilt from canonical SQL state on open.
+The native in-memory B+ tree backs SQL equality indexes and supports point lookup, insertion/replacement, deletion with sibling borrowing and merging, root collapse, structural validation, and range scans. A stable EIK1/EIR1 codec defines the disk representation for SQL index keys. For PDB6 databases, the persistent page tree is part of the shared canonical catalog/row/index keyspace; supported equality and bounded range lookups can use persistent entries and fall back to the in-memory index when an encoding is unsupported. Legacy PDB5 databases retain their compatibility snapshot/WAL authority and may use a derived EmberTree index mirror. Index keys use stable table-local row IDs; the row-position map is only an in-memory lookup aid.
 
 SQL transaction commits no longer diff complete previous/current index snapshots. INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX now append encoded row-level index mutations while executing against the staged transaction. Repeated changes to the same key are coalesced in transaction order (last mutation wins), then removals and upserts are applied through one mixed CoW batch, one redo record, and one root publication after the canonical SQL WAL commit. This avoids O(total indexed entries) transaction-time delta discovery. A full scan remains necessary when rebuilding the derived mirror at startup. In-memory SQL indexes now store stable table-local row IDs rather than vector positions. INSERT adds only the new IDs, UPDATE removes and reinserts an ID only when an indexed key changes, DELETE removes each deleted row from its index keys, and UPSERT rekeys only the affected row. A DELETE still compacts the row vector and rebuilds the row-ID-to-position map in O(remaining rows), but it does not rebuild the B+ tree indexes. Unique-index updates are checked as a group before any staged row is changed.
 
@@ -105,7 +105,8 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [x] Signed-coordinate Minecraft chunk storage with ordered X/Z key encoding, bounded rectangular scans, and atomic region chunk batches.
 - [x] Atomic player batch updates/removals with one CoW redo/root publication and post-publication payload reclamation.
 - [ ] General user-defined secondary indexes and index rebuild/verification tooling.
-- [ ] Enlist EF7 mutations in the same user-visible SQL transaction and coordinator commit path; EF7 remains a separate durable participant.
+- [x] SQL, KV, Registry, and EF7 expose durable prepared-participant adapters for explicit coordinator transactions and restart recovery.
+- [ ] Expose a general cross-domain transaction API through Binary/1 and KSL; ordinary SQL transactions and KSL `transactionAsync` do not automatically enlist the other domains.
 - [x] KSL JSONL/1 typed player-profile bridge: profile put/get by UUID or username, delete, and atomic profile batches; asynchronous Kotlin client methods are implemented. Custom-data transport is capped at 24 KiB by the line protocol.
 - [x] KSL JSONL/1 namespace administration: create/get/find/list/delete with parent-scoped hierarchy; bridge listing is capped at 64 entries per call.
 - [x] KSL JSONL/1 chunk CRUD with signed coordinates and a pre-read descriptor-size check; the bridge caps chunk payloads at 24 KiB.
@@ -118,7 +119,7 @@ Startup and redo recovery validate the complete reachable persistent tree, inclu
 - [ ] Full JDBC compliance, native server-side prepared statements, and KSL-selectable SQL dialect remain pending.
 - [ ] Crash-point fault injection, extended reopen/corruption tests, and production-like Minecraft/KSL load tests.
 
-EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock`. It remains an independent record engine and does not yet provide cross-domain atomicity with SQL, KV, Registry, or other sidecars. FNV-style checksums detect accidental corruption; they are not cryptographic authentication.
+EF7 owns `.ef7.pages`, `.ef7.wal`, and `.ef7.lock` and remains a separate durable domain. The native transaction coordinator can enlist EF7 alongside SQL, KV, and Registry through prepared participants; this is an explicit coordinator workflow, not an implicit part of ordinary SQL or KSL SQL transactions. FNV-style checksums detect accidental corruption; they are not cryptographic authentication.
 
 ## 4. KSL/JVM adapter
 
@@ -181,12 +182,13 @@ A separate PostemberDBKSL addon now registers a KSL service and exposes async qu
 
 ## 8. Storage roadmap
 
-- [ ] EmberTree page-oriented B+ tree (the in-memory B+ tree and an experimental persistent extent-file primitive exist; catalog/root integration and WAL-coordinated page commits remain pending).
-- [ ] Explicit CoW and in-place update modes with crash-safe recovery.
-- [ ] FragmentationStats and manually budgeted defrag APIs.
-- [ ] Per-page LZ4/Snappy compression with decompression limits.
-- [ ] Snapshot and incremental backup/restore system.
-- [ ] Explicit page/index/query/WAL memory budgets.
+- [x] EmberTree page-backed CoW B+ tree, shared PDB6 root, redo WAL, allocator metadata, and atomic root publication for supported batches.
+- [ ] Byte-balanced redistribution for persistent underfull siblings; explicit in-place update mode with an independent page-recovery protocol.
+- [ ] FragmentationStats and manually budgeted defragmentation APIs.
+- [ ] Per-page LZ4/Snappy compression with strict decompression limits.
+- [x] Durable named PDB6 snapshots and current/named-root tree reachability during vacuum.
+- [ ] Full/incremental backup and restore with verified manifests.
+- [ ] Shared page-cache pinning and explicit page/index/query/WAL memory budgets.
 
 ## Release gate
 
@@ -206,16 +208,17 @@ Do not label PostemberDB production-ready until the page cache, transaction/reco
 - [x] Direct row-level SQL index journaling for INSERT, UPDATE, DELETE, UPSERT, and CREATE INDEX.
 - [x] Coalesce repeated row-key mutations in transaction order and publish one mixed CoW batch after the canonical SQL WAL commit.
 - [x] Stable row IDs in persistent index entries prevent row-position shifts after DELETE.
-- [ ] Replace in-memory index row positions with stable row IDs and remove full in-memory index rebuilds on UPDATE/DELETE.
+- [x] Store stable table-local row IDs in in-memory SQL indexes and maintain only affected index keys on INSERT, UPDATE, DELETE, and UPSERT; row-vector compaction still rebuilds the row-ID-to-position map.
 - [x] Conservative PDB6 vacuum traces the current published B+ Tree root and frees unreachable EBL1/EBI1 nodes while retaining P6R1 overflow and unknown page types.
-- [ ] Descriptor-aware reclamation of orphan overflow extents, named snapshot roots, active-reader pins/epochs, and crash-safe vacuum progress.
+- [x] Trace the current PDB6 root and named snapshot roots during vacuum; reclaim unreachable tree pages and current-root orphan overflow pages when no snapshots are retained.
+- [ ] Active-reader epochs/pins, per-snapshot overflow descriptor tracing while snapshots exist, and crash-safe vacuum progress.
 - [x] Test-only B+ tree crash injection after redo sync, after the first page sync, after all page syncs, and after root publication; recovery tests also cover interrupted deletion of the final key and restoration of an empty root.
 - [x] Test-only allocator metadata fault injection after the primary durable slot sync and after the mirrored slot sync; reopen tests verify that committed reservations are never reissued.
 - [x] Test-only recovery coverage for a durably torn primary metadata slot and a crash after file extension but before high-water-mark publication.
 - [x] Deterministic allocator-churn test checks exact allocated-page ownership through repeated reserve/release cycles and periodic reopen; metadata generation zero is rejected.
 - [ ] Fault injection for device-level write reordering/flush guarantees and cross-log transaction boundaries.
 
-The incremental insert/delete APIs are now used by SQL transaction commits for the derived index mirror.  Delete batches ignore missing keys, publish one redo record/root per batch, merge adjacent same-level siblings when their combined contents fit one page, and collapse unary roots. Non-root unary internal pages may remain when siblings cannot be merged; byte-balanced redistribution and a minimum-occupancy invariant are not implemented. SQL transaction commits now compute the set difference between the previous and next derived index entries, then apply removed and inserted keys through one mixed page-tree mutation batch, one redo record, and one root publication. This reduces persistent page writes and preserves untouched CoW subtrees. Stable table-local row identifiers are now stored in PDB5 snapshots and used in EmberTree index keys, so deleting a row does not renumber later entries. PDB4 and earlier snapshots remain readable; legacy rows receive deterministic IDs when loaded. The current delta collector still scans all in-memory index entries to calculate the difference (O(total indexed entries)). SQL table rows are not page-backed. Allocation metadata is committed as new pages are reserved; an interrupted operation before its redo record can leave unreachable allocated pages. This is safe for correctness but requires future vacuum/reclamation support.
+Incremental copy-on-write insert/delete is used by the persistent page tree. Delete batches ignore missing keys, publish one redo record and one root per batch, merge same-level siblings when their contents fit, and collapse unary roots; redistribution when siblings cannot merge remains unfinished. PDB6 SQL writes publish row descriptors, catalog metadata, index mutations, and the manifest through one shared root. The SQL index mutation journal coalesces repeated key changes and avoids discovering transaction deltas by diffing every indexed entry. Stable table-local row IDs survive deletion and reopening. PDB5 snapshots remain readable for compatibility. Allocation metadata is committed as pages are reserved, so an interrupted pre-redo operation can leave unreachable allocations; conservative vacuum reclaims eligible pages, while crash-resumable reclamation and active-reader protection remain future work.
 
 
 ## Native Key-Value and Registry storage
@@ -224,7 +227,7 @@ Implemented a standalone `KeyValueStore` backed by the native page-backed CoW B+
 
 Implemented a typed `Registry` layered on that KV engine. It provides top-level hives, nested keys, case-insensitive slash/backslash paths, named values (including the default empty-name value), enumeration, and safe non-recursive or recursive key deletion. Supported value types are String, Integer, Boolean, Binary, and JSON text. JSON text is not parsed or schema-validated by the database.
 
-File-backed `Database` instances can open their independent `open_key_value_store()` and `open_registry()` sidecars. These stores are not yet enlisted in the SQL transaction WAL, so atomic commits spanning SQL + KV + Registry are not supported. Large values requiring overflow/blob pages, per-hive ACL/RBAC, encryption-at-rest, and audit events remain future work.
+File-backed `Database` instances can open independent `open_key_value_store()` and `open_registry()` sidecars. Ordinary SQL transactions do not automatically enlist those sidecars. Explicit durable coordinator adapters now exist for SQL, KV, Registry, and EF7, but a general user-facing cross-domain transaction API is not yet exposed through Binary/1 or KSL. Large-value/blob support in KV, per-hive ACL/RBAC, encryption-at-rest, and broader audit integration remain future work.
 
 
 ## Explicit PDB5-to-PDB6 migration foundation
@@ -243,7 +246,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Recovery reports undecided transactions and truncates only a torn final record; complete corrupt records fail closed.
 - [x] COMMIT is rejected until every participant has a durable PREPARED marker.
 - [x] KV, Registry, and EF7 now have durable prepared-participant adapters with idempotent committed replay and APPLIED acknowledgements.
-- [ ] SQL still needs a durable participant adapter. Full SQL + KV + Registry + EF7 atomicity is not available yet.
+- [x] SQL, KV, Registry, and EF7 expose durable prepared-participant adapters; the coordinator verifies durable prepares and recovers committed/aborted decisions.
+- [ ] A user-facing general cross-domain transaction API remains to be exposed through server Binary/1 and KSL; ordinary SQL transactions do not automatically span sidecar domains.
 
 
 ## Coordinator participant-application recovery
@@ -252,7 +256,8 @@ File-backed `Database` instances can open their independent `open_key_value_stor
 - [x] Recovery distinguishes committed transactions that still need participant application from transactions whose participants have all acknowledged.
 - [x] APPLIED records are checksummed, ordered after COMMIT, and reject duplicate or unprepared participant IDs.
 - [x] KV, Registry, and EF7 are enlisted through durable prepare markers and idempotent commit replay; coordinator APPLIED is synced before prepare-marker cleanup.
-- [ ] SQL adapter and durable abort-acknowledgement recovery remain pending; the system does not yet guarantee cross-domain atomicity across all four domains.
+- [x] SQL adapter and durable abort acknowledgements are implemented; restart recovery retries idempotent commit/rollback and records APPLIED/FINALIZED/ROLLED_BACK acknowledgements.
+- [ ] Expose and document general cross-domain transaction control to remote clients; the prepared-participant foundation is not the same as automatic enlistment by ordinary SQL/KSL transactions.
 
 
 ## Live PDB6 SQL authority
