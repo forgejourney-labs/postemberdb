@@ -3352,6 +3352,26 @@ mod tests {
         assert!(db.execute_params("SELECT * FROM missing", &[Value::Integer(1)]).is_err());
     }
 
+    #[test]
+    fn where_comparisons_reject_incompatible_parameter_types() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE typed_predicates (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO typed_predicates VALUES (1, 'one')").unwrap();
+
+        assert!(matches!(
+            db.execute_params(
+                "SELECT id FROM typed_predicates WHERE id = ?",
+                &[Value::Text("1".into())],
+            ),
+            Err(DbError::TypeMismatch { column, expected: DataType::Integer }) if column == "id"
+        ));
+
+        assert!(matches!(
+            db.execute("SELECT id FROM typed_predicates WHERE id = '1'"),
+            Err(DbError::TypeMismatch { column, expected: DataType::Integer }) if column == "id"
+        ));
+    }
+
 
     #[test]
     fn wal_replay_restores_index_definitions() {

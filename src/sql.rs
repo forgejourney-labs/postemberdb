@@ -227,6 +227,10 @@ pub(super) fn parse_where_expression(
                 Ok(SqlExpression::Predicate(predicates.into_iter().next().unwrap()))
             }
             Ok(_) => Err(DbError::Parse("invalid nested WHERE expression".into())),
+            // A type mismatch is a semantic error, not a signal to reinterpret the
+            // same predicate as a scalar expression. Falling back here used to
+            // bypass the column-type validation performed by parse_where_predicates.
+            Err(error @ DbError::TypeMismatch { .. }) => Err(error),
             Err(predicate_error) => parse_scalar_comparison(columns, source).or(Err(predicate_error)),
         }
     }
